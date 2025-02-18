@@ -9,66 +9,60 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import BigNumber from 'bignumber.js';
 
-import { 
-  Address, 
+import {
+  Address,
   Transaction,
   TransactionPayload
 } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
-
 import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 
 // ---------------------------------------------
-// Example usage fee settings & environment
+// Configuration & constants
 // ---------------------------------------------
-const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN'; 
-const USAGE_FEE = 500;                    // Fee in "REWARD" tokens
-const REWARD_TOKEN = 'REWARD-cf6eac';     // Your usage-fee token
-const TREASURY_WALLET = 'erd1...';        // Your treasury wallet for usage fees
-const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85';  // The on-chain transaction hash of your Warp
+const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
+const USAGE_FEE = 500;                     // Fee in "REWARD" tokens
+const REWARD_TOKEN = 'REWARD-cf6eac';      // Your usage-fee token identifier
+const TREASURY_WALLET = 'erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn'; // Treasury wallet
+const // The on-chain transaction hash of your ESDT Creator Warp blueprint
+      WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85';
 
 // ---------------------------------------------
-// For local files & express setup
+// Express setup
 // ---------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// If you keep a local whitelist file:
-const whitelistFilePath = path.join(__dirname, 'whitelist.json');
-
-// The provider for sending transactions on mainnet:
-const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
-
-// For WarpBuilder and WarpActionExecutor, define a config object:
-const warpConfig = {
-  // environment, gateway, etc. - minimal example:
-  providerUrl: "https://gateway.multiversx.com",
-};
-
-// Middleware to parse JSON body
+// Use JSON body parser
 app.use(bodyParser.json());
 
-// -------------------------------------------------------------------------
-// 1) Authorization Endpoint for Make.com
-// -------------------------------------------------------------------------
-app.post('/authorization', (req, res) => {
-  try {
-    const token = req.headers.authorization;
-    if (token === `Bearer ${SECURE_TOKEN}`) {
-      return res.json({ message: "Authorization successful" });
-    } 
-    return res.status(401).json({ error: "Unauthorized" });
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
-  }
-});
+// ---------------------------------------------
+// Network Provider & Warp configuration
+// ---------------------------------------------
+const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
+const warpConfig = {
+  providerUrl: "https://gateway.multiversx.com",
+  // additional config values if needed
+};
 
-// -------------------------------------------------------------------------
-// Helper: Load local whitelist (if you maintain one)
-// -------------------------------------------------------------------------
+// ---------------------------------------------
+// Middleware: Authorization check (for Make.com custom app)
+// ---------------------------------------------
+const checkToken = (req, res, next) => {
+  const token = req.headers.authorization;
+  if (token === `Bearer ${SECURE_TOKEN}`) {
+    return next();
+  }
+  return res.status(401).json({ error: 'Unauthorized' });
+};
+
+// ---------------------------------------------
+// Helper: Load whitelist (if used)
+// ---------------------------------------------
+const whitelistFilePath = path.join(__dirname, 'whitelist.json');
 function loadWhitelist() {
   if (!fs.existsSync(whitelistFilePath)) {
     fs.writeFileSync(whitelistFilePath, JSON.stringify([], null, 2));
@@ -81,14 +75,14 @@ function isWhitelisted(walletAddress) {
   return whitelist.some(entry => entry.walletAddress === walletAddress);
 }
 
-// -------------------------------------------------------------------------
-// Helper: Check & parse PEM from request
-// -------------------------------------------------------------------------
+// ---------------------------------------------
+// Helpers: PEM and wallet address extraction
+// ---------------------------------------------
 function getPemContent(req) {
   const pemContent = req.body.walletPem;
   if (
-    !pemContent || 
-    typeof pemContent !== 'string' || 
+    !pemContent ||
+    typeof pemContent !== 'string' ||
     !pemContent.includes('-----BEGIN PRIVATE KEY-----')
   ) {
     throw new Error('Invalid PEM content');
@@ -100,9 +94,9 @@ function deriveWalletAddressFromPem(pemContent) {
   return signer.getAddress().toString();
 }
 
-// -------------------------------------------------------------------------
-// Helper: Check transaction status
-// -------------------------------------------------------------------------
+// ---------------------------------------------
+// Helper: Check transaction status (with retries)
+// ---------------------------------------------
 async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
   const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
   for (let i = 0; i < retries; i++) {
@@ -124,14 +118,12 @@ async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
     }
     await new Promise(resolve => setTimeout(resolve, delay));
   }
-  throw new Error(
-    `Transaction ${txHash} not determined after ${retries} retries.`
-  );
+  throw new Error(`Transaction ${txHash} not determined after ${retries} retries.`);
 }
 
-// -------------------------------------------------------------------------
-// Helper: Convert numeric amount to blockchain representation
-// -------------------------------------------------------------------------
+// ---------------------------------------------
+// Helper: Token decimals & amount conversion
+// ---------------------------------------------
 async function getTokenDecimals(tokenTicker) {
   const apiUrl = `https://api.multiversx.com/tokens/${tokenTicker}`;
   const response = await fetch(apiUrl);
@@ -143,12 +135,12 @@ async function getTokenDecimals(tokenTicker) {
 }
 function convertAmountToBlockchainValue(amount, decimals) {
   const factor = new BigNumber(10).pow(decimals);
-  return new BigNumber(amount).times(factor).toFixed(0);
+  return new BigNumber(amount).multipliedBy(factor).toFixed(0);
 }
 
-// -------------------------------------------------------------------------
+// ---------------------------------------------
 // Helper: Send usage fee (in REWARD tokens)
-// -------------------------------------------------------------------------
+// ---------------------------------------------
 async function sendUsageFee(pemContent) {
   const signer = UserSigner.fromPem(pemContent);
   const senderAddress = signer.getAddress();
@@ -157,23 +149,21 @@ async function sendUsageFee(pemContent) {
   const accountOnNetwork = await provider.getAccount(senderAddress);
   const nonce = accountOnNetwork.nonce;
 
-  // Convert usage fee
   const decimals = await getTokenDecimals(REWARD_TOKEN);
   const convertedAmount = convertAmountToBlockchainValue(USAGE_FEE, decimals);
 
-  // Construct a token-transfer transaction
-  // (Manually using sdk-core or your own factory approach)
+  // Construct a simple transaction payload for a token transfer (usage fee)
   const payload = TransactionPayload.contractCall()
     .setFunction("ESDTTransfer")
-    .addArg(REWARD_TOKEN)              // token ID
-    .addArg(convertedAmount)           // amount
+    .addArg(REWARD_TOKEN)
+    .addArg(convertedAmount)
     .build();
 
   const tx = new Transaction({
     nonce,
     receiver: receiverAddress,
     sender: senderAddress,
-    value: 0, // no EGLD
+    value: 0,
     gasLimit: 500000n,
     data: payload,
     chainID: "1"
@@ -183,86 +173,81 @@ async function sendUsageFee(pemContent) {
   const txHash = await provider.sendTransaction(tx);
   const status = await checkTransactionStatus(txHash.toString());
   if (status.status !== "success") {
-    throw new Error('UsageFee transaction failed. Ensure you have enough REWARD tokens.');
+    throw new Error('Usage fee transaction failed. Ensure you have enough REWARD tokens.');
   }
   return txHash.toString();
 }
 
-// -------------------------------------------------------------------------
-// Middleware: handle usage fee
-// -------------------------------------------------------------------------
+// ---------------------------------------------
+// Middleware: Handle usage fee
+// ---------------------------------------------
 async function handleUsageFee(req, res, next) {
   try {
     const pemContent = getPemContent(req);
     const walletAddress = deriveWalletAddressFromPem(pemContent);
 
-    // Check if the wallet is whitelisted => skip usage fee
+    // If wallet is whitelisted, skip fee collection
     if (isWhitelisted(walletAddress)) {
       console.log(`Wallet ${walletAddress} is whitelisted. Skipping usage fee.`);
       return next();
     }
-
-    // Otherwise, collect usage fee
     const txHash = await sendUsageFee(pemContent);
-    req.usageFeeHash = txHash; 
+    req.usageFeeHash = txHash;
     return next();
   } catch (error) {
-    console.error('Error processing usageFee:', error.message);
+    console.error('Error processing usage fee:', error.message);
     return res.status(400).json({ error: error.message });
   }
 }
 
-// Middleware to check authorization token for protected routes
-const checkToken = (req, res, next) => {
-  const token = req.headers.authorization;
-  if (token === `Bearer ${SECURE_TOKEN}`) {
-    next();
-  } else {
-    res.status(401).json({ error: 'Unauthorized' });
+// ---------------------------------------------
+// 1) Authorization Endpoint (for Make.com)
+// ---------------------------------------------
+app.post('/authorization', (req, res) => {
+  try {
+    const token = req.headers.authorization;
+    if (token === `Bearer ${SECURE_TOKEN}`) {
+      return res.json({ message: "Authorization successful" });
+    }
+    return res.status(401).json({ error: "Unauthorized" });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
   }
-};
+});
 
-
-// -------------------------------------------------------------------------
-// 2) Example endpoint: /executeWarp
-//    Accept user input, user PEM, and run the warp action
-// -------------------------------------------------------------------------
+// ---------------------------------------------
+// 2) Warp Execution Endpoint: /executeWarp
+//    This endpoint accepts user input (for the ESDT Creator warp)
+//    along with the user's PEM file. It then executes the Warp action.
+// ---------------------------------------------
 app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
   try {
-    // 1) Extract user PEM
+    // Extract user PEM and create a signer
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
     const userAddress = signer.getAddress();
 
-    // 2) Gather user inputs for the Warp action
-    //    For example, if your Warp blueprint requires:
-    //    "Token Name", "Token Ticker", "Initial Supply", "Token Decimals"
-    //    then parse them from request body:
-    const {
-      tokenName,
-      tokenTicker,
-      initialSupply,
-      tokenDecimals
-    } = req.body;
+    // Gather user inputs required by the ESDT Creator warp:
+    // "Token Name", "Token Ticker", "Initial Supply", "Token Decimals"
+    const { tokenName, tokenTicker, initialSupply, tokenDecimals } = req.body;
+    if (!tokenName || !tokenTicker || !initialSupply || !tokenDecimals) {
+      throw new Error("Missing required input fields.");
+    }
 
-    // 3) Build the Warp from the on-chain transaction hash
+    // Build the Warp from the on-chain transaction hash (ESDT Creator blueprint)
     const warpBuilder = new WarpBuilder(warpConfig);
     const warp = await warpBuilder.createFromTransactionHash(WARP_HASH);
     if (!warp) {
       throw new Error(`Could not load Warp from hash: ${WARP_HASH}`);
     }
 
-    // This example uses the FIRST action in warp.actions:
-    // (In your "ESDT Creator" warp, the first action might be "issue")
+    // Use the first action from the Warp (assumed to be the 'issue' function)
     const action = warp.actions[0];
     if (!action) {
-      throw new Error("No action found in this Warp blueprint!");
+      throw new Error("No action found in the Warp blueprint!");
     }
 
-    // 4) Build the userInputs object that matches your Warp blueprint fields
-    //    e.g. if the Warp expects:
-    //    "Token Name", "Token Ticker", "Initial Supply", "Token Decimals"
-    //    then pass them exactly as named:
+    // Create the userInputs object matching the Warp blueprint fields exactly:
     const userInputs = {
       "Token Name": tokenName,
       "Token Ticker": tokenTicker,
@@ -270,23 +255,22 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
       "Token Decimals": tokenDecimals
     };
 
-    // 5) Create the transaction
+    // Execute the Warp action to create a signable transaction
     const warpActionExecutor = new WarpActionExecutor(warpConfig);
-    const tx = warpActionExecutor.createTransactionForExecute(action, userInputs, /*transfers*/ []);
+    const tx = warpActionExecutor.createTransactionForExecute(action, userInputs, []);
 
-    // 6) Sign & broadcast
-    //    The transaction returned by warpActionExecutor is a standard
-    //    @multiversx/sdk-core Transaction, so we can sign & send:
+    // Set the transaction nonce
     const accountOnNetwork = await provider.getAccount(userAddress);
     tx.setNonce(accountOnNetwork.nonce);
 
+    // Sign and send the transaction
     await signer.sign(tx);
     const txHash = await provider.sendTransaction(tx);
 
-    // 7) Wait for final status
+    // Wait for final transaction status
     const status = await checkTransactionStatus(txHash.toString());
 
-    // 8) Return the result
+    // Return the result
     return res.json({
       usageFeeHash: req.usageFeeHash || null,
       warpHash: WARP_HASH,
@@ -299,7 +283,9 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
   }
 });
 
-// -------------------------------------------------------------------------
+// ---------------------------------------------
+// Start the server
+// ---------------------------------------------
 app.listen(PORT, () => {
   console.log(`Warp integration app is running on port ${PORT}`);
 });
