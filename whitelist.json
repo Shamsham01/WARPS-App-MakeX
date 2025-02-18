@@ -1,0 +1,9 @@
+[
+  {"walletAddress":"erd15wmqqvxf3yp6dztvyhxj4g297uaae0q3wgy58ld4js2pn9f6k3pqnwupt3",
+  "label":"HodlTokenClubAssets",
+  "whitelistStart":"2024-11-26T10:00:00Z"},
+  
+  {"walletAddress":"erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn",
+    "label":"HodlTokenClubAssets",
+    "whitelistStart":"2024-12-01T10:00:00Z"}
+]
