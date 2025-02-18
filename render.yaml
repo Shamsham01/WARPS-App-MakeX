@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: warps-makex
+    env: node
+    plan: free
+    buildCommand: 'npm install && npm run build'
+    startCommand: 'npm start'
+    envVars:
+      - key: API_PROVIDER
+        value: "https://api.multiversx.com"
+      - key: CHAIN
+        value: "mainnet"
+      - key: SECURE_TOKEN
+        sync: false
+      - key: REWARD_TOKEN
+        value: "REWARD-cf6eac"
+      - key: TREASURY_WALLET
+        value: "erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn"
+    autoDeploy: true
+    region: frankfurt
