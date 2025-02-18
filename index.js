@@ -26,7 +26,7 @@ const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
 const USAGE_FEE = 500;                    // Fee in "REWARD" tokens
 const REWARD_TOKEN = 'REWARD-cf6eac';     // Your usage-fee token
 const TREASURY_WALLET = 'erd1...';        // Your treasury wallet for usage fees
-const WARP_HASH = '5d765600d47904e1...';  // The on-chain transaction hash of your Warp
+const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85';  // The on-chain transaction hash of your Warp
 
 // ---------------------------------------------
 // For local files & express setup
