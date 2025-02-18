@@ -133,7 +133,14 @@ app.post('/executeWarp', checkToken, async (req, res) => {
     // 1) Extract user PEM and create a signer
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
-    const userAddress = signer.getAddress();
+    const userAddress = signer.getAddress().toString();
+
+    // Create the WarpActionExecutor with the user address set
+    const warpActionExecutor = new WarpActionExecutor({
+    ...warpConfig,
+    userAddress: userAddress,
+    });
+
 
     // 2) Gather user inputs from the request body.
     //    Expected inputs for the ESDT Creator warp:
