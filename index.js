@@ -212,6 +212,17 @@ async function handleUsageFee(req, res, next) {
   }
 }
 
+// Middleware to check authorization token for protected routes
+const checkToken = (req, res, next) => {
+  const token = req.headers.authorization;
+  if (token === `Bearer ${SECURE_TOKEN}`) {
+    next();
+  } else {
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+};
+
+
 // -------------------------------------------------------------------------
 // 2) Example endpoint: /executeWarp
 //    Accept user input, user PEM, and run the warp action
