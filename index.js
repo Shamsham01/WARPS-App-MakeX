@@ -53,10 +53,13 @@ const warpConfig = {
 // ---------------------------------------------
 const checkToken = (req, res, next) => {
   const token = req.headers.authorization;
+  console.log("Received token:", token);
+  console.log("Expected token:", `Bearer ${SECURE_TOKEN}`);
   if (token === `Bearer ${SECURE_TOKEN}`) {
-    return next();
+    next();
+  } else {
+    res.status(401).json({ error: 'Unauthorized' });
   }
-  return res.status(401).json({ error: 'Unauthorized' });
 };
 
 // ---------------------------------------------
