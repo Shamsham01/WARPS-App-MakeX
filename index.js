@@ -31,9 +31,10 @@ const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
 const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85';
 
 const warpConfig = {
-  // Minimal configuration for the warps SDK; adjust if needed.
-  providerUrl: "https://gateway.multiversx.com"
+  providerUrl: "https://gateway.multiversx.com",
+  currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
 };
+
 
 // ----------------------------
 // Express Setup
