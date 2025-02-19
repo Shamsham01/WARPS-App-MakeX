@@ -14,7 +14,6 @@ import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
 
 import { UserSigner } from '@multiversx/sdk-wallet';
-// Import Warp-related classes from the warps SDK
 import { WarpBuilder, WarpActionExecutor, WarpArgSerializer } from '@vleap/warps';
 
 // -------------------------------------------------------------
@@ -26,7 +25,7 @@ const REWARD_TOKEN = 'REWARD-cf6eac';
 const TREASURY_WALLET = process.env.TREASURY_WALLET || 'erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn';
 const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85'; // Warp transaction hash
 
-// Warp configuration – later we’ll add userAddress.
+// Warp configuration – note that later we’ll add userAddress to config.
 const warpConfig = {
   providerUrl: "https://gateway.multiversx.com",
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
@@ -137,7 +136,7 @@ async function sendUsageFee(pemContent) {
   const decimals = await getTokenDecimals(REWARD_TOKEN);
   const convertedAmount = convertAmountToBlockchainValue(USAGE_FEE, decimals);
 
-  // Build a simple ESDT transfer payload (this is a basic JSON payload; adjust if needed)
+  // Build a simple ESDT transfer payload (basic JSON payload)
   const payload = Buffer.from(
     JSON.stringify({
       func: "ESDTTransfer",
@@ -207,24 +206,24 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     const userAddress = signer.getAddress().toString();
 
     // Extract user inputs from request body
-    // IMPORTANT: The WARPS founder recommends that user inputs be an array in the correct order.
-    // For the ESDT Creator warp the order is:
+    // IMPORTANT: For the ESDT Creator warp, the expected order is:
     // [Token Name, Token Ticker, Initial Supply, Token Decimals]
     const { tokenName, tokenTicker, initialSupply, tokenDecimals } = req.body;
     if (!tokenName || !tokenTicker || !initialSupply || tokenDecimals === undefined) {
       throw new Error("Missing one or more required input fields.");
     }
 
-    // Use WarpArgSerializer to convert native values into Warp-typed string notation.
+    // Use WarpArgSerializer to convert native values to Warp typed notation.
+    // Note: For tokenDecimals we now use "uint" so the scaling modifier can parse the exponent.
     const argSerializer = new WarpArgSerializer(warpConfig);
     const args = [
-      argSerializer.nativeToString(tokenName, "string"),   // e.g. "string:MyToken"
-      argSerializer.nativeToString(tokenTicker, "string"),   // e.g. "string:MYTKN"
+      argSerializer.nativeToString(tokenName, "string"),     // e.g. "string:MyToken"
+      argSerializer.nativeToString(tokenTicker, "string"),     // e.g. "string:MYTKN"
       argSerializer.nativeToString(initialSupply, "biguint"),  // e.g. "biguint:1000000"
-      argSerializer.nativeToString(tokenDecimals, "uint8")     // e.g. "uint8:18"
+      argSerializer.nativeToString(tokenDecimals, "uint")      // e.g. "uint:18"
     ];
 
-    // Build the Warp using the provided on-chain warp hash
+    // Build the Warp using the on-chain warp hash
     const warpBuilder = new WarpBuilder(warpConfig);
     const warp = await warpBuilder.createFromTransactionHash(WARP_HASH);
     if (!warp) {
@@ -241,7 +240,7 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     const executorConfig = { ...warpConfig, userAddress };
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
 
-    // Create the transaction based on the array of arguments; no extra transfers assumed.
+    // Create the transaction based on the array of arguments; assuming no extra transfers are needed.
     const tx = warpActionExecutor.createTransactionForExecute(action, args, []);
 
     // Set nonce from network for the user's account
