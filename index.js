@@ -20,9 +20,7 @@ import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 // Configuration & Environment variables
 // -------------------------------------------------------------
 const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
-const USAGE_FEE = 500; // Fee in REWARD tokens
-const REWARD_TOKEN = 'REWARD-cf6eac';
-const TREASURY_WALLET = process.env.TREASURY_WALLET || 'erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn';
+// (Usage fee settings removed)
 const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85'; // Warp transaction hash
 
 // Warp configuration – note that later we’ll add userAddress to config.
@@ -84,7 +82,7 @@ function getPemContent(req) {
 
 function deriveWalletAddressFromPem(pemContent) {
   const signer = UserSigner.fromPem(pemContent);
-  return signer.getAddress(); // Return the Address object directly.
+  return signer.getAddress(); // Return Address object
 }
 
 async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
@@ -126,60 +124,6 @@ function convertAmountToBlockchainValue(amount, decimals) {
   return new BigNumber(amount).times(factor).toFixed(0);
 }
 
-async function sendUsageFee(pemContent) {
-  const signer = UserSigner.fromPem(pemContent);
-  const senderAddress = signer.getAddress();
-  const receiverAddress = new Address(TREASURY_WALLET);
-
-  const accountOnNetwork = await provider.getAccount(senderAddress);
-  const nonce = accountOnNetwork.nonce;
-  const decimals = await getTokenDecimals(REWARD_TOKEN);
-  const convertedAmount = convertAmountToBlockchainValue(USAGE_FEE, decimals);
-
-  // Build a simple ESDT transfer payload (using basic JSON payload)
-  const payload = Buffer.from(
-    JSON.stringify({
-      func: "ESDTTransfer",
-      args: [REWARD_TOKEN, convertedAmount.toString()]
-    })
-  );
-
-  const tx = new Transaction({
-    nonce,
-    receiver: receiverAddress,
-    sender: senderAddress,
-    value: 0,
-    gasLimit: 500000n,
-    data: payload,
-    chainID: "1"
-  });
-
-  await signer.sign(tx);
-  const txHash = await provider.sendTransaction(tx);
-  const status = await checkTransactionStatus(txHash.toString());
-  if (status.status !== "success") {
-    throw new Error('UsageFee transaction failed. Ensure you have enough REWARD tokens.');
-  }
-  return txHash.toString();
-}
-
-async function handleUsageFee(req, res, next) {
-  try {
-    const pemContent = getPemContent(req);
-    const walletAddress = deriveWalletAddressFromPem(pemContent);
-    if (isWhitelisted(walletAddress.toString())) {
-      console.log(`Wallet ${walletAddress.toString()} is whitelisted. Skipping usage fee.`);
-      return next();
-    }
-    const txHash = await sendUsageFee(pemContent);
-    req.usageFeeHash = txHash;
-    return next();
-  } catch (error) {
-    console.error('Error processing usageFee:', error.message);
-    return res.status(400).json({ error: error.message });
-  }
-}
-
 // -------------------------------------------------------------
 // Authorization Endpoint for Make.com
 // -------------------------------------------------------------
@@ -196,32 +140,31 @@ app.post('/authorization', (req, res) => {
 });
 
 // -------------------------------------------------------------
-// Execute Warp Endpoint
+// Execute Warp Endpoint (Usage fee logic removed)
 // -------------------------------------------------------------
-app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
+app.post('/executeWarp', checkToken, async (req, res) => {
   try {
     // Extract PEM and create a signer
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
-    // Do NOT convert the address to a string here; keep the Address object.
-    const userAddress = signer.getAddress();
+    const userAddress = signer.getAddress(); // Preserve as Address object
 
-    // Extract user inputs from request body
+    // Extract user inputs from request body for the ESDT Creator warp.
     // Expected order: [Token Name, Token Ticker, Initial Supply, Token Decimals]
     const { tokenName, tokenTicker, initialSupply, tokenDecimals } = req.body;
     if (!tokenName || !tokenTicker || !initialSupply || tokenDecimals === undefined) {
       throw new Error("Missing one or more required input fields.");
     }
 
-    // Build an array of arguments using Warp typed notation.
+    // Build an array of arguments using the Warp typed notation.
     const args = [
-      `string:${tokenName}`,    // Token Name
-      `string:${tokenTicker}`,  // Token Ticker
-      `biguint:${initialSupply}`, // Initial Supply
-      `uint8:${tokenDecimals}`    // Token Decimals
+      `string:${tokenName}`,       // Token Name
+      `string:${tokenTicker}`,     // Token Ticker
+      `biguint:${initialSupply}`,  // Initial Supply
+      `uint8:${tokenDecimals}`     // Token Decimals
     ];
 
-    // Build the Warp using the provided on-chain warp hash
+    // Build the Warp using the provided on-chain warp hash.
     const warpBuilder = new WarpBuilder(warpConfig);
     const warp = await warpBuilder.createFromTransactionHash(WARP_HASH);
     if (!warp) {
@@ -238,20 +181,19 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     const executorConfig = { ...warpConfig, userAddress };
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
 
-    // Create the transaction based on the array of arguments; assuming no extra transfers.
+    // Create the transaction based on the array of arguments; no extra transfers.
     const tx = warpActionExecutor.createTransactionForExecute(action, args, []);
 
-    // Set nonce from network for the user's account
-    const accountOnNetwork = await provider.getAccount(userAddress.toString());
+    // Set nonce from network for the user's account.
+    const accountOnNetwork = await provider.getAccount(userAddress.bech32());
     tx.nonce = accountOnNetwork.nonce;
 
-    // Sign and send the transaction
+    // Sign and send the transaction.
     await signer.sign(tx);
     const txHash = await provider.sendTransaction(tx);
     const status = await checkTransactionStatus(txHash.toString());
 
     return res.json({
-      usageFeeHash: req.usageFeeHash || null,
       warpHash: WARP_HASH,
       finalTxHash: txHash.toString(),
       finalStatus: status.status
