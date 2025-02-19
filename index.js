@@ -84,7 +84,7 @@ function getPemContent(req) {
 
 function deriveWalletAddressFromPem(pemContent) {
   const signer = UserSigner.fromPem(pemContent);
-  return signer.getAddress().toString();
+  return signer.getAddress(); // Return the Address object directly.
 }
 
 async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
@@ -167,8 +167,8 @@ async function handleUsageFee(req, res, next) {
   try {
     const pemContent = getPemContent(req);
     const walletAddress = deriveWalletAddressFromPem(pemContent);
-    if (isWhitelisted(walletAddress)) {
-      console.log(`Wallet ${walletAddress} is whitelisted. Skipping usage fee.`);
+    if (isWhitelisted(walletAddress.toString())) {
+      console.log(`Wallet ${walletAddress.toString()} is whitelisted. Skipping usage fee.`);
       return next();
     }
     const txHash = await sendUsageFee(pemContent);
@@ -203,26 +203,25 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     // Extract PEM and create a signer
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
-    const userAddress = signer.getAddress().toString();
+    // Do NOT convert the address to a string here; keep the Address object.
+    const userAddress = signer.getAddress();
 
     // Extract user inputs from request body
-    // For the ESDT Creator warp, the expected order is:
-    // [Token Name, Token Ticker, Initial Supply, Token Decimals]
+    // Expected order: [Token Name, Token Ticker, Initial Supply, Token Decimals]
     const { tokenName, tokenTicker, initialSupply, tokenDecimals } = req.body;
     if (!tokenName || !tokenTicker || !initialSupply || tokenDecimals === undefined) {
       throw new Error("Missing one or more required input fields.");
     }
 
     // Build an array of arguments using Warp typed notation.
-    // Note: The blueprint expects these in order.
     const args = [
       `string:${tokenName}`,    // Token Name
-      `string:${tokenTicker}`,    // Token Ticker
+      `string:${tokenTicker}`,  // Token Ticker
       `biguint:${initialSupply}`, // Initial Supply
-      `uint8:${tokenDecimals}`    // Token Decimals (this will be used as the exponent for scaling)
+      `uint8:${tokenDecimals}`    // Token Decimals
     ];
 
-    // Build the Warp using the on-chain warp hash
+    // Build the Warp using the provided on-chain warp hash
     const warpBuilder = new WarpBuilder(warpConfig);
     const warp = await warpBuilder.createFromTransactionHash(WARP_HASH);
     if (!warp) {
@@ -239,11 +238,11 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     const executorConfig = { ...warpConfig, userAddress };
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
 
-    // Create the transaction based on the array of arguments; assuming no extra transfers are needed.
+    // Create the transaction based on the array of arguments; assuming no extra transfers.
     const tx = warpActionExecutor.createTransactionForExecute(action, args, []);
 
     // Set nonce from network for the user's account
-    const accountOnNetwork = await provider.getAccount(userAddress);
+    const accountOnNetwork = await provider.getAccount(userAddress.toString());
     tx.nonce = accountOnNetwork.nonce;
 
     // Sign and send the transaction
