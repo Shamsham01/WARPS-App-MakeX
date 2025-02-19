@@ -218,6 +218,7 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
       "Token Decimals": tokenDecimals.toString()
     };
 
+
     // Build the Warp using the provided on-chain warp hash
     const warpBuilder = new WarpBuilder(warpConfig);
     const warp = await warpBuilder.createFromTransactionHash(WARP_HASH);
