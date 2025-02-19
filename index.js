@@ -20,7 +20,7 @@ import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 // Configuration & Environment variables
 // -------------------------------------------------------------
 const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
-// (Usage fee settings removed)
+// (Usage fee settings removed for now)
 const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85'; // Warp transaction hash
 
 // Warp configuration – note that later we’ll add userAddress to config.
@@ -82,7 +82,7 @@ function getPemContent(req) {
 
 function deriveWalletAddressFromPem(pemContent) {
   const signer = UserSigner.fromPem(pemContent);
-  return signer.getAddress(); // Return Address object
+  return signer.getAddress(); // returns an Address object
 }
 
 async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
@@ -140,14 +140,14 @@ app.post('/authorization', (req, res) => {
 });
 
 // -------------------------------------------------------------
-// Execute Warp Endpoint (Usage fee logic removed)
+// Execute Warp Endpoint
 // -------------------------------------------------------------
 app.post('/executeWarp', checkToken, async (req, res) => {
   try {
     // Extract PEM and create a signer
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
-    const userAddress = signer.getAddress(); // Preserve as Address object
+    const userAddress = signer.getAddress(); // Address object
 
     // Extract user inputs from request body for the ESDT Creator warp.
     // Expected order: [Token Name, Token Ticker, Initial Supply, Token Decimals]
@@ -156,35 +156,37 @@ app.post('/executeWarp', checkToken, async (req, res) => {
       throw new Error("Missing one or more required input fields.");
     }
 
-    // Build an array of arguments using the Warp typed notation.
+    // Build an array of arguments using Warp's typed notation.
+    // Note: For 'biguint' and 'uint8', the executor expects the typed string.
     const args = [
-      `string:${tokenName}`,       // Token Name
-      `string:${tokenTicker}`,     // Token Ticker
-      `biguint:${initialSupply}`,  // Initial Supply
-      `uint8:${tokenDecimals}`     // Token Decimals
+      `string:${tokenName}`,
+      `string:${tokenTicker}`,
+      `biguint:${initialSupply}`,
+      `uint8:${tokenDecimals}`
     ];
 
-    // Build the Warp using the provided on-chain warp hash.
+    // Build the Warp from the provided on-chain warp hash.
     const warpBuilder = new WarpBuilder(warpConfig);
     const warp = await warpBuilder.createFromTransactionHash(WARP_HASH);
     if (!warp) {
       throw new Error(`Could not load Warp from hash: ${WARP_HASH}`);
     }
 
-    // Use the first action from the Warp blueprint (for ESDT Creator, this should be "issue")
+    // Use the first action from the Warp blueprint (for ESDT Creator, this should be "issue").
     const action = warp.actions[0];
     if (!action) {
       throw new Error("No action found in this Warp blueprint!");
     }
 
-    // Create a WarpActionExecutor with updated config (including userAddress)
+    // Create a WarpActionExecutor with updated config (including userAddress).
     const executorConfig = { ...warpConfig, userAddress };
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
 
-    // Create the transaction based on the array of arguments; no extra transfers.
+    // Create the transaction based on the array of arguments.
     const tx = warpActionExecutor.createTransactionForExecute(action, args, []);
 
     // Set nonce from network for the user's account.
+    // Note: provider.getAccount expects a Bech32 string.
     const accountOnNetwork = await provider.getAccount(userAddress.bech32());
     tx.nonce = accountOnNetwork.nonce;
 
