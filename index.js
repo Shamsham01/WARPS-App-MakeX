@@ -116,7 +116,7 @@ app.post('/executeWarp', checkToken, async (req, res) => {
     // 1) Extract PEM and create a signer
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
-    const userAddress = signer.getAddress().toString();
+    const userAddress = signer.getAddress();
 
     // 2) Extract user inputs from request body
     // Expecting: tokenName, tokenTicker, initialSupply, tokenDecimals
