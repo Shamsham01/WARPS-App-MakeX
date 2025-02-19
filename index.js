@@ -1,14 +1,6 @@
 /**************************************************************************
  * index.js
- *
- * This Express API demonstrates:
- *  • An /authorization endpoint to check a Bearer token.
- *  • An /executeWarp endpoint that uses a user’s PEM and input data
- *    to execute a WARPS action (here, the "ESDT Creator" warp).
- *
- * This version does NOT include usage fee logic.
  **************************************************************************/
-
 import express from 'express';
 import bodyParser from 'body-parser';
 import fetch from 'node-fetch';
@@ -23,47 +15,67 @@ import { UserSigner } from '@multiversx/sdk-wallet';
 
 import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 
-// ----------------------------
-// Configuration & Environment Variables
-// ----------------------------
+// -------------------------------------------------------------
+// Configuration & Environment variables
+// -------------------------------------------------------------
 const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
-// The on-chain transaction hash for your ESDT Creator Warp
-const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85';
+const USAGE_FEE = 500; // Fee in REWARD tokens
+const REWARD_TOKEN = 'REWARD-cf6eac';
+const TREASURY_WALLET = 'erd1...'; // Your treasury wallet address
+const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85'; // Warp transaction hash
 
+// Warp configuration – note that later we’ll add userAddress and currentUrl
 const warpConfig = {
   providerUrl: "https://gateway.multiversx.com",
-  currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
+  currentUrl: process.env.CURRENT_URL || "http://localhost:3000"
 };
 
-
-// ----------------------------
-// Express Setup
-// ----------------------------
+// -------------------------------------------------------------
+// Express and local file setup
+// -------------------------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
+const whitelistFilePath = path.join(__dirname, 'whitelist.json');
 
 app.use(bodyParser.json());
 
-// ----------------------------
-// Authorization Middleware
-// ----------------------------
+// -------------------------------------------------------------
+// Middleware: Authorization check
+// -------------------------------------------------------------
 const checkToken = (req, res, next) => {
   const token = req.headers.authorization;
   if (token === `Bearer ${SECURE_TOKEN}`) {
-    return next();
+    next();
   } else {
-    return res.status(401).json({ error: 'Unauthorized' });
+    res.status(401).json({ error: 'Unauthorized' });
   }
 };
 
-// ----------------------------
-// PEM & Wallet Helpers
-// ----------------------------
+// -------------------------------------------------------------
+// Helper Functions
+// -------------------------------------------------------------
+function loadWhitelist() {
+  if (!fs.existsSync(whitelistFilePath)) {
+    fs.writeFileSync(whitelistFilePath, JSON.stringify([], null, 2));
+  }
+  const data = fs.readFileSync(whitelistFilePath);
+  return JSON.parse(data);
+}
+
+function isWhitelisted(walletAddress) {
+  const whitelist = loadWhitelist();
+  return whitelist.some(entry => entry.walletAddress === walletAddress);
+}
+
 function getPemContent(req) {
   const pemContent = req.body.walletPem;
-  if (!pemContent || typeof pemContent !== 'string' || !pemContent.includes('-----BEGIN PRIVATE KEY-----')) {
+  if (
+    !pemContent ||
+    typeof pemContent !== 'string' ||
+    !pemContent.includes('-----BEGIN PRIVATE KEY-----')
+  ) {
     throw new Error('Invalid PEM content');
   }
   return pemContent;
@@ -74,9 +86,6 @@ function deriveWalletAddressFromPem(pemContent) {
   return signer.getAddress().toString();
 }
 
-// ----------------------------
-// Transaction Helper: Check Transaction Status
-// ----------------------------
 async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
   const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
   for (let i = 0; i < retries; i++) {
@@ -101,69 +110,105 @@ async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
   throw new Error(`Transaction ${txHash} not determined after ${retries} retries.`);
 }
 
-// ----------------------------
-// Provider Initialization (for broadcasting transactions)
-// ----------------------------
-const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", {
-  clientName: "warp-integration"
-});
+async function getTokenDecimals(tokenTicker) {
+  const apiUrl = `https://api.multiversx.com/tokens/${tokenTicker}`;
+  const response = await fetch(apiUrl);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch token info: ${response.statusText}`);
+  }
+  const tokenInfo = await response.json();
+  return tokenInfo.decimals || 0;
+}
 
-// ----------------------------
-// Endpoint: /authorization
-// ----------------------------
+function convertAmountToBlockchainValue(amount, decimals) {
+  const factor = new BigNumber(10).pow(decimals);
+  return new BigNumber(amount).times(factor).toFixed(0);
+}
+
+async function sendUsageFee(pemContent) {
+  const signer = UserSigner.fromPem(pemContent);
+  const senderAddress = signer.getAddress();
+  const receiverAddress = new Address(TREASURY_WALLET);
+
+  const accountOnNetwork = await provider.getAccount(senderAddress);
+  const nonce = accountOnNetwork.nonce;
+  const decimals = await getTokenDecimals(REWARD_TOKEN);
+  const convertedAmount = convertAmountToBlockchainValue(USAGE_FEE, decimals);
+
+  // Build a simple ESDT transfer payload (adjust as needed)
+  const payload = Buffer.from(
+    JSON.stringify({
+      func: "ESDTTransfer",
+      args: [REWARD_TOKEN, convertedAmount.toString()]
+    })
+  );
+
+  const tx = new Transaction({
+    nonce,
+    receiver: receiverAddress,
+    sender: senderAddress,
+    value: 0,
+    gasLimit: 500000n,
+    data: payload,
+    chainID: "1"
+  });
+
+  await signer.sign(tx);
+  const txHash = await provider.sendTransaction(tx);
+  const status = await checkTransactionStatus(txHash.toString());
+  if (status.status !== "success") {
+    throw new Error('UsageFee transaction failed. Ensure you have enough REWARD tokens.');
+  }
+  return txHash.toString();
+}
+
+async function handleUsageFee(req, res, next) {
+  try {
+    const pemContent = getPemContent(req);
+    const walletAddress = deriveWalletAddressFromPem(pemContent);
+    if (isWhitelisted(walletAddress)) {
+      console.log(`Wallet ${walletAddress} is whitelisted. Skipping usage fee.`);
+      return next();
+    }
+    const txHash = await sendUsageFee(pemContent);
+    req.usageFeeHash = txHash;
+    return next();
+  } catch (error) {
+    console.error('Error processing usageFee:', error.message);
+    return res.status(400).json({ error: error.message });
+  }
+}
+
+// -------------------------------------------------------------
+// 1) Authorization Endpoint for Make.com
+// -------------------------------------------------------------
 app.post('/authorization', (req, res) => {
   try {
     const token = req.headers.authorization;
     if (token === `Bearer ${SECURE_TOKEN}`) {
       return res.json({ message: "Authorization successful" });
-    } else {
-      return res.status(401).json({ error: "Unauthorized" });
     }
+    return res.status(401).json({ error: "Unauthorized" });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
 });
 
-// ----------------------------
-// Endpoint: /executeWarp
-// Accepts user input for ESDT creation and executes the warp action.
-// ----------------------------
-app.post('/executeWarp', checkToken, async (req, res) => {
+// -------------------------------------------------------------
+// 2) Execute Warp Endpoint
+// -------------------------------------------------------------
+app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
   try {
-    // 1) Extract user PEM and create a signer
+    // Extract PEM and create a signer
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
     const userAddress = signer.getAddress().toString();
 
-    // Create the WarpActionExecutor with the user address set
-    const warpActionExecutor = new WarpActionExecutor({
-    ...warpConfig,
-    userAddress: userAddress,
-    });
-
-
-    // 2) Gather user inputs from the request body.
-    //    Expected inputs for the ESDT Creator warp:
-    //    "Token Name", "Token Ticker", "Initial Supply", "Token Decimals"
+    // Extract user inputs from request body for the ESDT Creator warp
     const { tokenName, tokenTicker, initialSupply, tokenDecimals } = req.body;
     if (!tokenName || !tokenTicker || !initialSupply || !tokenDecimals) {
-      throw new Error("Missing required input parameters.");
+      throw new Error("Missing one or more required input fields.");
     }
-
-    // 3) Build the Warp from the on-chain transaction hash.
-    const warpBuilder = new WarpBuilder(warpConfig);
-    const warp = await warpBuilder.createFromTransactionHash(WARP_HASH);
-    if (!warp) {
-      throw new Error(`Could not load Warp from hash: ${WARP_HASH}`);
-    }
-
-    // 4) Get the first action from the Warp blueprint.
-    const action = warp.actions[0];
-    if (!action) {
-      throw new Error("No action found in the Warp blueprint!");
-    }
-
-    // 5) Build the userInputs object (keys must exactly match those in the Warp blueprint).
     const userInputs = {
       "Token Name": tokenName,
       "Token Ticker": tokenTicker,
@@ -171,23 +216,37 @@ app.post('/executeWarp', checkToken, async (req, res) => {
       "Token Decimals": tokenDecimals
     };
 
-    // 6) Create the transaction using the WarpActionExecutor.
-    const warpActionExecutor = new WarpActionExecutor(warpConfig);
-    const tx = warpActionExecutor.createTransactionForExecute(action, userInputs, /*transfers*/ []);
+    // Build the Warp using the provided on-chain warp hash
+    const warpBuilder = new WarpBuilder(warpConfig);
+    const warp = await warpBuilder.createFromTransactionHash(WARP_HASH);
+    if (!warp) {
+      throw new Error(`Could not load Warp from hash: ${WARP_HASH}`);
+    }
 
-    // 7) Synchronize nonce with the network.
+    // Use the first action from the Warp blueprint (for ESDT Creator, this should be "issue")
+    const action = warp.actions[0];
+    if (!action) {
+      throw new Error("No action found in this Warp blueprint!");
+    }
+
+    // Create a WarpActionExecutor with updated config (including userAddress)
+    const executorConfig = { ...warpConfig, userAddress };
+    const warpActionExecutor = new WarpActionExecutor(executorConfig);
+
+    // Create the transaction based on user inputs; assuming no extra transfers are needed
+    const tx = warpActionExecutor.createTransactionForExecute(action, userInputs, []);
+
+    // Set nonce from network for the user's account
     const accountOnNetwork = await provider.getAccount(userAddress);
     tx.nonce = accountOnNetwork.nonce;
 
-    // 8) Sign and send the transaction.
+    // Sign and send the transaction
     await signer.sign(tx);
     const txHash = await provider.sendTransaction(tx);
-
-    // 9) Wait for the transaction to complete.
     const status = await checkTransactionStatus(txHash.toString());
 
-    // 10) Return the result.
     return res.json({
+      usageFeeHash: req.usageFeeHash || null,
       warpHash: WARP_HASH,
       finalTxHash: txHash.toString(),
       finalStatus: status.status
@@ -198,9 +257,9 @@ app.post('/executeWarp', checkToken, async (req, res) => {
   }
 });
 
-// ----------------------------
+// -------------------------------------------------------------
 // Start the Express server
-// ----------------------------
+// -------------------------------------------------------------
 app.listen(PORT, () => {
   console.log(`Warp integration app is running on port ${PORT}`);
 });
