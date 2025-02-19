@@ -14,7 +14,6 @@ import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
 
 import { UserSigner } from '@multiversx/sdk-wallet';
-
 import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 
 // -------------------------------------------------------------
@@ -23,10 +22,10 @@ import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
 const USAGE_FEE = 500; // Fee in REWARD tokens
 const REWARD_TOKEN = 'REWARD-cf6eac';
-const TREASURY_WALLET = process.env.TREASURY_WALLET || 'erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn'; // Your treasury wallet address
+const TREASURY_WALLET = process.env.TREASURY_WALLET || 'erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn';
 const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85'; // Warp transaction hash
 
-// Warp configuration – note that later we’ll add userAddress and currentUrl
+// Warp configuration – note that later we’ll add userAddress to config.
 const warpConfig = {
   providerUrl: "https://gateway.multiversx.com",
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
@@ -208,14 +207,15 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
 
     // Extract user inputs from request body for the ESDT Creator warp
     const { tokenName, tokenTicker, initialSupply, tokenDecimals } = req.body;
-    if (!tokenName || !tokenTicker || !initialSupply || !tokenDecimals) {
+    if (!tokenName || !tokenTicker || !initialSupply || tokenDecimals === undefined) {
       throw new Error("Missing one or more required input fields.");
     }
+    // Convert tokenDecimals to string so the modifier "scale:Token Decimals" can find it
     const userInputs = {
       "Token Name": tokenName,
       "Token Ticker": tokenTicker,
       "Initial Supply": initialSupply,
-      "Token Decimals": tokenDecimals
+      "Token Decimals": tokenDecimals.toString()
     };
 
     // Build the Warp using the provided on-chain warp hash
