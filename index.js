@@ -11,6 +11,8 @@ import BigNumber from 'bignumber.js';
 
 import { Address, Transaction } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
+const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
+
 import { UserSigner } from '@multiversx/sdk-wallet';
 
 import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
