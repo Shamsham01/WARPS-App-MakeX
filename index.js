@@ -14,7 +14,7 @@ import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
 
 import { UserSigner } from '@multiversx/sdk-wallet';
-import { WarpBuilder, WarpActionExecutor, WarpArgSerializer } from '@vleap/warps';
+import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 
 // -------------------------------------------------------------
 // Configuration & Environment variables
@@ -136,7 +136,7 @@ async function sendUsageFee(pemContent) {
   const decimals = await getTokenDecimals(REWARD_TOKEN);
   const convertedAmount = convertAmountToBlockchainValue(USAGE_FEE, decimals);
 
-  // Build a simple ESDT transfer payload (basic JSON payload)
+  // Build a simple ESDT transfer payload (using basic JSON payload)
   const payload = Buffer.from(
     JSON.stringify({
       func: "ESDTTransfer",
@@ -206,21 +206,20 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     const userAddress = signer.getAddress().toString();
 
     // Extract user inputs from request body
-    // IMPORTANT: For the ESDT Creator warp, the expected order is:
+    // For the ESDT Creator warp, the expected order is:
     // [Token Name, Token Ticker, Initial Supply, Token Decimals]
     const { tokenName, tokenTicker, initialSupply, tokenDecimals } = req.body;
     if (!tokenName || !tokenTicker || !initialSupply || tokenDecimals === undefined) {
       throw new Error("Missing one or more required input fields.");
     }
 
-    // Use WarpArgSerializer to convert native values to Warp typed notation.
-    // Note: For tokenDecimals we now use "uint" so the scaling modifier can parse the exponent.
-    const argSerializer = new WarpArgSerializer(warpConfig);
+    // Build an array of arguments using Warp typed notation.
+    // Note: The blueprint expects these in order.
     const args = [
-      argSerializer.nativeToString(tokenName, "string"),     // e.g. "string:MyToken"
-      argSerializer.nativeToString(tokenTicker, "string"),     // e.g. "string:MYTKN"
-      argSerializer.nativeToString(initialSupply, "biguint"),  // e.g. "biguint:1000000"
-      argSerializer.nativeToString(tokenDecimals, "uint")      // e.g. "uint:18"
+      `string:${tokenName}`,    // Token Name
+      `string:${tokenTicker}`,    // Token Ticker
+      `biguint:${initialSupply}`, // Initial Supply
+      `uint8:${tokenDecimals}`    // Token Decimals (this will be used as the exponent for scaling)
     ];
 
     // Build the Warp using the on-chain warp hash
