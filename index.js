@@ -181,7 +181,7 @@ async function handleUsageFee(req, res, next) {
 }
 
 // -------------------------------------------------------------
-// 1) Authorization Endpoint for Make.com
+// Authorization Endpoint for Make.com
 // -------------------------------------------------------------
 app.post('/authorization', (req, res) => {
   try {
@@ -196,7 +196,7 @@ app.post('/authorization', (req, res) => {
 });
 
 // -------------------------------------------------------------
-// 2) Execute Warp Endpoint
+// Execute Warp Endpoint
 // -------------------------------------------------------------
 app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
   try {
@@ -210,14 +210,13 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     if (!tokenName || !tokenTicker || !initialSupply || tokenDecimals === undefined) {
       throw new Error("Missing one or more required input fields.");
     }
-    // Convert tokenDecimals to string so the modifier "scale:Token Decimals" can find it
+    // Pass tokenDecimals as a number (do not convert to string)
     const userInputs = {
       "Token Name": tokenName,
       "Token Ticker": tokenTicker,
       "Initial Supply": initialSupply,
-      "Token Decimals": tokenDecimals.toString()
+      "Token Decimals": tokenDecimals
     };
-
 
     // Build the Warp using the provided on-chain warp hash
     const warpBuilder = new WarpBuilder(warpConfig);
