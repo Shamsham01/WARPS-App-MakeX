@@ -4,12 +4,15 @@
 import express from 'express';
 import bodyParser from 'body-parser';
 import fetch from 'node-fetch';
-import { fileURLToPath } from 'url';
+import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import BigNumber from 'bignumber.js';
 
 import { Address, Transaction } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
+const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
+
 import { UserSigner } from '@multiversx/sdk-wallet';
 import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 
@@ -17,17 +20,17 @@ import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 // Configuration & Environment variables
 // -------------------------------------------------------------
 const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
-// The on-chain transaction hash for the ESDT Creator Warp
-const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85';
+// For now we remove usage fee logic
+const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85'; // Warp transaction hash
 
-// Warp configuration – note that later we add the userAddress to the config
+// Warp configuration – note: we add userAddress later (as an Address instance)
 const warpConfig = {
   providerUrl: "https://gateway.multiversx.com",
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
 };
 
 // -------------------------------------------------------------
-// Express setup
+// Express and local file setup
 // -------------------------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -51,8 +54,9 @@ const checkToken = (req, res, next) => {
 // -------------------------------------------------------------
 // Helper Functions
 // -------------------------------------------------------------
-// Extract the full PEM content from the request body
-const getPemContent = (req) => {
+// (Whitelist logic omitted for simplicity)
+
+function getPemContent(req) {
   const pemContent = req.body.walletPem;
   if (
     !pemContent ||
@@ -62,14 +66,14 @@ const getPemContent = (req) => {
     throw new Error('Invalid PEM content');
   }
   return pemContent;
-};
+}
 
-// Derive a wallet address from the PEM using the SDK;
-// IMPORTANT: Return the Address instance so that methods like .bech32() are available.
-const deriveWalletAddressFromPem = (pemContent) => {
+// IMPORTANT: Do not convert the address to string!
+// Return the Address instance directly so that methods like .bech32() are available.
+function deriveWalletAddressFromPem(pemContent) {
   const signer = UserSigner.fromPem(pemContent);
   return signer.getAddress();
-};
+}
 
 async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
   const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
@@ -77,6 +81,7 @@ async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
     try {
       const response = await fetch(txStatusUrl);
       if (!response.ok) {
+        console.warn(`Non-200 response for ${txHash}: ${response.status}`);
         throw new Error(`HTTP error ${response.status}`);
       }
       const txStatus = await response.json();
@@ -92,6 +97,21 @@ async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
     await new Promise(resolve => setTimeout(resolve, delay));
   }
   throw new Error(`Transaction ${txHash} not determined after ${retries} retries.`);
+}
+
+async function getTokenDecimals(tokenTicker) {
+  const apiUrl = `https://api.multiversx.com/tokens/${tokenTicker}`;
+  const response = await fetch(apiUrl);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch token info: ${response.statusText}`);
+  }
+  const tokenInfo = await response.json();
+  return tokenInfo.decimals || 0;
+}
+
+function convertAmountToBlockchainValue(amount, decimals) {
+  const factor = new BigNumber(10).pow(decimals);
+  return new BigNumber(amount).times(factor).toFixed(0);
 }
 
 // -------------------------------------------------------------
@@ -114,25 +134,26 @@ app.post('/authorization', (req, res) => {
 // -------------------------------------------------------------
 app.post('/executeWarp', checkToken, async (req, res) => {
   try {
-    // 1) Extract the PEM and create a signer
+    // Extract PEM and create a signer
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
-    // Use the full Address instance (do not convert to string)
+    // IMPORTANT: Do not convert to string; use the Address instance directly.
     const userAddress = signer.getAddress();
 
-    // 2) Extract user inputs from the request body.
-    // The ESDT Creator warp expects four inputs (in this order):
-    //   - Token Name (string)
-    //   - Token Ticker (string)
-    //   - Initial Supply (biguint)
-    //   - Token Decimals (uint8)
+    // Extract user inputs from request body for the ESDT Creator warp
     const { tokenName, tokenTicker, initialSupply, tokenDecimals } = req.body;
     if (!tokenName || !tokenTicker || !initialSupply || tokenDecimals === undefined) {
       throw new Error("Missing one or more required input fields.");
     }
 
-    // 3) Build the array of user inputs using the custom typed notation.
-    // Note: Make sure the order matches the blueprint.
+    // The Warp blueprint expects arguments as an array in the correct order,
+    // using the Warp custom notation.
+    // For example:
+    // - For token name: "string:MyToken"
+    // - For token ticker: "string:MYTKN"
+    // - For initial supply: "biguint:1000000"
+    // - For token decimals: "uint8:18"
+    // (If you need to adjust the notation, do so here.)
     const userInputsArray = [
       `string:${tokenName}`,
       `string:${tokenTicker}`,
@@ -140,32 +161,32 @@ app.post('/executeWarp', checkToken, async (req, res) => {
       `uint8:${tokenDecimals}`
     ];
 
-    // 4) Build the Warp using the provided on-chain warp hash.
+    // Build the Warp using the provided on-chain warp hash
     const warpBuilder = new WarpBuilder(warpConfig);
     const warp = await warpBuilder.createFromTransactionHash(WARP_HASH);
     if (!warp) {
       throw new Error(`Could not load Warp from hash: ${WARP_HASH}`);
     }
 
-    // 5) Select the first action from the Warp blueprint.
+    // Use the first action from the Warp blueprint (for ESDT Creator, this should be "issue")
     const action = warp.actions[0];
     if (!action) {
       throw new Error("No action found in this Warp blueprint!");
     }
 
-    // 6) Create a WarpActionExecutor with updated config (including the userAddress).
+    // Create a WarpActionExecutor with updated config (including userAddress)
     const executorConfig = { ...warpConfig, userAddress };
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
 
-    // 7) Create the transaction using the array of user inputs.
+    // Create the transaction based on user inputs; assuming no extra transfers are needed
+    // Note: we pass an array of arguments, not an object.
     const tx = warpActionExecutor.createTransactionForExecute(action, userInputsArray, []);
 
-    // 8) Retrieve the account nonce from the network and set it on the transaction.
-    const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
+    // Set nonce from network for the user's account
     const accountOnNetwork = await provider.getAccount(userAddress);
     tx.nonce = accountOnNetwork.nonce;
 
-    // 9) Sign and send the transaction.
+    // Sign and send the transaction
     await signer.sign(tx);
     const txHash = await provider.sendTransaction(tx);
     const status = await checkTransactionStatus(txHash.toString());
