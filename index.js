@@ -138,7 +138,7 @@ app.post('/executeWarp', checkToken, async (req, res) => {
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
     // IMPORTANT: Do not convert to string; use the Address instance directly.
-    const userAddress = signer.getAddress();
+    const userAddress = signer.getAddress().trim();
 
     // Extract user inputs from request body for the ESDT Creator warp
     const { tokenName, tokenTicker, initialSupply, tokenDecimals } = req.body;
