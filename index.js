@@ -62,9 +62,9 @@ async function fetchWarpInfo(warpId) {
   };
 }
 
-// Helper: Check transaction status with improved retry logic
-async function checkTransactionStatus(txHash, retries = 60, delay = 10000) { // Increased retries and delay
-  const txStatusUrl = `https://devnet-api.multiversx.com/transactions/${txHash}`; // Use devnet API
+// Helper: Check transaction status (reverted to original with added logging)
+async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
+  const txStatusUrl = `https://devnet-api.multiversx.com/transactions/${txHash}`;
   for (let i = 0; i < retries; i++) {
     try {
       console.log(`Attempt ${i + 1}/${retries} to check transaction ${txHash} status...`);
@@ -85,7 +85,6 @@ async function checkTransactionStatus(txHash, retries = 60, delay = 10000) { // 
     } catch (error) {
       console.error(`Error fetching transaction ${txHash} (attempt ${i + 1}): ${error.message}`);
       if (i === retries - 1) throw new Error(`Transaction ${txHash} not determined after ${retries} retries.`);
-      await new Promise(resolve => setTimeout(resolve, delay)); // Retry on error
     }
   }
   throw new Error(`Transaction ${txHash} not determined after ${retries} retries.`);
