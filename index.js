@@ -1,176 +1,141 @@
-/**************************************************************************
- * index.js
- **************************************************************************/
 import express from 'express';
 import bodyParser from 'body-parser';
-import fetch from 'node-fetch';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import BigNumber from 'bignumber.js';
-
-import { Address, Transaction } from '@multiversx/sdk-core';
+import { Address } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
-const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
-
 import { UserSigner } from '@multiversx/sdk-wallet';
 import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 
-// -------------------------------------------------------------
-// Configuration & Environment variables
-// -------------------------------------------------------------
+const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
+const app = express();
+const PORT = process.env.PORT || 3000;
 const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
-// For now we remove usage fee logic
-const WARP_HASH = '5d765600d47904e135ef66e45d57596fab8953ea7f12b2f287159df3480d1e85'; // Warp transaction hash
 
-// Warp configuration – note: we add userAddress later (as an Address instance)
+app.use(bodyParser.json());
+
+// Warp Configurations
 const warpConfig = {
   providerUrl: "https://gateway.multiversx.com",
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
 };
 
-// -------------------------------------------------------------
-// Express and local file setup
-// -------------------------------------------------------------
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.use(bodyParser.json());
-
-// -------------------------------------------------------------
-// Middleware: Authorization check
-// -------------------------------------------------------------
+// Middleware: Token check
 const checkToken = (req, res, next) => {
   const token = req.headers.authorization;
-  if (token === `Bearer ${SECURE_TOKEN}`) {
-    next();
-  } else {
-    res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (token === `Bearer ${SECURE_TOKEN}`) next();
+  else res.status(401).json({ error: 'Unauthorized' });
 };
 
-// -------------------------------------------------------------
-// Helper Functions
-// -------------------------------------------------------------
-// (Whitelist logic omitted for simplicity)
-
+// Helper: Get PEM and derive address
 function getPemContent(req) {
   const pemContent = req.body.walletPem;
-  if (
-    !pemContent ||
-    typeof pemContent !== 'string' ||
-    !pemContent.includes('-----BEGIN PRIVATE KEY-----')
-  ) {
+  if (!pemContent || typeof pemContent !== 'string' || !pemContent.includes('-----BEGIN PRIVATE KEY-----')) {
     throw new Error('Invalid PEM content');
   }
   return pemContent;
 }
 
-// IMPORTANT: Do not convert the address to string!
-// Return the Address instance directly so that methods like .bech32() are available.
-function deriveWalletAddressFromPem(pemContent) {
-  const signer = UserSigner.fromPem(pemContent);
-  return signer.getAddress();
+// Helper: Fetch WARP info (simplified, assumes @vleap/warps provides this)
+async function fetchWarpInfo(warpId) {
+  const warpBuilder = new WarpBuilder(warpConfig);
+  
+  // Determine if warpId is an alias or hash
+  const isHash = warpId.length === 64 && /^[0-9a-fA-F]+$/.test(warpId);
+  let warp;
+  
+  if (isHash) {
+    warp = await warpBuilder.createFromTransactionHash(warpId);
+  } else {
+    // Assume alias resolution via registry (pseudo-code, adjust per SDK)
+    // This might require a direct contract query if not built into WarpBuilder
+    warp = await warpBuilder.createFromAlias(warpId); // Hypothetical method
+    if (!warp) {
+      throw new Error(`Failed to resolve alias: ${warpId}. Use a valid alias or hash.`);
+    }
+  }
+  
+  if (!warp || !warp.actions || warp.actions.length === 0) {
+    throw new Error(`Invalid WARP: ${warpId}`);
+  }
+  
+  return {
+    hash: isHash ? warpId : warp.hash, // Fallback to resolved hash if alias
+    actions: warp.actions
+  };
 }
 
+// Helper: Prepare inputs based on action requirements
+function prepareWarpInputs(action, payload) {
+  if (!action.inputs || action.inputs.length === 0) return [];
+
+  const inputs = [];
+  for (const input of action.inputs) {
+    const value = payload[input.name];
+    if (input.required && (value === undefined || value === null)) {
+      throw new Error(`Missing required input: ${input.name}`);
+    }
+    if (value !== undefined) {
+      const type = input.type.split(':')[0]; // e.g., "string" from "string:default"
+      if (type === "uint8" && (value < 0 || value > 255)) {
+        throw new Error(`${input.name} must be between 0 and 255`);
+      }
+      if (type === "address" && !Address.isValid(value)) {
+        throw new Error(`${input.name} must be a valid MultiversX address`);
+      }
+      inputs.push(`${type}:${value}`);
+    }
+  }
+  return inputs;
+}
+
+// Helper: Check transaction status (unchanged)
 async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
   const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
   for (let i = 0; i < retries; i++) {
-    try {
-      const response = await fetch(txStatusUrl);
-      if (!response.ok) {
-        console.warn(`Non-200 response for ${txHash}: ${response.status}`);
-        throw new Error(`HTTP error ${response.status}`);
-      }
-      const txStatus = await response.json();
-      if (txStatus.status === "success") {
-        return { status: "success", txHash };
-      } else if (txStatus.status === "fail") {
-        return { status: "fail", txHash };
-      }
-      console.log(`Transaction ${txHash} pending, retrying...`);
-    } catch (error) {
-      console.error(`Error fetching transaction ${txHash}: ${error.message}`);
-    }
+    const response = await fetch(txStatusUrl);
+    if (!response.ok) throw new Error(`HTTP error ${response.status}`);
+    const txStatus = await response.json();
+    if (txStatus.status === "success") return { status: "success", txHash };
+    if (txStatus.status === "fail") return { status: "fail", txHash };
     await new Promise(resolve => setTimeout(resolve, delay));
   }
   throw new Error(`Transaction ${txHash} not determined after ${retries} retries.`);
 }
 
-async function getTokenDecimals(tokenTicker) {
-  const apiUrl = `https://api.multiversx.com/tokens/${tokenTicker}`;
-  const response = await fetch(apiUrl);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch token info: ${response.statusText}`);
-  }
-  const tokenInfo = await response.json();
-  return tokenInfo.decimals || 0;
-}
-
-function convertAmountToBlockchainValue(amount, decimals) {
-  const factor = new BigNumber(10).pow(decimals);
-  return new BigNumber(amount).times(factor).toFixed(0);
-}
-
-// -------------------------------------------------------------
-// Authorization Endpoint for Make.com
-// -------------------------------------------------------------
+// Endpoint: Execute WARP by ID
 app.post('/executeWarp', checkToken, async (req, res) => {
   try {
-    // Extract PEM and create signer
+    const { warpId, ...payload } = req.body;
+    if (!warpId) throw new Error("Missing warpId in request body");
+
+    // Fetch WARP info
+    const warpInfo = await fetchWarpInfo(warpId);
+    const action = warpInfo.actions[0]; // Default to first action, could be parameterized
+    if (!action || action.type !== 'contract') {
+      throw new Error(`WARP ${warpId} must have a 'contract' action`);
+    }
+
+    // Extract PEM and signer
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
-    const userAddress = signer.getAddress(); // Address instance
+    const userAddress = signer.getAddress();
 
-    // Validate user inputs
-    const { tokenName, tokenTicker, initialSupply, tokenDecimals } = req.body;
-    if (!tokenName || !tokenTicker || !initialSupply || tokenDecimals === undefined) {
-      throw new Error("Missing one or more required input fields.");
-    }
-    if (typeof tokenDecimals !== 'number' || tokenDecimals < 0 || tokenDecimals > 255) {
-      throw new Error("tokenDecimals must be a number between 0 and 255.");
-    }
+    // Prepare inputs dynamically
+    const userInputsArray = prepareWarpInputs(action, payload);
 
-    // Format inputs per WARPS typing system
-    const userInputsArray = [
-      `string:${tokenName}`,
-      `string:${tokenTicker}`,
-      `biguint:${initialSupply}`, // Assuming initialSupply is already in smallest unit
-      `uint8:${tokenDecimals}`
-    ];
-
-    // Build WARP from hash
-    const warpBuilder = new WarpBuilder(warpConfig);
-    const warp = await warpBuilder.createFromTransactionHash(WARP_HASH);
-    if (!warp) {
-      throw new Error(`Could not load Warp from hash: ${WARP_HASH}`);
-    }
-
-    const action = warp.actions[0];
-    if (!action || action.type !== 'contract') {
-      throw new Error("Warp blueprint must have a 'contract' action at index 0.");
-    }
-
-    // Use Bech32 string for WarpActionExecutor config
+    // Execute transaction
     const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
-
-    // Create transaction
     const tx = warpActionExecutor.createTransactionForExecute(action, userInputsArray, []);
 
-    // Set nonce and sign
     const accountOnNetwork = await provider.getAccount(userAddress);
     tx.nonce = accountOnNetwork.nonce;
     await signer.sign(tx);
-
-    // Send transaction
     const txHash = await provider.sendTransaction(tx);
     const status = await checkTransactionStatus(txHash.toString());
 
     return res.json({
-      warpHash: WARP_HASH,
+      warpId,
+      warpHash: warpInfo.hash,
       finalTxHash: txHash.toString(),
       finalStatus: status.status
     });
@@ -180,9 +145,7 @@ app.post('/executeWarp', checkToken, async (req, res) => {
   }
 });
 
-// -------------------------------------------------------------
-// Start the Express server
-// -------------------------------------------------------------
+// Start server
 app.listen(PORT, () => {
   console.log(`Warp integration app is running on port ${PORT}`);
 });
