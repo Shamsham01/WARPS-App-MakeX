@@ -117,77 +117,55 @@ function convertAmountToBlockchainValue(amount, decimals) {
 // -------------------------------------------------------------
 // Authorization Endpoint for Make.com
 // -------------------------------------------------------------
-app.post('/authorization', (req, res) => {
-  try {
-    const token = req.headers.authorization;
-    if (token === `Bearer ${SECURE_TOKEN}`) {
-      return res.json({ message: "Authorization successful" });
-    }
-    return res.status(401).json({ error: "Unauthorized" });
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// -------------------------------------------------------------
-// Execute Warp Endpoint
-// -------------------------------------------------------------
 app.post('/executeWarp', checkToken, async (req, res) => {
   try {
-    // Extract PEM and create a signer
+    // Extract PEM and create signer
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
-    // IMPORTANT: Do not convert to string; use the Address instance directly.
-    const userAddress = signer.getAddress();
+    const userAddress = signer.getAddress(); // Address instance
 
-    // Extract user inputs from request body for the ESDT Creator warp
+    // Validate user inputs
     const { tokenName, tokenTicker, initialSupply, tokenDecimals } = req.body;
     if (!tokenName || !tokenTicker || !initialSupply || tokenDecimals === undefined) {
       throw new Error("Missing one or more required input fields.");
     }
+    if (typeof tokenDecimals !== 'number' || tokenDecimals < 0 || tokenDecimals > 255) {
+      throw new Error("tokenDecimals must be a number between 0 and 255.");
+    }
 
-    // The Warp blueprint expects arguments as an array in the correct order,
-    // using the Warp custom notation.
-    // For example:
-    // - For token name: "string:MyToken"
-    // - For token ticker: "string:MYTKN"
-    // - For initial supply: "biguint:1000000"
-    // - For token decimals: "uint8:18"
-    // (If you need to adjust the notation, do so here.)
+    // Format inputs per WARPS typing system
     const userInputsArray = [
       `string:${tokenName}`,
       `string:${tokenTicker}`,
-      `biguint:${initialSupply}`,
+      `biguint:${initialSupply}`, // Assuming initialSupply is already in smallest unit
       `uint8:${tokenDecimals}`
     ];
 
-    // Build the Warp using the provided on-chain warp hash
+    // Build WARP from hash
     const warpBuilder = new WarpBuilder(warpConfig);
     const warp = await warpBuilder.createFromTransactionHash(WARP_HASH);
     if (!warp) {
       throw new Error(`Could not load Warp from hash: ${WARP_HASH}`);
     }
 
-    // Use the first action from the Warp blueprint (for ESDT Creator, this should be "issue")
     const action = warp.actions[0];
-    if (!action) {
-      throw new Error("No action found in this Warp blueprint!");
+    if (!action || action.type !== 'contract') {
+      throw new Error("Warp blueprint must have a 'contract' action at index 0.");
     }
 
-    // Create a WarpActionExecutor with updated config (including userAddress)
-    const executorConfig = { ...warpConfig, userAddress };
+    // Use Bech32 string for WarpActionExecutor config
+    const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
 
-    // Create the transaction based on user inputs; assuming no extra transfers are needed
-    // Note: we pass an array of arguments, not an object.
+    // Create transaction
     const tx = warpActionExecutor.createTransactionForExecute(action, userInputsArray, []);
 
-    // Set nonce from network for the user's account
+    // Set nonce and sign
     const accountOnNetwork = await provider.getAccount(userAddress);
     tx.nonce = accountOnNetwork.nonce;
-
-    // Sign and send the transaction
     await signer.sign(tx);
+
+    // Send transaction
     const txHash = await provider.sendTransaction(tx);
     const status = await checkTransactionStatus(txHash.toString());
 
