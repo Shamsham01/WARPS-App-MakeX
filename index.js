@@ -63,7 +63,7 @@ async function fetchWarpInfo(warpId) {
 }
 
 // Helper: Check transaction status
-async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // Reduced retries to 20, delay to 3s
+async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // Keep reduced retries and delay
   const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
   for (let i = 0; i < retries; i++) {
     try {
@@ -76,11 +76,15 @@ async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // R
       const txStatus = await response.json();
       console.log(`Transaction ${txHash} status: ${txStatus.status || 'undefined'}`);
 
-      // Check for success or failure
+      // Check for success, failure, or invalid status
       if (txStatus.status === "success") {
         return { status: "success", txHash };
-      } else if (txStatus.status === "fail") {
-        return { status: "fail", txHash, details: txStatus.error || 'No error details provided' };
+      } else if (txStatus.status === "fail" || txStatus.status === "invalid") {
+        return { 
+          status: "fail", 
+          txHash, 
+          details: txStatus.error || txStatus.receipt?.data || 'No error details provided' 
+        };
       } else if (txStatus.status === "pending" || !txStatus.status) {
         // Continue retrying if pending or status is missing
         await new Promise(resolve => setTimeout(resolve, delay));
