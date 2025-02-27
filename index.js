@@ -41,21 +41,29 @@ function getPemContent(req) {
   return pemContent;
 };
 
-// Helper: Fetch WARP info (simplified, assumes @vleap/warps handles aliases)
+// Helper: Fetch WARP info (with explicit registry support for aliases)
 async function fetchWarpInfo(warpId) {
   const warpBuilder = new WarpBuilder(warpConfig);
   
   // Determine if warpId is a hash or alias
   const isHash = warpId.length === 64 && /^[0-9a-fA-F]+$/.test(warpId);
   let warp;
-  
+
   if (isHash) {
     warp = await warpBuilder.createFromTransactionHash(warpId);
   } else {
-    // Placeholder for alias resolution (adjust if @vleap/warps has a specific method)
-    warp = await warpBuilder.createFromAlias?.(warpId) || await warpBuilder.createFromTransactionHash(warpId); // Fallback to hash if alias unsupported
-    if (!warp) {
-      throw new Error(`Failed to resolve alias: ${warpId}. Use a valid alias or hash.`);
+    // Try to resolve alias via registry or fallback to hash (if not supported by WarpBuilder)
+    try {
+      // Placeholder for registry query (adjust based on vLeap SDK or Multiversx API)
+      // This assumes @vleap/warps supports alias resolution or you implement registry interaction
+      warp = await warpBuilder.createFromAlias?.(warpId);
+      if (!warp) {
+        console.warn(`Alias ${warpId} not resolved by WarpBuilder, attempting as hash...`);
+        warp = await warpBuilder.createFromTransactionHash(warpId);
+      }
+    } catch (error) {
+      console.error(`Error resolving alias ${warpId}: ${error.message}`);
+      throw new Error(`Failed to resolve alias ${warpId}. Use a valid alias or hash.`);
     }
   }
   
@@ -63,10 +71,9 @@ async function fetchWarpInfo(warpId) {
     throw new Error(`Invalid WARP: ${warpId}`);
   }
   
-  return {
-    hash: isHash ? warpId : warp.hash || warpId, // Use resolved hash if available
-    actions: warp.actions
-  };
+  // Return the full blueprint for debugging/logging
+  console.log(`Fetched WARP Blueprint for ${warpId}:`, warp);
+  return warp; // Return the full warp object (including actions, inputs, etc.)
 }
 
 // Helper: Check transaction status with improved retry logic
@@ -100,24 +107,31 @@ async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // K
   throw new Error(`Transaction ${txHash} status could not be determined after ${retries} retries.`);
 }
 
-// Endpoint: Get WARP input requirements
+// Endpoint: Get WARP input requirements (updated to return full blueprint for debugging)
 app.get('/warpInfo', checkToken, async (req, res) => {
   try {
     const { warpId } = req.query;
     if (!warpId) throw new Error("Missing warpId in query parameters");
 
+    console.log(`Fetching WARP info for warpId: ${warpId}`);
     // Fetch WARP info
-    const warpInfo = await fetchWarpInfo(warpId);
-    const action = warpInfo.actions[0];
+    const warp = await fetchWarpInfo(warpId);
+    const action = warp.actions[0];
     if (!action || action.type !== 'contract') {
       throw new Error(`WARP ${warpId} must have a 'contract' action`);
     }
 
-    // Return input requirements
+    // Return input requirements and full blueprint for debugging
     const inputs = action.inputs || [];
+    console.log(`WARP Info Response:`, {
+      warpId,
+      warpHash: warp.hash || warpId,
+      inputs: inputs,
+      fullBlueprint: warp
+    });
     return res.json({
       warpId,
-      warpHash: warpInfo.hash,
+      warpHash: warp.hash || warpId,
       inputs: inputs.map(input => ({
         name: input.name,
         type: input.type.split(':')[0], // e.g., "string" from "string:default"
@@ -125,8 +139,10 @@ app.get('/warpInfo', checkToken, async (req, res) => {
         min: input.min,
         max: input.max,
         pattern: input.pattern,
-        patternDescription: input.patternDescription
-      }))
+        patternDescription: input.patternDescription,
+        modifier: input.modifier // Include modifier for scaling (e.g., "scale:18")
+      })),
+      fullBlueprint: warp // Optionally return full blueprint for debugging
     });
   } catch (error) {
     console.error("Error in /warpInfo:", error.message);
@@ -206,7 +222,7 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
       throw new Error(`WARP ${warpId} has no input requirements; use /executeWarp instead`);
     }
 
-    // Validate and prepare inputs dynamically
+    // Validate and prepare inputs dynamically, handling modifiers (e.g., scale:18)
     const userInputsArray = [];
     for (const input of action.inputs) {
       const value = inputs[input.name];
@@ -214,7 +230,16 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
         throw new Error(`Missing required input: ${input.name}`);
       }
       if (value !== undefined) {
+        let typedValue = value;
         const type = input.type.split(':')[0]; // e.g., "string" from "string:default"
+        
+        // Handle scaling for biguint with modifier (e.g., scale:18)
+        if (type === "biguint" && input.modifier && input.modifier.startsWith("scale:")) {
+          const decimals = parseInt(input.modifier.split(':')[1], 10);
+          if (isNaN(decimals)) throw new Error(`Invalid scale modifier for ${input.name}`);
+          typedValue = new BigNumber(value).times(new BigNumber(10).pow(decimals)).toFixed(0);
+        }
+
         if (type === "uint8" && (value < input.min || value > input.max)) {
           throw new Error(`${input.name} must be between ${input.min} and ${input.max}`);
         }
@@ -224,7 +249,7 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
         if (type === "string" && input.pattern && !new RegExp(input.pattern).test(value)) {
           throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
         }
-        userInputsArray.push(`${type}:${value}`);
+        userInputsArray.push(`${type}:${typedValue}`);
       }
     }
 
