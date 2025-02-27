@@ -63,43 +63,36 @@ async function fetchWarpInfo(warpId) {
 }
 
 // Helper: Check transaction status with improved retry logic
-async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // Keep reduced retries and delay
+async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // Keep reduced retries and delay for speed
   const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
   for (let i = 0; i < retries; i++) {
     try {
       console.log(`Attempt ${i + 1}/${retries} to check transaction ${txHash} status at ${new Date().toISOString()}...`);
-      const response = await fetch(txStatusUrl, { timeout: 5000 }); // Add timeout for fetch
+      const response = await fetch(txStatusUrl, { timeout: 5000 }); // Retain timeout
       if (!response.ok) {
-        console.warn(`Non-200 response for ${txHash}: ${response.status} - ${response.statusText}`);
-        throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
+        console.warn(`Non-200 response for ${txHash}: ${response.status}`);
+        throw new Error(`HTTP error ${response.status}`);
       }
       const txStatus = await response.json();
       console.log(`Transaction ${txHash} status: ${txStatus.status || 'undefined'}`);
 
-      // Check for success, failure, or invalid status
       if (txStatus.status === "success") {
         return { status: "success", txHash };
       } else if (txStatus.status === "fail" || txStatus.status === "invalid") {
-        return { 
-          status: "fail", 
-          txHash, 
-          details: txStatus.error || txStatus.receipt?.data || 'No error details provided' 
-        };
-      } else if (txStatus.status === "pending" || !txStatus.status) {
-        // Continue retrying if pending or status is missing
-        await new Promise(resolve => setTimeout(resolve, delay));
-        continue;
-      } else {
-        throw new Error(`Unexpected transaction status: ${txStatus.status}`);
+        return { status: "fail", txHash, details: txStatus.error || txStatus.receipt?.data || 'No error details provided' };
       }
+
+      // Treat any other status (including pending or missing) as needing a retry
+      console.log(`Transaction ${txHash} still pending, retrying...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
     } catch (error) {
       console.error(`Error fetching transaction ${txHash} (attempt ${i + 1}): ${error.message}`);
-      if (i === retries - 1) throw new Error(`Transaction ${txHash} not determined after ${retries} retries. Details: ${error.message}`);
-      await new Promise(resolve => setTimeout(resolve, delay)); // Retry on error
+      // Don't throw here—let the loop continue and throw only on final retry
     }
   }
-  throw new Error(`Transaction ${txHash} not determined after ${retries} retries.`);
+  throw new Error(`Transaction ${txHash} status could not be determined after ${retries} retries.`);
 }
+
 
 // Endpoint: Execute WARP with no user inputs
 app.post('/executeWarp', checkToken, async (req, res) => {
@@ -132,6 +125,12 @@ app.post('/executeWarp', checkToken, async (req, res) => {
     await signer.sign(tx);
     const txHash = await provider.sendTransaction(tx);
     const status = await checkTransactionStatus(txHash.toString());
+
+    if (status.status === "fail") {
+      return res.status(400).json({
+        error: `Transaction failed: ${status.details || 'Unknown reason'}`
+      });
+    }
 
     return res.json({
       warpId,
@@ -167,7 +166,7 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
       throw new Error(`WARP ${warpId} has no input requirements; use /executeWarp instead`);
     }
 
-    // Validate and prepare inputs
+    // Validate and prepare inputs dynamically
     const userInputsArray = [];
     for (const input of action.inputs) {
       const value = inputs[input.name];
@@ -176,11 +175,14 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
       }
       if (value !== undefined) {
         const type = input.type.split(':')[0]; // e.g., "string" from "string:default"
-        if (type === "uint8" && (value < 0 || value > 255)) {
-          throw new Error(`${input.name} must be between 0 and 255`);
+        if (type === "uint8" && (value < input.min || value > input.max)) {
+          throw new Error(`${input.name} must be between ${input.min} and ${input.max}`);
         }
         if (type === "address" && !Address.isValid(value)) {
-          throw new Error(`${input.name} must be a valid MultiversX address`);
+          throw new Error(`${input.name} must be a valid Multiversx address`);
+        }
+        if (type === "string" && input.pattern && !new RegExp(input.pattern).test(value)) {
+          throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
         }
         userInputsArray.push(`${type}:${value}`);
       }
@@ -197,6 +199,12 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
     const txHash = await provider.sendTransaction(tx);
     const status = await checkTransactionStatus(txHash.toString());
 
+    if (status.status === "fail") {
+      return res.status(400).json({
+        error: `Transaction failed: ${status.details || 'Unknown reason'}`
+      });
+    }
+
     return res.json({
       warpId,
       warpHash: warpInfo.hash,
@@ -208,6 +216,7 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
     return res.status(400).json({ error: error.message });
   }
 });
+
 
 // Start server
 app.listen(PORT, () => {
