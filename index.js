@@ -3,8 +3,7 @@ import bodyParser from 'body-parser';
 import { Address } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
-import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
-import { WarpRegistry } from '@vleap/warp-sdk';
+import { WarpBuilder, WarpActionExecutor, WarpRegistry, WarpLink } from '@vleap/warps'; // Use WarpRegistry and WarpLink from @vleap/warps
 import BigNumber from 'bignumber.js';
 
 // Use mainnet (revert to devnet by uncommenting the devnet line below)
@@ -21,17 +20,17 @@ app.use(bodyParser.json());
 const warpConfig = {
   providerUrl: "https://gateway.multiversx.com",
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
-  chainApiUrl: "https://api.multiversx.com", // Mainnet API for WarpRegistry
+  chainApiUrl: "https://api.multiversx.com", // Mainnet API for registry
   env: "mainnet", // Specify environment
-  registryContract: "erd1...", // Replace with actual registry contract address from vLeap docs (e.g., mainnet)
+  registryContract: "erd1qqqqqqqqqqqqqqqpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gq4hu", // Mainnet WARP Registry contract (replace if incorrect, check vLeap docs)
   userAddress: undefined // Optional, set if needed for transactions
 };
 // const warpConfig = {
 //   providerUrl: "https://devnet-gateway.multiversx.com",
 //   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
-//   chainApiUrl: "https://devnet-api.multiversx.com", // Devnet API for WarpRegistry
+//   chainApiUrl: "https://devnet-api.multiversx.com", // Devnet API for registry
 //   env: "devnet", // Specify environment
-//   registryContract: "erd1...", // Replace with devnet registry contract address
+//   registryContract: "erd1...", // Devnet WARP Registry contract (replace if incorrect)
 //   userAddress: undefined // Optional
 // };
 
@@ -62,10 +61,11 @@ async function initializeWarpRegistry() {
   return warpRegistry;
 }
 
-// Helper: Fetch WARP info (using WarpRegistry for aliases)
+// Helper: Fetch WARP info (using WarpRegistry or WarpLink from @vleap/warps)
 async function fetchWarpInfo(warpId) {
   const warpBuilder = new WarpBuilder(warpConfig);
   const registry = await initializeWarpRegistry();
+  const warpLink = new WarpLink(warpConfig); // Initialize WarpLink for detection
 
   // Determine if warpId is a hash or alias
   const isHash = warpId.length === 64 && /^[0-9a-fA-F]+$/.test(warpId);
@@ -74,19 +74,32 @@ async function fetchWarpInfo(warpId) {
   if (isHash) {
     warp = await warpBuilder.createFromTransactionHash(warpId);
   } else {
-    // Resolve alias via WarpRegistry
+    // Try to resolve alias via WarpLink.detect (preferred) or WarpRegistry.getInfoByAlias
     try {
-      console.log(`Resolving alias ${warpId} via WarpRegistry...`);
-      const { registryInfo } = await registry.getInfoByAlias(warpId, { ttl: 3600 }); // Cache for 1 hour
-      if (!registryInfo || !registryInfo.hash) {
-        throw new Error(`Alias ${warpId} not found in registry`);
+      console.log(`Resolving alias ${warpId} via WarpLink...`);
+      const result = await warpLink.detect(warpId); // WarpLink can resolve both hashes and aliases
+      if (!result || !result.hash) {
+        throw new Error(`Alias or ID ${warpId} not found`);
       }
-      const warpHash = registryInfo.hash;
+      const warpHash = result.hash;
       console.log(`Resolved alias ${warpId} to hash: ${warpHash}`);
       warp = await warpBuilder.createFromTransactionHash(warpHash);
     } catch (error) {
-      console.error(`Error resolving alias ${warpId}: ${error.message}`);
-      throw new Error(`Failed to resolve alias ${warpId}. Use a valid alias or hash.`);
+      console.error(`Error resolving alias ${warpId} via WarpLink: ${error.message}`);
+      // Fallback to WarpRegistry.getInfoByAlias
+      try {
+        console.log(`Falling back to WarpRegistry for alias ${warpId}...`);
+        const { registryInfo } = await registry.getInfoByAlias(warpId, { ttl: 3600 }); // Cache for 1 hour
+        if (!registryInfo || !registryInfo.hash) {
+          throw new Error(`Alias ${warpId} not found in registry`);
+        }
+        const warpHash = registryInfo.hash;
+        console.log(`Resolved alias ${warpId} to hash: ${warpHash}`);
+        warp = await warpBuilder.createFromTransactionHash(warpHash);
+      } catch (registryError) {
+        console.error(`Error resolving alias ${warpId} via WarpRegistry: ${registryError.message}`);
+        throw new Error(`Failed to resolve alias ${warpId}. Use a valid alias or hash.`);
+      }
     }
   }
   
