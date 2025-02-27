@@ -62,7 +62,7 @@ async function fetchWarpInfo(warpId) {
   };
 }
 
-// Helper: Check transaction status
+// Helper: Check transaction status with improved retry logic
 async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // Keep reduced retries and delay
   const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
   for (let i = 0; i < retries; i++) {
