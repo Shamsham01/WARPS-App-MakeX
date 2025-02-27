@@ -63,15 +63,36 @@ async function fetchWarpInfo(warpId) {
 }
 
 // Helper: Check transaction status
-async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
+async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // Reduced retries to 20, delay to 3s
   const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
   for (let i = 0; i < retries; i++) {
-    const response = await fetch(txStatusUrl);
-    if (!response.ok) throw new Error(`HTTP error ${response.status}`);
-    const txStatus = await response.json();
-    if (txStatus.status === "success") return { status: "success", txHash };
-    if (txStatus.status === "fail") return { status: "fail", txHash };
-    await new Promise(resolve => setTimeout(resolve, delay));
+    try {
+      console.log(`Attempt ${i + 1}/${retries} to check transaction ${txHash} status at ${new Date().toISOString()}...`);
+      const response = await fetch(txStatusUrl, { timeout: 5000 }); // Add timeout for fetch
+      if (!response.ok) {
+        console.warn(`Non-200 response for ${txHash}: ${response.status} - ${response.statusText}`);
+        throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
+      }
+      const txStatus = await response.json();
+      console.log(`Transaction ${txHash} status: ${txStatus.status || 'undefined'}`);
+
+      // Check for success or failure
+      if (txStatus.status === "success") {
+        return { status: "success", txHash };
+      } else if (txStatus.status === "fail") {
+        return { status: "fail", txHash, details: txStatus.error || 'No error details provided' };
+      } else if (txStatus.status === "pending" || !txStatus.status) {
+        // Continue retrying if pending or status is missing
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      } else {
+        throw new Error(`Unexpected transaction status: ${txStatus.status}`);
+      }
+    } catch (error) {
+      console.error(`Error fetching transaction ${txHash} (attempt ${i + 1}): ${error.message}`);
+      if (i === retries - 1) throw new Error(`Transaction ${txHash} not determined after ${retries} retries. Details: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, delay)); // Retry on error
+    }
   }
   throw new Error(`Transaction ${txHash} not determined after ${retries} retries.`);
 }
