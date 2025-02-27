@@ -5,18 +5,25 @@ import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
 import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 
+// Use mainnet (revert to devnet by uncommenting the devnet line below)
 const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
+// const provider = new ProxyNetworkProvider("https://devnet-gateway.multiversx.com", { clientName: "warp-integration" });
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
 
 app.use(bodyParser.json());
 
-// Warp Configurations
+// Warp Configurations (for mainnet, adjust for devnet by uncommenting devnet URL below)
 const warpConfig = {
   providerUrl: "https://gateway.multiversx.com",
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
 };
+// const warpConfig = {
+//   providerUrl: "https://devnet-gateway.multiversx.com",
+//   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
+// };
 
 // Middleware: Token check
 const checkToken = (req, res, next) => {
@@ -32,7 +39,7 @@ function getPemContent(req) {
     throw new Error('Invalid PEM content');
   }
   return pemContent;
-}
+};
 
 // Helper: Fetch WARP info (simplified, assumes @vleap/warps handles aliases)
 async function fetchWarpInfo(warpId) {
@@ -93,6 +100,39 @@ async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // K
   throw new Error(`Transaction ${txHash} status could not be determined after ${retries} retries.`);
 }
 
+// Endpoint: Get WARP input requirements
+app.get('/warpInfo', checkToken, async (req, res) => {
+  try {
+    const { warpId } = req.query;
+    if (!warpId) throw new Error("Missing warpId in query parameters");
+
+    // Fetch WARP info
+    const warpInfo = await fetchWarpInfo(warpId);
+    const action = warpInfo.actions[0];
+    if (!action || action.type !== 'contract') {
+      throw new Error(`WARP ${warpId} must have a 'contract' action`);
+    }
+
+    // Return input requirements
+    const inputs = action.inputs || [];
+    return res.json({
+      warpId,
+      warpHash: warpInfo.hash,
+      inputs: inputs.map(input => ({
+        name: input.name,
+        type: input.type.split(':')[0], // e.g., "string" from "string:default"
+        required: input.required || false,
+        min: input.min,
+        max: input.max,
+        pattern: input.pattern,
+        patternDescription: input.patternDescription
+      }))
+    });
+  } catch (error) {
+    console.error("Error in /warpInfo:", error.message);
+    return res.status(400).json({ error: error.message });
+  }
+});
 
 // Endpoint: Execute WARP with no user inputs
 app.post('/executeWarp', checkToken, async (req, res) => {
@@ -216,7 +256,6 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
     return res.status(400).json({ error: error.message });
   }
 });
-
 
 // Start server
 app.listen(PORT, () => {
