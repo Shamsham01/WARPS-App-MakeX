@@ -4,6 +4,8 @@ import { Address } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
 import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
+import { WarpRegistry } from '@vleap/warp-sdk'; // Import WarpRegistry from the warp-sdk
+import BigNumber from 'bignumber.js'; // For handling biguint scaling
 
 // Use mainnet (revert to devnet by uncommenting the devnet line below)
 const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
@@ -18,12 +20,22 @@ app.use(bodyParser.json());
 // Warp Configurations (for mainnet, adjust for devnet by uncommenting devnet URL below)
 const warpConfig = {
   providerUrl: "https://gateway.multiversx.com",
-  currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
+  currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
+  chainApiUrl: "https://api.multiversx.com", // Mainnet API for WarpRegistry
+  env: "mainnet", // Specify environment
+  registryContract: "erd1..."}, // Replace with actual registry contract address from vLeap docs
+  userAddress: undefined // Optional, set if needed for transactions
 };
 // const warpConfig = {
 //   providerUrl: "https://devnet-gateway.multiversx.com",
-//   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
+//   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
+//   chainApiUrl: "https://devnet-api.multiversx.com", // Devnet API for WarpRegistry
+//   env: "devnet", // Specify environment
+//   registryContract: "erd1..."}, // Replace with devnet registry contract address
+//   userAddress: undefined // Optional
 // };
+
+let warpRegistry; // Global instance for WarpRegistry
 
 // Middleware: Token check
 const checkToken = (req, res, next) => {
@@ -41,10 +53,20 @@ function getPemContent(req) {
   return pemContent;
 };
 
-// Helper: Fetch WARP info (with explicit registry support for aliases)
+// Helper: Initialize WarpRegistry (async to ensure config is loaded)
+async function initializeWarpRegistry() {
+  if (!warpRegistry) {
+    warpRegistry = new WarpRegistry(warpConfig);
+    await warpRegistry.init(); // Load registry configs
+  }
+  return warpRegistry;
+}
+
+// Helper: Fetch WARP info (using WarpRegistry for aliases)
 async function fetchWarpInfo(warpId) {
   const warpBuilder = new WarpBuilder(warpConfig);
-  
+  const registry = await initializeWarpRegistry();
+
   // Determine if warpId is a hash or alias
   const isHash = warpId.length === 64 && /^[0-9a-fA-F]+$/.test(warpId);
   let warp;
@@ -52,15 +74,16 @@ async function fetchWarpInfo(warpId) {
   if (isHash) {
     warp = await warpBuilder.createFromTransactionHash(warpId);
   } else {
-    // Try to resolve alias via registry or fallback to hash (if not supported by WarpBuilder)
+    // Resolve alias via WarpRegistry
     try {
-      // Placeholder for registry query (adjust based on vLeap SDK or Multiversx API)
-      // This assumes @vleap/warps supports alias resolution or you implement registry interaction
-      warp = await warpBuilder.createFromAlias?.(warpId);
-      if (!warp) {
-        console.warn(`Alias ${warpId} not resolved by WarpBuilder, attempting as hash...`);
-        warp = await warpBuilder.createFromTransactionHash(warpId);
+      console.log(`Resolving alias ${warpId} via WarpRegistry...`);
+      const { registryInfo } = await registry.getInfoByAlias(warpId, { ttl: 3600 }); // Cache for 1 hour
+      if (!registryInfo || !registryInfo.hash) {
+        throw new Error(`Alias ${warpId} not found in registry`);
       }
+      const warpHash = registryInfo.hash;
+      console.log(`Resolved alias ${warpId} to hash: ${warpHash}`);
+      warp = await warpBuilder.createFromTransactionHash(warpHash);
     } catch (error) {
       console.error(`Error resolving alias ${warpId}: ${error.message}`);
       throw new Error(`Failed to resolve alias ${warpId}. Use a valid alias or hash.`);
