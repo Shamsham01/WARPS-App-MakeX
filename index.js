@@ -5,16 +5,16 @@ import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
 import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
 
-const provider = new ProxyNetworkProvider("https://devnet-gateway.multiversx.com", { clientName: "warp-integration" });
+const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
 
 app.use(bodyParser.json());
 
-// Warp Configurations (for devnet)
+// Warp Configurations
 const warpConfig = {
-  providerUrl: "https://devnet-gateway.multiversx.com",
+  providerUrl: "https://gateway.multiversx.com",
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
 };
 
@@ -62,30 +62,16 @@ async function fetchWarpInfo(warpId) {
   };
 }
 
-// Helper: Check transaction status (reverted to original with added logging)
+// Helper: Check transaction status
 async function checkTransactionStatus(txHash, retries = 40, delay = 5000) {
-  const txStatusUrl = `https://devnet-api.multiversx.com/transactions/${txHash}`;
+  const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
   for (let i = 0; i < retries; i++) {
-    try {
-      console.log(`Attempt ${i + 1}/${retries} to check transaction ${txHash} status...`);
-      const response = await fetch(txStatusUrl);
-      if (!response.ok) {
-        console.warn(`Non-200 response for ${txHash}: ${response.status}`);
-        throw new Error(`HTTP error ${response.status}`);
-      }
-      const txStatus = await response.json();
-      console.log(`Transaction ${txHash} status: ${txStatus.status}`);
-
-      if (txStatus.status === "success") {
-        return { status: "success", txHash };
-      } else if (txStatus.status === "fail") {
-        return { status: "fail", txHash };
-      }
-      await new Promise(resolve => setTimeout(resolve, delay));
-    } catch (error) {
-      console.error(`Error fetching transaction ${txHash} (attempt ${i + 1}): ${error.message}`);
-      if (i === retries - 1) throw new Error(`Transaction ${txHash} not determined after ${retries} retries.`);
-    }
+    const response = await fetch(txStatusUrl);
+    if (!response.ok) throw new Error(`HTTP error ${response.status}`);
+    const txStatus = await response.json();
+    if (txStatus.status === "success") return { status: "success", txHash };
+    if (txStatus.status === "fail") return { status: "fail", txHash };
+    await new Promise(resolve => setTimeout(resolve, delay));
   }
   throw new Error(`Transaction ${txHash} not determined after ${retries} retries.`);
 }
@@ -156,7 +142,7 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
       throw new Error(`WARP ${warpId} has no input requirements; use /executeWarp instead`);
     }
 
-    // Validate and prepare inputs dynamically
+    // Validate and prepare inputs
     const userInputsArray = [];
     for (const input of action.inputs) {
       const value = inputs[input.name];
@@ -165,14 +151,11 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
       }
       if (value !== undefined) {
         const type = input.type.split(':')[0]; // e.g., "string" from "string:default"
-        if (type === "uint8" && (value < input.min || value > input.max)) {
-          throw new Error(`${input.name} must be between ${input.min} and ${input.max}`);
+        if (type === "uint8" && (value < 0 || value > 255)) {
+          throw new Error(`${input.name} must be between 0 and 255`);
         }
         if (type === "address" && !Address.isValid(value)) {
           throw new Error(`${input.name} must be a valid MultiversX address`);
-        }
-        if (type === "string" && input.pattern && !new RegExp(input.pattern).test(value)) {
-          throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
         }
         userInputsArray.push(`${type}:${value}`);
       }
