@@ -22,7 +22,7 @@ const warpConfig = {
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
   chainApiUrl: "https://api.multiversx.com", // Mainnet API for registry
   env: "mainnet", // Specify environment
-  registryContract: "erd1qqqqqqqqqqqqqqqpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gq4hu", // Mainnet WARP Registry contract (replace if incorrect, check vLeap docs)
+  registryContract: "erd1qqqqqqqqqqqqqpgq3mrpj3u6q7tejv6d7eqhnyd27n9v5c5tl3ts08mffe",
   userAddress: undefined // Optional, set if needed for transactions
 };
 // const warpConfig = {
