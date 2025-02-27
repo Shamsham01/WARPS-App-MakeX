@@ -4,8 +4,8 @@ import { Address } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
 import { WarpBuilder, WarpActionExecutor } from '@vleap/warps';
-import { WarpRegistry } from '@vleap/warp-sdk'; // Import WarpRegistry from the warp-sdk
-import BigNumber from 'bignumber.js'; // For handling biguint scaling
+import { WarpRegistry } from '@vleap/warp-sdk';
+import BigNumber from 'bignumber.js';
 
 // Use mainnet (revert to devnet by uncommenting the devnet line below)
 const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
@@ -23,7 +23,7 @@ const warpConfig = {
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
   chainApiUrl: "https://api.multiversx.com", // Mainnet API for WarpRegistry
   env: "mainnet", // Specify environment
-  registryContract: "erd1..."}, // Replace with actual registry contract address from vLeap docs
+  registryContract: "erd1...", // Replace with actual registry contract address from vLeap docs (e.g., mainnet)
   userAddress: undefined // Optional, set if needed for transactions
 };
 // const warpConfig = {
@@ -31,7 +31,7 @@ const warpConfig = {
 //   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
 //   chainApiUrl: "https://devnet-api.multiversx.com", // Devnet API for WarpRegistry
 //   env: "devnet", // Specify environment
-//   registryContract: "erd1..."}, // Replace with devnet registry contract address
+//   registryContract: "erd1...", // Replace with devnet registry contract address
 //   userAddress: undefined // Optional
 // };
 
