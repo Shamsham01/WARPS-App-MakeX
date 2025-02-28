@@ -101,13 +101,13 @@ async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // K
   throw new Error(`Transaction ${txHash} status could not be determined after ${retries} retries.`);
 }
 
-// Endpoint: Get WARP input requirements (updated to return full blueprint for debugging)
+// Endpoint: Get WARP input requirements (updated to return only inputs for Make.com mapping)
 app.get('/warpInfo', checkToken, async (req, res) => {
   try {
     const { warpId } = req.query;
     if (!warpId) throw new Error("Missing warpId in query parameters");
 
-    console.log(`Fetching WARP info for warpId: ${warpId}`);
+    console.log(`Fetching WARP input requirements for warpId: ${warpId}`);
     // Fetch WARP info
     const warp = await fetchWarpInfo(warpId);
     const action = warp.actions[0];
@@ -115,34 +115,42 @@ app.get('/warpInfo', checkToken, async (req, res) => {
       throw new Error(`WARP ${warpId} must have a 'contract' action`);
     }
 
-    // Return input requirements and full blueprint for debugging
+    // Extract and map only the inputs array, converting types for Make.com
     const inputs = action.inputs || [];
-    console.log(`WARP Info Response:`, {
-      warpId,
-      warpHash: warp.meta?.hash || warpId,
-      inputs: inputs,
-      fullBlueprint: warp
-    });
-    return res.json({
-      warpId,
-      warpHash: warp.meta?.hash || warpId,
-      inputs: inputs.map(input => ({
-        name: input.name,
-        type: input.type.split(':')[0], // e.g., "string" from "string:default"
-        required: input.required || false,
-        min: input.min,
-        max: input.max,
-        pattern: input.pattern,
-        patternDescription: input.patternDescription,
-        modifier: input.modifier // Include modifier for scaling (e.g., "scale:18")
-      })),
-      fullBlueprint: warp // Optionally return full blueprint for debugging
-    });
+    const mappedInputs = inputs.map(input => ({
+      name: input.name,
+      type: mapToMakeType(input.type.split(':')[0]), // Convert API type to Make.com type
+      label: input.name, // Use name as label since label isn’t explicitly provided
+      required: input.required || false,
+      min: input.min,
+      max: input.max,
+      pattern: input.pattern,
+      patternDescription: input.patternDescription,
+      modifier: input.modifier // Include modifier for scaling (e.g., "scale:Token Decimals")
+    }));
+
+    console.log(`WARP Input Requirements Response:`, mappedInputs);
+    return res.json(mappedInputs); // Return only the mapped inputs array
   } catch (error) {
     console.error("Error in /warpInfo:", error.message);
     return res.status(400).json({ error: error.message });
   }
 });
+
+// Helper function to map API types to Make.com types
+function mapToMakeType(apiType) {
+  switch (apiType) {
+    case "string":
+      return "text"; // Make.com uses "text" instead of "string"
+    case "biguint":
+    case "uint8":
+      return "number"; // Map large/unsigned integers to "number"
+    case "date":
+      return "date"; // Map date types to Make.com’s "date"
+    default:
+      return "text"; // Default to "text" if type isn’t recognized
+  }
+}
 
 // Endpoint: Execute WARP with no user inputs
 app.post('/executeWarp', checkToken, async (req, res) => {
