@@ -7,8 +7,8 @@ import { WarpBuilder, WarpActionExecutor, WarpLink, WarpRegistry } from '@vleap/
 import BigNumber from 'bignumber.js';
 
 // Use mainnet (revert to devnet by uncommenting the devnet line below)
-const provider = new ProxyNetworkProvider('https://gateway.multiversx.com', { clientName: 'warp-integration' });
-// const provider = new ProxyNetworkProvider('https://devnet-gateway.multiversx.com', { clientName: 'warp-integration' });
+const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
+// const provider = new ProxyNetworkProvider("https://devnet-gateway.multiversx.com", { clientName: "warp-integration" });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,30 +18,27 @@ app.use(bodyParser.json());
 
 // Warp Configurations (for mainnet, adjust for devnet by uncommenting devnet URL below)
 const warpConfig = {
-  providerUrl: 'https://gateway.multiversx.com',
-  currentUrl: process.env.CURRENT_URL || 'https://warps-makex.onrender.com',
-  chainApiUrl: 'https://api.multiversx.com', // Mainnet API for registry
-  env: 'mainnet', // Specify environment
-  registryContract: 'erd1qqqqqqqqqqqqqpgq3mrpj3u6q7tejv6d7eqhnyd27n9v5c5tl3ts08mffe', // Mainnet WARP Registry contract
+  providerUrl: "https://gateway.multiversx.com",
+  currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
+  chainApiUrl: "https://api.multiversx.com", // Mainnet API for registry
+  env: "mainnet", // Specify environment
+  registryContract: "erd1qqqqqqqqqqqqqpgq3mrpj3u6q7tejv6d7eqhnyd27n9v5c5tl3ts08mffe", // Mainnet WARP Registry contract
   userAddress: undefined // Optional, set if needed for transactions
 };
 // const warpConfig = {
-//   providerUrl: 'https://devnet-gateway.multiversx.com',
-//   currentUrl: process.env.CURRENT_URL || 'https://warps-makex.onrender.com',
-//   chainApiUrl: 'https://devnet-api.multiversx.com', // Devnet API for registry
-//   env: 'devnet', // Specify environment
-//   registryContract: 'erd1...', // Devnet WARP Registry contract
+//   providerUrl: "https://devnet-gateway.multiversx.com",
+//   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
+//   chainApiUrl: "https://devnet-api.multiversx.com", // Devnet API for registry
+//   env: "devnet", // Specify environment
+//   registryContract: "erd1...", // Devnet WARP Registry contract
 //   userAddress: undefined // Optional
 // };
 
 // Middleware: Token check
 const checkToken = (req, res, next) => {
   const token = req.headers.authorization;
-  if (token === `Bearer ${SECURE_TOKEN}`) {
-    next();
-  } else {
-    res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (token === `Bearer ${SECURE_TOKEN}`) next();
+  else res.status(401).json({ error: 'Unauthorized' });
 };
 
 // Helper: Get PEM and derive address
@@ -97,10 +94,10 @@ async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // K
       const txStatus = await response.json();
       console.log(`Transaction ${txHash} status: ${txStatus.status || 'undefined'}`);
 
-      if (txStatus.status === 'success') {
-        return { status: 'success', txHash };
-      } else if (txStatus.status === 'fail' || txStatus.status === 'invalid') {
-        return { status: 'fail', txHash, details: txStatus.error || txStatus.receipt?.data || 'No error details provided' };
+      if (txStatus.status === "success") {
+        return { status: "success", txHash };
+      } else if (txStatus.status === "fail" || txStatus.status === "invalid") {
+        return { status: "fail", txHash, details: txStatus.error || txStatus.receipt?.data || 'No error details provided' };
       }
 
       // Treat any other status (including pending or missing) as needing a retry
@@ -121,44 +118,44 @@ function mapTypeFromRegistryOrDefault(input) {
 
   // Map to Make.com-compatible types dynamically
   switch (registryType.toLowerCase()) {
-    case 'string':
-      return { makeType: 'text', validation: { pattern: input.pattern, minLength: input.min, maxLength: input.max } };
-    case 'uint8':
-    case 'uint16':
-    case 'uint32':
-    case 'uint64':
-    case 'biguint':
-      return { makeType: 'number', validation: { min: input.min, max: input.max, scale: input.modifier?.startsWith('scale:') ? input.modifier.split(':')[1] : null } };
-    case 'bool':
-      return { makeType: 'boolean', validation: {} };
-    case 'address':
-      return { makeType: 'text', validation: { address: true } }; // Custom validation for Multiversx addresses
-    case 'token':
-    case 'codesdata':
-    case 'hex':
-    case 'esdt':
-    case 'nft':
-      return { makeType: 'text', validation: {} };
-    case 'date':
-      return { makeType: 'date', validation: {} };
-    case 'option':
-    case 'optional':
-      const baseType = input.type.split(':')[1] || 'text';
+    case "string":
+      return { makeType: "text", validation: { pattern: input.pattern, minLength: input.min, maxLength: input.max } };
+    case "uint8":
+    case "uint16":
+    case "uint32":
+    case "uint64":
+    case "biguint":
+      return { makeType: "number", validation: { min: input.min, max: input.max, scale: input.modifier?.startsWith("scale:") ? input.modifier.split(':')[1] : null } };
+    case "bool":
+      return { makeType: "boolean", validation: {} };
+    case "address":
+      return { makeType: "text", validation: { address: true } }; // Custom validation for Multiversx addresses
+    case "token":
+    case "codesdata":
+    case "hex":
+    case "esdt":
+    case "nft":
+      return { makeType: "text", validation: {} };
+    case "date":
+      return { makeType: "date", validation: {} };
+    case "option":
+    case "optional":
+      const baseType = input.type.split(':')[1] || "text";
       const baseMapping = mapTypeFromRegistryOrDefault({ type: baseType });
       return { makeType: baseMapping.makeType, validation: { ...baseMapping.validation, optional: true } };
-    case 'list':
-      const listType = input.type.split(':')[1] || 'text';
+    case "list":
+      const listType = input.type.split(':')[1] || "text";
       const listMapping = mapTypeFromRegistryOrDefault({ type: listType });
-      return { makeType: 'array', validation: { itemType: listMapping.makeType, ...listMapping.validation } };
-    case 'varladic':
-      const varladicType = input.type.split(':')[1].split('|')[0] || 'text';
+      return { makeType: "array", validation: { itemType: listMapping.makeType, ...listMapping.validation } };
+    case "varladic":
+      const varladicType = input.type.split(':')[1].split('|')[0] || "text";
       const varladicMapping = mapTypeFromRegistryOrDefault({ type: varladicType });
-      return { makeType: 'array', validation: { itemType: varladicMapping.makeType, ...varladicMapping.validation } };
-    case 'composite':
-      return { makeType: 'text', validation: { composite: true, types: input.type.split(':')[1].split('|') || [] } };
+      return { makeType: "array", validation: { itemType: varladicMapping.makeType, ...varladicMapping.validation } };
+    case "composite":
+      return { makeType: "text", validation: { composite: true, types: input.type.split(':')[1].split('|') || [] } };
     default:
       console.warn(`Unknown type ${registryType} for input ${input.name}, defaulting to text`);
-      return { makeType: 'text', validation: {} };
+      return { makeType: "text", validation: {} };
   }
 }
 
@@ -166,7 +163,7 @@ function mapTypeFromRegistryOrDefault(input) {
 app.get('/warpInfo', checkToken, async (req, res) => {
   try {
     const { warpId } = req.query;
-    if (!warpId) throw new Error('Missing warpId in query parameters');
+    if (!warpId) throw new Error("Missing warpId in query parameters");
 
     console.log(`Fetching WARP input requirements for warpId: ${warpId}`);
     // Fetch WARP info with registry details
@@ -192,7 +189,7 @@ app.get('/warpInfo', checkToken, async (req, res) => {
     console.log(`WARP Input Requirements Response:`, mappedInputs);
     return res.json(mappedInputs); // Return only the mapped inputs array
   } catch (error) {
-    console.error('Error in /warpInfo:', error.message);
+    console.error("Error in /warpInfo:", error.message);
     return res.status(400).json({ error: error.message });
   }
 }
@@ -201,18 +198,18 @@ app.get('/warpInfo', checkToken, async (req, res) => {
 app.post('/executeWarp', checkToken, async (req, res) => {
   try {
     const { warpId, inputs } = req.body;
-    if (!warpId) throw new Error('Missing warpId in request body');
+    if (!warpId) throw new Error("Missing warpId in request body");
 
     // Handle inputs flexibly: accept object, array, or undefined, but ensure required fields are present
     let normalizedInputs = {};
     if (!inputs) {
-      console.warn('No inputs provided in request body, checking WARP requirements...');
+      console.warn("No inputs provided in request body, checking WARP requirements...");
       const warpInfo = await fetchWarpInfo(warpId);
       const action = warpInfo.actions[0];
       if (!action || !action.inputs || action.inputs.length === 0) {
         normalizedInputs = {}; // No inputs required, proceed with empty object
       } else {
-        throw new Error('Missing required \'inputs\' object in request body');
+        throw new Error("Missing required 'inputs' object in request body");
       }
     } else if (typeof inputs === 'object' && !Array.isArray(inputs)) {
       // Handle flat object (expected from Make.com)
@@ -225,7 +222,7 @@ app.post('/executeWarp', checkToken, async (req, res) => {
         }
       });
     } else {
-      throw new Error('Invalid \'inputs\' format in request body; must be an object or array');
+      throw new Error("Invalid 'inputs' format in request body; must be an object or array");
     }
 
     // Log the normalized inputs for debugging
@@ -251,17 +248,17 @@ app.post('/executeWarp', checkToken, async (req, res) => {
       const fieldName = inputSpec.name;
       const value = normalizedInputs[fieldName];
 
-      if (inputSpec.required && (value === undefined || value === null || value === '')) {
+      if (inputSpec.required && (value === undefined || value === null || value === "")) {
         throw new Error(`Missing required input: ${fieldName}`);
       }
 
-      if (value !== undefined && value !== null && value !== '') {
+      if (value !== undefined && value !== null && value !== "") {
         let typedValue = value;
         const { makeType, validation } = mapTypeFromRegistryOrDefault(inputSpec);
         try {
           switch (makeType) {
-            case 'text':
-              if (typeof typedValue !== 'string') throw new Error(`${fieldName} must be a string`);
+            case "text":
+              if (typeof typedValue !== "string") throw new Error(`${fieldName} must be a string`);
               if (validation.pattern && !new RegExp(validation.pattern).test(typedValue)) {
                 throw new Error(`${fieldName} must match pattern: ${validation.patternDescription || validation.pattern}`);
               }
@@ -272,14 +269,14 @@ app.post('/executeWarp', checkToken, async (req, res) => {
                 throw new Error(`${fieldName} must not exceed ${validation.maxLength} characters`);
               }
               break;
-            case 'number':
-              if (isNaN(typedValue) || typeof typedValue !== 'string' && typeof typedValue !== 'number') {
+            case "number":
+              if (isNaN(typedValue) || typeof typedValue !== "string" && typeof typedValue !== "number") {
                 throw new Error(`${fieldName} must be a number or numeric string`);
               }
               typedValue = new BigNumber(typedValue).toFixed(0).toString();
               if (validation.scale) {
-                if (validation.scale === 'Token Decimals') {
-                  const decimals = normalizedInputs['Token Decimals'];
+                if (validation.scale === "Token Decimals") {
+                  const decimals = normalizedInputs["Token Decimals"];
                   if (decimals === undefined || isNaN(decimals)) {
                     throw new Error(`Missing or invalid 'Token Decimals' for scaling ${fieldName}`);
                   }
@@ -301,25 +298,25 @@ app.post('/executeWarp', checkToken, async (req, res) => {
                 throw new Error(`${fieldName} must not exceed ${validation.max}`);
               }
               break;
-            case 'boolean':
-              if (typedValue !== true && typedValue !== false && typedValue !== 'true' && typedValue !== 'false') {
+            case "boolean":
+              if (typedValue !== true && typedValue !== false && typedValue !== "true" && typedValue !== "false") {
                 throw new Error(`${fieldName} must be a boolean value (true/false)`);
               }
-              typedValue = typedValue === true || typedValue === 'true';
+              typedValue = typedValue === true || typedValue === "true";
               break;
-            case 'date':
+            case "date":
               if (!new Date(typedValue).getTime()) throw new Error(`${fieldName} must be a valid date`);
               typedValue = new Date(typedValue).toISOString();
               break;
-            case 'array':
-              if (typeof typedValue !== 'string' && !Array.isArray(typedValue)) {
+            case "array":
+              if (typeof typedValue !== "string" && !Array.isArray(typedValue)) {
                 throw new Error(`${fieldName} must be a string or array of values`);
               }
-              if (typeof typedValue === 'string') typedValue = typedValue.split(',').map(v => v.trim());
-              typedValue = typedValue.map(v => handleNestedType(v, validation.itemType || 'text'));
+              if (typeof typedValue === "string") typedValue = typedValue.split(',').map(v => v.trim());
+              typedValue = typedValue.map(v => handleNestedType(v, validation.itemType || "text"));
               break;
             default:
-              if (typeof typedValue !== 'string') throw new Error(`${fieldName} must be a string for type ${makeType}`);
+              if (typeof typedValue !== "string") throw new Error(`${fieldName} must be a string for type ${makeType}`);
               break;
           }
 
@@ -338,18 +335,18 @@ app.post('/executeWarp', checkToken, async (req, res) => {
     // Helper function for nested types
     function handleNestedType(value, baseType) {
       switch (baseType.toLowerCase()) {
-        case 'text':
-          if (typeof value !== 'string') throw new Error(`Value must be a string`);
+        case "text":
+          if (typeof value !== "string") throw new Error(`Value must be a string`);
           return value;
-        case 'number':
+        case "number":
           if (isNaN(value)) throw new Error(`Value must be a number`);
           return new BigNumber(value).toFixed(0).toString();
-        case 'boolean':
-          if (value !== true && value !== false && value !== 'true' && value !== 'false') {
+        case "boolean":
+          if (value !== true && value !== false && value !== "true" && value !== "false") {
             throw new Error(`Value must be a boolean (true/false)`);
           }
-          return value === true || value === 'true';
-        case 'address':
+          return value === true || value === "true";
+        case "address":
           if (!Address.isValid(value)) throw new Error(`Value must be a valid Multiversx address`);
           return value;
         default:
@@ -368,7 +365,7 @@ app.post('/executeWarp', checkToken, async (req, res) => {
     const txHash = await provider.sendTransaction(tx);
     const status = await checkTransactionStatus(txHash.toString());
 
-    if (status.status === 'fail') {
+    if (status.status === "fail") {
       return res.status(400).json({
         error: `Transaction failed: ${status.details || 'Unknown reason'}`
       });
@@ -381,7 +378,7 @@ app.post('/executeWarp', checkToken, async (req, res) => {
       finalStatus: status.status
     });
   } catch (error) {
-    console.error('Error in /executeWarp:', error.message, 'Request Body:', req.body);
+    console.error("Error in /executeWarp:", error.message, 'Request Body:', req.body);
     return res.status(400).json({ error: error.message });
   }
 });
