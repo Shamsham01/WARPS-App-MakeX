@@ -88,7 +88,7 @@ async function checkTransactionStatus(txHash, retries = 20, delay = 3000) {
   throw new Error(`Transaction ${txHash} status could not be determined after ${retries} retries.`);
 }
 
-// --- New Endpoints ---
+// --- Endpoints ---
 
 // 1. GET /warpRPC (formerly /warpInfo)
 // This endpoint returns dynamic input fields for Make.com based on the warp blueprint.
@@ -145,10 +145,10 @@ function mapToMakeType(apiType) {
 }
 
 // 2. POST /warpInfo
-// This new endpoint interacts with the registry to fetch blueprint details (using registry data)
-// and then executes the warp transaction based on that blueprint.
+// This new endpoint interacts with the registry to fetch blueprint details and then executes the warp.
 app.post('/warpInfo', checkToken, async (req, res) => {
   try {
+    console.log("Incoming /warpInfo request body:", req.body);
     const { warpId, inputs } = req.body;
     if (!warpId) throw new Error("Missing warpId in request body");
     if (!inputs || typeof inputs !== 'object') throw new Error("Missing or invalid 'inputs' object in request body");
@@ -170,6 +170,7 @@ app.post('/warpInfo', checkToken, async (req, res) => {
     if (!registryInfo) {
       throw new Error(`No registry info found for ${warpId}`);
     }
+    console.log(`Registry info for warpId ${warpId}:`, JSON.stringify(registryInfo, null, 2));
 
     // Use the blueprint (registryInfo) to get the contract action details
     const action = registryInfo.actions[0];
@@ -198,7 +199,7 @@ app.post('/warpInfo', checkToken, async (req, res) => {
           typedValue = new BigNumber(value).times(new BigNumber(10).pow(decimals)).toFixed(0);
         }
 
-        // Additional validations (e.g., address format or pattern matching) can be added here
+        // Additional validations (e.g., address format or pattern matching)
         if (type === "address" && !Address.isValid(value)) {
           throw new Error(`${input.name} must be a valid MultiversX address`);
         }
@@ -209,6 +210,7 @@ app.post('/warpInfo', checkToken, async (req, res) => {
         userInputsArray.push(`${type}:${typedValue}`);
       }
     }
+    console.log("Prepared userInputsArray for registry warp:", userInputsArray);
 
     // Execute the transaction using the registry blueprint data
     const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
@@ -239,79 +241,34 @@ app.post('/warpInfo', checkToken, async (req, res) => {
   }
 });
 
-// Endpoint: Execute WARP with no user inputs
-app.post('/executeWarp', checkToken, async (req, res) => {
-  try {
-    const { warpId } = req.body;
-    if (!warpId) throw new Error("Missing warpId in request body");
-
-    // Extract PEM and signer
-    const pemContent = getPemContent(req);
-    const signer = UserSigner.fromPem(pemContent);
-    const userAddress = signer.getAddress();
-
-    // Fetch WARP info
-    const warpInfo = await fetchWarpInfo(warpId);
-    const action = warpInfo.actions[0];
-    if (!action || action.type !== 'contract') {
-      throw new Error(`WARP ${warpId} must have a 'contract' action`);
-    }
-    if (action.inputs && action.inputs.length > 0) {
-      throw new Error(`WARP ${warpId} requires user inputs; use /executeWarpWithInputs instead`);
-    }
-
-    // Execute with no inputs
-    const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
-    const warpActionExecutor = new WarpActionExecutor(executorConfig);
-    const tx = warpActionExecutor.createTransactionForExecute(action, [], []);
-
-    const accountOnNetwork = await provider.getAccount(userAddress);
-    tx.nonce = accountOnNetwork.nonce;
-    await signer.sign(tx);
-    const txHash = await provider.sendTransaction(tx);
-    const status = await checkTransactionStatus(txHash.toString());
-
-    if (status.status === "fail") {
-      return res.status(400).json({
-        error: `Transaction failed: ${status.details || 'Unknown reason'}`
-      });
-    }
-
-    return res.json({
-      warpId,
-      warpHash: warpInfo.meta?.hash,
-      finalTxHash: txHash.toString(),
-      finalStatus: status.status
-    });
-  } catch (error) {
-    console.error("Error in /executeWarp:", error.message);
-    return res.status(400).json({ error: error.message });
-  }
-});
-
-// Endpoint: Execute WARP with user inputs
+// 3. POST /executeWarpWithInputs
+// This endpoint executes a warp using inputs provided by Make.com via WarpLink.
 app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
   try {
+    console.log("Incoming /executeWarpWithInputs request body:", req.body);
     const { warpId, inputs } = req.body;
     if (!warpId) throw new Error("Missing warpId in request body");
     if (!inputs || typeof inputs !== 'object') throw new Error("Missing or invalid 'inputs' object in request body");
 
-    // Extract PEM and signer
+    // Extract PEM and signer details
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
     const userAddress = signer.getAddress();
 
-    // Fetch WARP info
+    // Fetch warp info via WarpLink (this may differ from registry-based warps)
     const warpInfo = await fetchWarpInfo(warpId);
+    console.log("Fetched warp info via WarpLink:", JSON.stringify(warpInfo, null, 2));
+    console.log("User inputs received:", inputs);
+
     const action = warpInfo.actions[0];
     if (!action || action.type !== 'contract') {
-      throw new Error(`WARP ${warpId} must have a 'contract' action`);
+      throw new Error(`Warp ${warpId} must have a 'contract' action`);
     }
     if (!action.inputs || action.inputs.length === 0) {
-      throw new Error(`WARP ${warpId} has no input requirements; use /executeWarp instead`);
+      throw new Error(`Warp ${warpId} does not have input requirements; use /executeWarp instead`);
     }
 
-    // Validate and prepare inputs dynamically, handling modifiers (e.g., scale:18)
+    // Validate and prepare inputs dynamically
     const userInputsArray = [];
     for (const input of action.inputs) {
       const value = inputs[input.name];
@@ -320,27 +277,27 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
       }
       if (value !== undefined) {
         let typedValue = value;
-        const type = input.type.split(':')[0]; // e.g., "string" from "string:default"
+        const type = input.type.split(':')[0];
         
-        // Handle scaling for biguint with modifier (e.g., scale:18)
-        if (type === "biguint" && input.modifier && input.modifier.startsWith("scale:")) {
+        // Handle scaling for numeric types if modifier exists (e.g., scale:18)
+        if ((type === "biguint" || type.startsWith("uint")) && input.modifier && input.modifier.startsWith("scale:")) {
           const decimals = parseInt(input.modifier.split(':')[1], 10);
           if (isNaN(decimals)) throw new Error(`Invalid scale modifier for ${input.name}`);
           typedValue = new BigNumber(value).times(new BigNumber(10).pow(decimals)).toFixed(0);
         }
 
-        if (type === "uint8" && (value < input.min || value > input.max)) {
-          throw new Error(`${input.name} must be between ${input.min} and ${input.max}`);
-        }
+        // Additional validations
         if (type === "address" && !Address.isValid(value)) {
-          throw new Error(`${input.name} must be a valid Multiversx address`);
+          throw new Error(`${input.name} must be a valid MultiversX address`);
         }
         if (type === "string" && input.pattern && !new RegExp(input.pattern).test(value)) {
           throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
         }
+
         userInputsArray.push(`${type}:${typedValue}`);
       }
     }
+    console.log("Prepared userInputsArray for WarpLink execution:", userInputsArray);
 
     // Execute transaction
     const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
