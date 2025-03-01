@@ -22,7 +22,7 @@ const warpConfig = {
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
   chainApiUrl: "https://api.multiversx.com", // Mainnet API for registry
   env: "mainnet",
-  registryContract: "erd1qqqqqqqqqqqqqpgq3mrpj3u6q7tejv6d7eqhnyd27n9v5c5tl3ts08mffe",
+  registryContract: "erd1qqqqqqqqqqqqqpgq3mrpj3u6q7tejv6d7eqhnyd27n9v5c5tl3ts08mffe", // Verify this is correct for mainnet
   userAddress: undefined
 };
 
@@ -66,10 +66,16 @@ async function fetchWarpInfo(warpId) {
       console.log(`Resolved alias ${warpId} to hash: ${hash}`);
     }
 
-    // Fetch full blueprint using WarpLink.detect with the hash
+    // Verify hash format (should be 64 chars for SHA-256)
+    if (!hash || typeof hash !== 'string' || hash.length !== 64) {
+      throw new Error(`Invalid hash format for ${warpId}: ${hash}`);
+    }
+
+    // Attempt to fetch blueprint using WarpLink.detect with the hash
     const result = await warpLink.detect(hash);
+    console.log(`WarpLink.detect result for hash ${hash}:`, JSON.stringify(result, null, 2));
     if (!result.match || !result.warp) {
-      throw new Error(`Could not fetch blueprint for hash ${hash}`);
+      throw new Error(`Could not fetch blueprint for hash ${hash}: warp not found`);
     }
     warp = result.warp;
     console.log(`Raw warp object from WarpLink.detect:`, JSON.stringify(warp, null, 2));
