@@ -61,10 +61,14 @@ async function fetchWarpInfo(warpId) {
         if (!result.match || !result.warp) {
           throw new Error(`Could not resolve ${warpId}`);
         }
-        warp = result.warp;
+        warp = result.warp; // Use the nested warp object from WarpLink.detect
       }
     }
     console.log(`Resolved ${warpId} to hash: ${warp.meta?.hash || 'unknown hash'}`);
+    // Ensure warp object consistency
+    if (!warp || !Array.isArray(warp.actions)) {
+      throw new Error(`Invalid warp object structure for ${warpId}: missing or invalid actions array`);
+    }
     return warp;
   } catch (error) {
     console.error(`Error resolving ${warpId}: ${error.message}`);
@@ -110,6 +114,13 @@ app.get('/warpRPC', checkToken, async (req, res) => {
 
     console.log(`Fetching dynamic input fields for warpId: ${warpId}`);
     const warp = await fetchWarpInfo(warpId);
+    console.log(`Warp object received:`, JSON.stringify(warp, null, 2));
+
+    // Validate actions array
+    if (!Array.isArray(warp.actions) || warp.actions.length === 0) {
+      throw new Error(`Warp ${warpId} has no valid actions array`);
+    }
+
     const action = warp.actions[0];
     if (!action || action.type !== 'contract') {
       throw new Error(`Warp ${warpId} must have a 'contract' action`);
