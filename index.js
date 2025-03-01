@@ -42,21 +42,32 @@ function getPemContent(req) {
   return pemContent;
 };
 
-// Helper: Fetch WARP info via WarpLink (blueprint details from chain)
+// Helper: Fetch WARP info using WarpRegistry and WarpLink
 async function fetchWarpInfo(warpId) {
-  const warpBuilder = new WarpBuilder(warpConfig);
+  const warpRegistry = new WarpRegistry(warpConfig);
   const warpLink = new WarpLink(warpConfig);
 
   try {
-    console.log(`Resolving ${warpId} via WarpLink...`);
-    const result = await warpLink.detect(warpId); // Handles both alias and hash
-    if (!result.match || !result.warp) {
-      throw new Error(`Could not resolve ${warpId}`);
+    console.log(`Resolving ${warpId}...`);
+    let warp;
+    if (warpId.startsWith('hash:')) {
+      warp = await warpRegistry.getInfoByHash(warpId.replace('hash:', ''));
+    } else {
+      // Try alias first via registry
+      warp = await warpRegistry.getInfoByAlias(warpId);
+      if (!warp) {
+        // Fallback to WarpLink for detection (handles both alias and hash)
+        const result = await warpLink.detect(warpId);
+        if (!result.match || !result.warp) {
+          throw new Error(`Could not resolve ${warpId}`);
+        }
+        warp = result.warp;
+      }
     }
-    console.log(`Resolved ${warpId} to hash: ${result.warp.meta?.hash || 'unknown hash'}`);
-    return result.warp;
+    console.log(`Resolved ${warpId} to hash: ${warp.meta?.hash || 'unknown hash'}`);
+    return warp;
   } catch (error) {
-    console.error(`Error resolving ${warpId} via WarpLink: ${error.message}`);
+    console.error(`Error resolving ${warpId}: ${error.message}`);
     throw new Error(`Failed to resolve ${warpId}. Use a valid alias or hash.`);
   }
 }
@@ -90,7 +101,7 @@ async function checkTransactionStatus(txHash, retries = 20, delay = 3000) {
 
 // --- Endpoints ---
 
-// 1. GET /warpRPC (formerly /warpInfo)
+// 1. GET /warpRPC
 // This endpoint returns dynamic input fields for Make.com based on the warp blueprint.
 app.get('/warpRPC', checkToken, async (req, res) => {
   try {
@@ -145,7 +156,7 @@ function mapToMakeType(apiType) {
 }
 
 // 2. POST /warpInfo
-// This new endpoint interacts with the registry to fetch blueprint details and then executes the warp.
+// This endpoint interacts with the registry to fetch blueprint details and then executes the warp.
 app.post('/warpInfo', checkToken, async (req, res) => {
   try {
     console.log("Incoming /warpInfo request body:", req.body);
