@@ -187,12 +187,12 @@ app.get('/warpInfo', checkToken, async (req, res) => {
     });
 
     console.log(`WARP Input Requirements Response:`, mappedInputs);
-    return res.json(mappedInputs); // Return only the mapped inputs array
+    return res.json(mappedInputs); // Ensure this is properly closed
   } catch (error) {
     console.error("Error in /warpInfo:", error.message);
     return res.status(400).json({ error: error.message });
   }
-}
+});
 
 // Endpoint: Execute WARP with user inputs (updated to handle all WARP types, nested structures, and Make.com input formats)
 app.post('/executeWarp', checkToken, async (req, res) => {
