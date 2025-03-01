@@ -212,10 +212,9 @@ app.post('/executeWarp', checkToken, async (req, res) => {
         throw new Error("Missing required 'inputs' object in request body");
       }
     } else if (typeof inputs === 'object' && !Array.isArray(inputs)) {
-      // Handle flat object (expected from Make.com)
       normalizedInputs = inputs;
     } else if (Array.isArray(inputs)) {
-      // Handle array (if Make.com sends inputs as an array, map to object by name)
+      // Convert array inputs into object format
       inputs.forEach(input => {
         if (input.name && input.value !== undefined) {
           normalizedInputs[input.name] = input.value;
@@ -225,7 +224,6 @@ app.post('/executeWarp', checkToken, async (req, res) => {
       throw new Error("Invalid 'inputs' format in request body; must be an object or array");
     }
 
-    // Log the normalized inputs for debugging
     console.log(`Normalized Inputs for warpId ${warpId}:`, normalizedInputs);
 
     // Extract PEM and signer
@@ -246,14 +244,13 @@ app.post('/executeWarp', checkToken, async (req, res) => {
 
     for (const inputSpec of inputsSpec) {
       const fieldName = inputSpec.name;
-      const value = normalizedInputs[fieldName];
+      let typedValue = normalizedInputs[fieldName];
 
-      if (inputSpec.required && (value === undefined || value === null || value === "")) {
+      if (inputSpec.required && (typedValue === undefined || typedValue === null || typedValue === "")) {
         throw new Error(`Missing required input: ${fieldName}`);
       }
 
-      if (value !== undefined && value !== null && value !== "") {
-        let typedValue = value;
+      if (typedValue !== undefined && typedValue !== null && typedValue !== "") {
         const { makeType, validation } = mapTypeFromRegistryOrDefault(inputSpec);
         try {
           switch (makeType) {
@@ -269,28 +266,20 @@ app.post('/executeWarp', checkToken, async (req, res) => {
                 throw new Error(`${fieldName} must not exceed ${validation.maxLength} characters`);
               }
               break;
+
             case "number":
               if (isNaN(typedValue) || typeof typedValue !== "string" && typeof typedValue !== "number") {
                 throw new Error(`${fieldName} must be a number or numeric string`);
               }
               typedValue = new BigNumber(typedValue).toFixed(0).toString();
+
+              // Apply scaling if needed
               if (validation.scale) {
-                if (validation.scale === "Token Decimals") {
-                  const decimals = normalizedInputs["Token Decimals"];
-                  if (decimals === undefined || isNaN(decimals)) {
-                    throw new Error(`Missing or invalid 'Token Decimals' for scaling ${fieldName}`);
-                  }
-                  const actualDecimals = parseInt(decimals, 10);
-                  if (actualDecimals < 0 || actualDecimals > 18) {
-                    throw new Error(`'Token Decimals' must be between 0 and 18`);
-                  }
-                  typedValue = new BigNumber(typedValue).times(new BigNumber(10).pow(actualDecimals)).toFixed(0);
-                } else {
-                  const decimals = parseInt(validation.scale, 10);
-                  if (isNaN(decimals)) throw new Error(`Invalid scale modifier for ${fieldName}`);
-                  typedValue = new BigNumber(typedValue).times(new BigNumber(10).pow(decimals)).toFixed(0);
-                }
+                const decimals = parseInt(validation.scale, 10);
+                if (isNaN(decimals)) throw new Error(`Invalid scale modifier for ${fieldName}`);
+                typedValue = new BigNumber(typedValue).times(new BigNumber(10).pow(decimals)).toFixed(0);
               }
+
               if (validation.min && new BigNumber(typedValue).lt(validation.min)) {
                 throw new Error(`${fieldName} must be at least ${validation.min}`);
               }
@@ -298,16 +287,19 @@ app.post('/executeWarp', checkToken, async (req, res) => {
                 throw new Error(`${fieldName} must not exceed ${validation.max}`);
               }
               break;
+
             case "boolean":
               if (typedValue !== true && typedValue !== false && typedValue !== "true" && typedValue !== "false") {
                 throw new Error(`${fieldName} must be a boolean value (true/false)`);
               }
               typedValue = typedValue === true || typedValue === "true";
               break;
+
             case "date":
               if (!new Date(typedValue).getTime()) throw new Error(`${fieldName} must be a valid date`);
               typedValue = new Date(typedValue).toISOString();
               break;
+
             case "array":
               if (typeof typedValue !== "string" && !Array.isArray(typedValue)) {
                 throw new Error(`${fieldName} must be a string or array of values`);
@@ -315,42 +307,21 @@ app.post('/executeWarp', checkToken, async (req, res) => {
               if (typeof typedValue === "string") typedValue = typedValue.split(',').map(v => v.trim());
               typedValue = typedValue.map(v => handleNestedType(v, validation.itemType || "text"));
               break;
+
             default:
               if (typeof typedValue !== "string") throw new Error(`${fieldName} must be a string for type ${makeType}`);
               break;
           }
 
-          // Format the value for WarpActionExecutor (e.g., "type:value" or array for lists/arrays)
+          // Format value for WarpActionExecutor
           if (Array.isArray(typedValue)) {
             userInputsArray.push(...typedValue.map(v => `${makeType}:${v}`));
-          } else if (typedValue !== null) { // Skip null for optional/empty values
+          } else if (typedValue !== null) {
             userInputsArray.push(`${makeType}:${typedValue}`);
           }
         } catch (validationError) {
           throw new Error(`Validation error for ${fieldName}: ${validationError.message}`);
         }
-      }
-    }
-
-    // Helper function for nested types
-    function handleNestedType(value, baseType) {
-      switch (baseType.toLowerCase()) {
-        case "text":
-          if (typeof value !== "string") throw new Error(`Value must be a string`);
-          return value;
-        case "number":
-          if (isNaN(value)) throw new Error(`Value must be a number`);
-          return new BigNumber(value).toFixed(0).toString();
-        case "boolean":
-          if (value !== true && value !== false && value !== "true" && value !== "false") {
-            throw new Error(`Value must be a boolean (true/false)`);
-          }
-          return value === true || value === "true";
-        case "address":
-          if (!Address.isValid(value)) throw new Error(`Value must be a valid Multiversx address`);
-          return value;
-        default:
-          return value.toString(); // Default to string for unrecognized nested types
       }
     }
 
