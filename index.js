@@ -50,13 +50,17 @@ async function fetchWarpInfo(warpId) {
   try {
     console.log(`Resolving ${warpId}...`);
     let warp;
+    let resolutionSource = '';
+
     if (warpId.startsWith('hash:')) {
+      resolutionSource = 'WarpRegistry.getInfoByHash';
       warp = await warpRegistry.getInfoByHash(warpId.replace('hash:', ''));
     } else {
       // Try alias first via registry
+      resolutionSource = 'WarpRegistry.getInfoByAlias';
       warp = await warpRegistry.getInfoByAlias(warpId);
       if (!warp) {
-        // Fallback to WarpLink for detection (handles both alias and hash)
+        resolutionSource = 'WarpLink.detect';
         const result = await warpLink.detect(warpId);
         if (!result.match || !result.warp) {
           throw new Error(`Could not resolve ${warpId}`);
@@ -64,15 +68,22 @@ async function fetchWarpInfo(warpId) {
         warp = result.warp; // Use the nested warp object from WarpLink.detect
       }
     }
-    console.log(`Resolved ${warpId} to hash: ${warp.meta?.hash || 'unknown hash'}`);
+
+    console.log(`Raw warp object from ${resolutionSource}:`, JSON.stringify(warp, null, 2));
+    console.log(`Resolved ${warpId} to hash: ${warp?.meta?.hash || 'unknown hash'}`);
+
     // Ensure warp object consistency
-    if (!warp || !Array.isArray(warp.actions)) {
-      throw new Error(`Invalid warp object structure for ${warpId}: missing or invalid actions array`);
+    if (!warp) {
+      throw new Error(`No warp data returned for ${warpId}`);
     }
+    if (!Array.isArray(warp.actions) || warp.actions.length === 0) {
+      throw new Error(`Invalid warp structure for ${warpId}: actions is missing or empty`);
+    }
+
     return warp;
   } catch (error) {
     console.error(`Error resolving ${warpId}: ${error.message}`);
-    throw new Error(`Failed to resolve ${warpId}. Use a valid alias or hash.`);
+    throw error; // Propagate the original error for better debugging
   }
 }
 
