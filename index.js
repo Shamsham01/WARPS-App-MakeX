@@ -3,7 +3,7 @@ import bodyParser from 'body-parser';
 import { Address } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
-import { WarpBuilder, WarpActionExecutor, WarpLink, WarpRegistry } from '@vleap/warps';
+import { WarpBuilder, WarpActionExecutor, WarpLink } from '@vleap/warps'; // Use WarpLink from @vleap/warps
 import BigNumber from 'bignumber.js';
 
 // Use mainnet (revert to devnet by uncommenting the devnet line below)
@@ -22,7 +22,7 @@ const warpConfig = {
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
   chainApiUrl: "https://api.multiversx.com", // Mainnet API for registry
   env: "mainnet", // Specify environment
-  registryContract: "erd1qqqqqqqqqqqqqpgq3mrpj3u6q7tejv6d7eqhnyd27n9v5c5tl3ts08mffe", // Mainnet WARP Registry contract
+  registryContract: "erd1qqqqqqqqqqqqqpgq3mrpj3u6q7tejv6d7eqhnyd27n9v5c5tl3ts08mffe", // Mainnet WARP Registry contract (replace if incorrect, check vLeap docs)
   userAddress: undefined // Optional, set if needed for transactions
 };
 // const warpConfig = {
@@ -30,7 +30,7 @@ const warpConfig = {
 //   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
 //   chainApiUrl: "https://devnet-api.multiversx.com", // Devnet API for registry
 //   env: "devnet", // Specify environment
-//   registryContract: "erd1...", // Devnet WARP Registry contract
+//   registryContract: "erd1...", // Devnet WARP Registry contract (replace if incorrect)
 //   userAddress: undefined // Optional
 // };
 
@@ -50,12 +50,12 @@ function getPemContent(req) {
   return pemContent;
 };
 
-// Helper: Fetch WARP info and registry details (using WarpLink and WarpRegistry for dynamic type mapping)
+// Helper: Fetch WARP info (using WarpLink for both hashes and aliases)
 async function fetchWarpInfo(warpId) {
   const warpBuilder = new WarpBuilder(warpConfig);
-  const warpLink = new WarpLink(warpConfig);
-  const warpRegistry = new WarpRegistry(warpConfig); // Initialize WarpRegistry for dynamic type mapping
+  const warpLink = new WarpLink(warpConfig); // Initialize WarpLink for detection
 
+  // Try to resolve warpId using WarpLink.detect (handles both hashes and aliases)
   try {
     console.log(`Resolving ${warpId} via WarpLink...`);
     const result = await warpLink.detect(warpId); // Pass warpId directly (hash or alias)
@@ -63,19 +63,9 @@ async function fetchWarpInfo(warpId) {
       throw new Error(`Could not resolve ${warpId}`);
     }
     console.log(`Resolved ${warpId} to hash: ${result.warp.meta?.hash || 'unknown hash'}`);
-
-    // Fetch detailed registry info for dynamic type mapping
-    const registryInfo = await warpRegistry.getInfoByAlias(warpId);
-    if (!registryInfo || !registryInfo.inputs) {
-      console.warn(`No registry info or inputs found for ${warpId}, using default warp data`);
-    }
-
-    return {
-      ...result.warp,
-      registryInputs: registryInfo?.inputs || result.warp.actions[0]?.inputs || [] // Use registry inputs if available, else use warp actions
-    }; // Return enhanced warp object with registry data
+    return result.warp; // Return the full Warp blueprint
   } catch (error) {
-    console.error(`Error resolving ${warpId} via WarpLink/Registry: ${error.message}`);
+    console.error(`Error resolving ${warpId} via WarpLink: ${error.message}`);
     throw new Error(`Failed to resolve ${warpId}. Use a valid alias or hash.`);
   }
 }
@@ -111,241 +101,157 @@ async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // K
   throw new Error(`Transaction ${txHash} status could not be determined after ${retries} retries.`);
 }
 
-// Helper: Dynamically map types from registry or default to WARP actions for Make.com compatibility
-function mapTypeFromRegistryOrDefault(input) {
-  const type = input.type.split(':')[0]; // Base type (e.g., "string", "biguint")
-  const registryType = input.registryType || type; // Use registry type if available, else default
-
-  // Map to Make.com-compatible types dynamically
-  switch (registryType.toLowerCase()) {
-    case "string":
-      return { makeType: "text", validation: { pattern: input.pattern, minLength: input.min, maxLength: input.max } };
-    case "uint8":
-    case "uint16":
-    case "uint32":
-    case "uint64":
-    case "biguint":
-      return { makeType: "number", validation: { min: input.min, max: input.max, scale: input.modifier?.startsWith("scale:") ? input.modifier.split(':')[1] : null } };
-    case "bool":
-      return { makeType: "boolean", validation: {} };
-    case "address":
-      return { makeType: "text", validation: { address: true } }; // Custom validation for Multiversx addresses
-    case "token":
-    case "codesdata":
-    case "hex":
-    case "esdt":
-    case "nft":
-      return { makeType: "text", validation: {} };
-    case "date":
-      return { makeType: "date", validation: {} };
-    case "option":
-    case "optional":
-      const baseType = input.type.split(':')[1] || "text";
-      const baseMapping = mapTypeFromRegistryOrDefault({ type: baseType });
-      return { makeType: baseMapping.makeType, validation: { ...baseMapping.validation, optional: true } };
-    case "list":
-      const listType = input.type.split(':')[1] || "text";
-      const listMapping = mapTypeFromRegistryOrDefault({ type: listType });
-      return { makeType: "array", validation: { itemType: listMapping.makeType, ...listMapping.validation } };
-    case "varladic":
-      const varladicType = input.type.split(':')[1].split('|')[0] || "text";
-      const varladicMapping = mapTypeFromRegistryOrDefault({ type: varladicType });
-      return { makeType: "array", validation: { itemType: varladicMapping.makeType, ...varladicMapping.validation } };
-    case "composite":
-      return { makeType: "text", validation: { composite: true, types: input.type.split(':')[1].split('|') || [] } };
-    default:
-      console.warn(`Unknown type ${registryType} for input ${input.name}, defaulting to text`);
-      return { makeType: "text", validation: {} };
-  }
-}
-
-// Helper: Handle nested types (e.g., for arrays)
-function handleNestedType(value, type) {
-  switch (type.toLowerCase()) {
-    case "text":
-      return String(value);
-    case "number":
-      return new BigNumber(value).toNumber();
-    case "boolean":
-      return Boolean(value);
-    default:
-      return String(value);
-  }
-}
-
-// Endpoint: Get WARP input requirements for Make.com RPC (returns normalized inputs)
+// Endpoint: Get WARP input requirements (updated to return only inputs for Make.com mapping)
 app.get('/warpInfo', checkToken, async (req, res) => {
   try {
     const { warpId } = req.query;
     if (!warpId) throw new Error("Missing warpId in query parameters");
 
     console.log(`Fetching WARP input requirements for warpId: ${warpId}`);
-    // Fetch WARP info with registry details
+    // Fetch WARP info
     const warp = await fetchWarpInfo(warpId);
     const action = warp.actions[0];
     if (!action || action.type !== 'contract') {
       throw new Error(`WARP ${warpId} must have a 'contract' action`);
     }
 
-    // Use registry inputs if available, else fall back to action inputs
-    const inputs = warp.registryInputs || action.inputs || [];
-    const mappedInputs = inputs.map(input => {
-      const { makeType, validation } = mapTypeFromRegistryOrDefault(input);
-      return {
-        name: input.name,
-        type: makeType,
-        label: input.name, // Use name as label since label isn’t explicitly provided
-        required: input.required || false,
-        ...validation // Include dynamic validation (min, max, pattern, scale, etc.)
-      };
-    });
+    // Extract and map only the inputs array, converting types for Make.com
+    const inputs = action.inputs || [];
+    const mappedInputs = inputs.map(input => ({
+      name: input.name,
+      type: mapToMakeType(input.type.split(':')[0]), // Convert API type to Make.com type
+      label: input.name, // Use name as label since label isn’t explicitly provided
+      required: input.required || false,
+      min: input.min,
+      max: input.max,
+      pattern: input.pattern,
+      patternDescription: input.patternDescription,
+      modifier: input.modifier // Include modifier for scaling (e.g., "scale:Token Decimals")
+    }));
 
     console.log(`WARP Input Requirements Response:`, mappedInputs);
-    return res.json(mappedInputs); // Return only the mapped inputs array for Make.com
+    return res.json(mappedInputs); // Return only the mapped inputs array
   } catch (error) {
     console.error("Error in /warpInfo:", error.message);
     return res.status(400).json({ error: error.message });
   }
 });
 
-// Endpoint: Execute WARP with user inputs (updated for Make.com RPC compatibility)
+// Helper function to map API types to Make.com types
+function mapToMakeType(apiType) {
+  switch (apiType) {
+    case "string":
+      return "text"; // Make.com uses "text" instead of "string"
+    case "biguint":
+    case "uint8":
+      return "number"; // Map large/unsigned integers to "number"
+    case "date":
+      return "date"; // Map date types to Make.com’s "date"
+    default:
+      return "text"; // Default to "text" if type isn’t recognized
+  }
+}
+
+// Endpoint: Execute WARP with no user inputs
 app.post('/executeWarp', checkToken, async (req, res) => {
   try {
-    const { warpId, inputs } = req.body;
+    const { warpId } = req.body;
     if (!warpId) throw new Error("Missing warpId in request body");
-
-    // Handle inputs flexibly: accept object, array, or undefined, but ensure required fields are present
-    let normalizedInputs = {};
-    if (!inputs) {
-      console.warn("No inputs provided in request body, checking WARP requirements...");
-      const warpInfo = await fetchWarpInfo(warpId);
-      const action = warpInfo.actions[0];
-      if (!action) {
-        throw new Error(`WARP ${warpId} has no action defined`);
-      }
-
-      // Use registry inputs or action inputs
-      const inputsSpec = warpInfo.registryInputs || action.inputs || [];
-      
-      // Check if there are any required inputs
-      const hasRequiredInputs = inputsSpec.some(input => input.required === true);
-      if (hasRequiredInputs) {
-        throw new Error("Missing required 'inputs' object in request body");
-      }
-      
-      // If no inputs are required, proceed with empty normalizedInputs
-      normalizedInputs = {};
-    } else if (typeof inputs === 'object' && !Array.isArray(inputs)) {
-      normalizedInputs = inputs;
-    } else if (Array.isArray(inputs)) {
-      // Convert array inputs into object format (for Make.com compatibility)
-      inputs.forEach(input => {
-        if (input.name && input.value !== undefined) {
-          normalizedInputs[input.name] = input.value;
-        }
-      });
-    } else {
-      throw new Error("Invalid 'inputs' format in request body; must be an object or array");
-    }
-
-    console.log(`Normalized Inputs for warpId ${warpId}:`, normalizedInputs);
 
     // Extract PEM and signer
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
     const userAddress = signer.getAddress();
 
-    // Fetch WARP info with registry details
+    // Fetch WARP info
     const warpInfo = await fetchWarpInfo(warpId);
     const action = warpInfo.actions[0];
     if (!action || action.type !== 'contract') {
       throw new Error(`WARP ${warpId} must have a 'contract' action`);
     }
+    if (action.inputs && action.inputs.length > 0) {
+      throw new Error(`WARP ${warpId} requires user inputs; use /executeWarpWithInputs instead`);
+    }
 
-    // Use registry inputs for validation and preparation
-    const inputsSpec = warpInfo.registryInputs || action.inputs || [];
+    // Execute with no inputs
+    const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
+    const warpActionExecutor = new WarpActionExecutor(executorConfig);
+    const tx = warpActionExecutor.createTransactionForExecute(action, [], []);
+
+    const accountOnNetwork = await provider.getAccount(userAddress);
+    tx.nonce = accountOnNetwork.nonce;
+    await signer.sign(tx);
+    const txHash = await provider.sendTransaction(tx);
+    const status = await checkTransactionStatus(txHash.toString());
+
+    if (status.status === "fail") {
+      return res.status(400).json({
+        error: `Transaction failed: ${status.details || 'Unknown reason'}`
+      });
+    }
+
+    return res.json({
+      warpId,
+      warpHash: warpInfo.meta?.hash,
+      finalTxHash: txHash.toString(),
+      finalStatus: status.status
+    });
+  } catch (error) {
+    console.error("Error in /executeWarp:", error.message);
+    return res.status(400).json({ error: error.message });
+  }
+});
+
+// Endpoint: Execute WARP with user inputs
+app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
+  try {
+    const { warpId, inputs } = req.body;
+    if (!warpId) throw new Error("Missing warpId in request body");
+    if (!inputs || typeof inputs !== 'object') throw new Error("Missing or invalid 'inputs' object in request body");
+
+    // Extract PEM and signer
+    const pemContent = getPemContent(req);
+    const signer = UserSigner.fromPem(pemContent);
+    const userAddress = signer.getAddress();
+
+    // Fetch WARP info
+    const warpInfo = await fetchWarpInfo(warpId);
+    const action = warpInfo.actions[0];
+    if (!action || action.type !== 'contract') {
+      throw new Error(`WARP ${warpId} must have a 'contract' action`);
+    }
+    if (!action.inputs || action.inputs.length === 0) {
+      throw new Error(`WARP ${warpId} has no input requirements; use /executeWarp instead`);
+    }
+
+    // Validate and prepare inputs dynamically, handling modifiers (e.g., scale:18)
     const userInputsArray = [];
-
-    for (const inputSpec of inputsSpec) {
-      const fieldName = inputSpec.name;
-      let typedValue = normalizedInputs[fieldName];
-
-      if (inputSpec.required && (typedValue === undefined || typedValue === null || typedValue === "")) {
-        throw new Error(`Missing required input: ${fieldName}`);
+    for (const input of action.inputs) {
+      const value = inputs[input.name];
+      if (input.required && (value === undefined || value === null)) {
+        throw new Error(`Missing required input: ${input.name}`);
       }
-
-      if (typedValue !== undefined && typedValue !== null && typedValue !== "") {
-        const { makeType, validation } = mapTypeFromRegistryOrDefault(inputSpec);
-        try {
-          switch (makeType) {
-            case "text":
-              if (typeof typedValue !== "string") throw new Error(`${fieldName} must be a string`);
-              if (validation.pattern && !new RegExp(validation.pattern).test(typedValue)) {
-                throw new Error(`${fieldName} must match pattern: ${validation.patternDescription || validation.pattern}`);
-              }
-              if (validation.minLength && typedValue.length < validation.minLength) {
-                throw new Error(`${fieldName} must be at least ${validation.minLength} characters`);
-              }
-              if (validation.maxLength && typedValue.length > validation.maxLength) {
-                throw new Error(`${fieldName} must not exceed ${validation.maxLength} characters`);
-              }
-              break;
-
-            case "number":
-              if (isNaN(typedValue) || typeof typedValue !== "string" && typeof typedValue !== "number") {
-                throw new Error(`${fieldName} must be a number or numeric string`);
-              }
-              typedValue = new BigNumber(typedValue).toFixed(0).toString();
-
-              // Apply scaling if needed (e.g., scale:18 for biguint)
-              if (validation.scale) {
-                const decimals = parseInt(validation.scale, 10);
-                if (isNaN(decimals)) throw new Error(`Invalid scale modifier for ${fieldName}`);
-                typedValue = new BigNumber(typedValue).times(new BigNumber(10).pow(decimals)).toFixed(0);
-              }
-
-              if (validation.min && new BigNumber(typedValue).lt(validation.min)) {
-                throw new Error(`${fieldName} must be at least ${validation.min}`);
-              }
-              if (validation.max && new BigNumber(typedValue).gt(validation.max)) {
-                throw new Error(`${fieldName} must not exceed ${validation.max}`);
-              }
-              break;
-
-            case "boolean":
-              if (typedValue !== true && typedValue !== false && typedValue !== "true" && typedValue !== "false") {
-                throw new Error(`${fieldName} must be a boolean value (true/false)`);
-              }
-              typedValue = typedValue === true || typedValue === "true";
-              break;
-
-            case "date":
-              if (!new Date(typedValue).getTime()) throw new Error(`${fieldName} must be a valid date`);
-              typedValue = new Date(typedValue).toISOString();
-              break;
-
-            case "array":
-              if (typeof typedValue !== "string" && !Array.isArray(typedValue)) {
-                throw new Error(`${fieldName} must be a string or array of values`);
-              }
-              if (typeof typedValue === "string") typedValue = typedValue.split(',').map(v => v.trim());
-              typedValue = typedValue.map(v => handleNestedType(v, validation.itemType || "text"));
-              break;
-
-            default:
-              if (typeof typedValue !== "string") throw new Error(`${fieldName} must be a string for type ${makeType}`);
-              break;
-          }
-
-          // Format value for WarpActionExecutor
-          if (Array.isArray(typedValue)) {
-            userInputsArray.push(...typedValue.map(v => `${makeType}:${v}`));
-          } else if (typedValue !== null) {
-            userInputsArray.push(`${makeType}:${typedValue}`);
-          }
-        } catch (validationError) {
-          throw new Error(`Validation error for ${fieldName}: ${validationError.message}`);
+      if (value !== undefined) {
+        let typedValue = value;
+        const type = input.type.split(':')[0]; // e.g., "string" from "string:default"
+        
+        // Handle scaling for biguint with modifier (e.g., scale:18)
+        if (type === "biguint" && input.modifier && input.modifier.startsWith("scale:")) {
+          const decimals = parseInt(input.modifier.split(':')[1], 10);
+          if (isNaN(decimals)) throw new Error(`Invalid scale modifier for ${input.name}`);
+          typedValue = new BigNumber(value).times(new BigNumber(10).pow(decimals)).toFixed(0);
         }
+
+        if (type === "uint8" && (value < input.min || value > input.max)) {
+          throw new Error(`${input.name} must be between ${input.min} and ${input.max}`);
+        }
+        if (type === "address" && !Address.isValid(value)) {
+          throw new Error(`${input.name} must be a valid Multiversx address`);
+        }
+        if (type === "string" && input.pattern && !new RegExp(input.pattern).test(value)) {
+          throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
+        }
+        userInputsArray.push(`${type}:${typedValue}`);
       }
     }
 
@@ -373,12 +279,12 @@ app.post('/executeWarp', checkToken, async (req, res) => {
       finalStatus: status.status
     });
   } catch (error) {
-    console.error("Error in /executeWarp:", error.message, 'Request Body:', req.body);
+    console.error("Error in /executeWarpWithInputs:", error.message);
     return res.status(400).json({ error: error.message });
   }
 });
 
 // Start server
-app.listen(PORT, '0.0.0.0', () => { // Bind to 0.0.0.0 for Render compatibility
+app.listen(PORT, () => {
   console.log(`Warp integration app is running on port ${PORT}`);
 });
