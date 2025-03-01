@@ -239,13 +239,136 @@ app.post('/warpInfo', checkToken, async (req, res) => {
   }
 });
 
-// Existing endpoints for executing warps without inputs or with flat inputs remain unchanged:
+// Endpoint: Execute WARP with no user inputs
 app.post('/executeWarp', checkToken, async (req, res) => {
-  // ... your existing implementation ...
+  try {
+    const { warpId } = req.body;
+    if (!warpId) throw new Error("Missing warpId in request body");
+
+    // Extract PEM and signer
+    const pemContent = getPemContent(req);
+    const signer = UserSigner.fromPem(pemContent);
+    const userAddress = signer.getAddress();
+
+    // Fetch WARP info
+    const warpInfo = await fetchWarpInfo(warpId);
+    const action = warpInfo.actions[0];
+    if (!action || action.type !== 'contract') {
+      throw new Error(`WARP ${warpId} must have a 'contract' action`);
+    }
+    if (action.inputs && action.inputs.length > 0) {
+      throw new Error(`WARP ${warpId} requires user inputs; use /executeWarpWithInputs instead`);
+    }
+
+    // Execute with no inputs
+    const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
+    const warpActionExecutor = new WarpActionExecutor(executorConfig);
+    const tx = warpActionExecutor.createTransactionForExecute(action, [], []);
+
+    const accountOnNetwork = await provider.getAccount(userAddress);
+    tx.nonce = accountOnNetwork.nonce;
+    await signer.sign(tx);
+    const txHash = await provider.sendTransaction(tx);
+    const status = await checkTransactionStatus(txHash.toString());
+
+    if (status.status === "fail") {
+      return res.status(400).json({
+        error: `Transaction failed: ${status.details || 'Unknown reason'}`
+      });
+    }
+
+    return res.json({
+      warpId,
+      warpHash: warpInfo.meta?.hash,
+      finalTxHash: txHash.toString(),
+      finalStatus: status.status
+    });
+  } catch (error) {
+    console.error("Error in /executeWarp:", error.message);
+    return res.status(400).json({ error: error.message });
+  }
 });
 
+// Endpoint: Execute WARP with user inputs
 app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
-  // ... your existing implementation ...
+  try {
+    const { warpId, inputs } = req.body;
+    if (!warpId) throw new Error("Missing warpId in request body");
+    if (!inputs || typeof inputs !== 'object') throw new Error("Missing or invalid 'inputs' object in request body");
+
+    // Extract PEM and signer
+    const pemContent = getPemContent(req);
+    const signer = UserSigner.fromPem(pemContent);
+    const userAddress = signer.getAddress();
+
+    // Fetch WARP info
+    const warpInfo = await fetchWarpInfo(warpId);
+    const action = warpInfo.actions[0];
+    if (!action || action.type !== 'contract') {
+      throw new Error(`WARP ${warpId} must have a 'contract' action`);
+    }
+    if (!action.inputs || action.inputs.length === 0) {
+      throw new Error(`WARP ${warpId} has no input requirements; use /executeWarp instead`);
+    }
+
+    // Validate and prepare inputs dynamically, handling modifiers (e.g., scale:18)
+    const userInputsArray = [];
+    for (const input of action.inputs) {
+      const value = inputs[input.name];
+      if (input.required && (value === undefined || value === null)) {
+        throw new Error(`Missing required input: ${input.name}`);
+      }
+      if (value !== undefined) {
+        let typedValue = value;
+        const type = input.type.split(':')[0]; // e.g., "string" from "string:default"
+        
+        // Handle scaling for biguint with modifier (e.g., scale:18)
+        if (type === "biguint" && input.modifier && input.modifier.startsWith("scale:")) {
+          const decimals = parseInt(input.modifier.split(':')[1], 10);
+          if (isNaN(decimals)) throw new Error(`Invalid scale modifier for ${input.name}`);
+          typedValue = new BigNumber(value).times(new BigNumber(10).pow(decimals)).toFixed(0);
+        }
+
+        if (type === "uint8" && (value < input.min || value > input.max)) {
+          throw new Error(`${input.name} must be between ${input.min} and ${input.max}`);
+        }
+        if (type === "address" && !Address.isValid(value)) {
+          throw new Error(`${input.name} must be a valid Multiversx address`);
+        }
+        if (type === "string" && input.pattern && !new RegExp(input.pattern).test(value)) {
+          throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
+        }
+        userInputsArray.push(`${type}:${typedValue}`);
+      }
+    }
+
+    // Execute transaction
+    const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
+    const warpActionExecutor = new WarpActionExecutor(executorConfig);
+    const tx = warpActionExecutor.createTransactionForExecute(action, userInputsArray, []);
+
+    const accountOnNetwork = await provider.getAccount(userAddress);
+    tx.nonce = accountOnNetwork.nonce;
+    await signer.sign(tx);
+    const txHash = await provider.sendTransaction(tx);
+    const status = await checkTransactionStatus(txHash.toString());
+
+    if (status.status === "fail") {
+      return res.status(400).json({
+        error: `Transaction failed: ${status.details || 'Unknown reason'}`
+      });
+    }
+
+    return res.json({
+      warpId,
+      warpHash: warpInfo.meta?.hash,
+      finalTxHash: txHash.toString(),
+      finalStatus: status.status
+    });
+  } catch (error) {
+    console.error("Error in /executeWarpWithInputs:", error.message);
+    return res.status(400).json({ error: error.message });
+  }
 });
 
 // Start server
