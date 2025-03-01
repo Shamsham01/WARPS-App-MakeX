@@ -1,10 +1,9 @@
-
 import express from 'express';
 import bodyParser from 'body-parser';
 import { Address } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
-import { WarpBuilder, WarpActionExecutor, WarpRegistry, WarpLink } from '@vleap/warps'; // Use WarpRegistry and WarpLink from @vleap/warps
+import { WarpBuilder, WarpActionExecutor, WarpLink } from '@vleap/warps'; // Use WarpLink from @vleap/warps
 import BigNumber from 'bignumber.js';
 
 // Use mainnet (revert to devnet by uncommenting the devnet line below)
@@ -23,7 +22,7 @@ const warpConfig = {
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
   chainApiUrl: "https://api.multiversx.com", // Mainnet API for registry
   env: "mainnet", // Specify environment
-  registryContract: "erd1qqqqqqqqqqqqqqqpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gq4hu", // Mainnet WARP Registry contract (replace if incorrect, check vLeap docs)
+  registryContract: "erd1qqqqqqqqqqqqqpgq3mrpj3u6q7tejv6d7eqhnyd27n9v5c5tl3ts08mffe", // Mainnet WARP Registry contract (replace if incorrect, check vLeap docs)
   userAddress: undefined // Optional, set if needed for transactions
 };
 // const warpConfig = {
@@ -34,8 +33,6 @@ const warpConfig = {
 //   registryContract: "erd1...", // Devnet WARP Registry contract (replace if incorrect)
 //   userAddress: undefined // Optional
 // };
-
-let warpRegistry; // Global instance for WarpRegistry
 
 // Middleware: Token check
 const checkToken = (req, res, next) => {
@@ -53,64 +50,24 @@ function getPemContent(req) {
   return pemContent;
 };
 
-// Helper: Initialize WarpRegistry (async to ensure config is loaded)
-async function initializeWarpRegistry() {
-  if (!warpRegistry) {
-    warpRegistry = new WarpRegistry(warpConfig);
-    await warpRegistry.init(); // Load registry configs
-  }
-  return warpRegistry;
-}
-
-// Helper: Fetch WARP info (using WarpRegistry or WarpLink from @vleap/warps)
+// Helper: Fetch WARP info (using WarpLink for both hashes and aliases)
 async function fetchWarpInfo(warpId) {
   const warpBuilder = new WarpBuilder(warpConfig);
-  const registry = await initializeWarpRegistry();
   const warpLink = new WarpLink(warpConfig); // Initialize WarpLink for detection
 
-  // Determine if warpId is a hash or alias
-  const isHash = warpId.length === 64 && /^[0-9a-fA-F]+$/.test(warpId);
-  let warp;
-
-  if (isHash) {
-    warp = await warpBuilder.createFromTransactionHash(warpId);
-  } else {
-    // Try to resolve alias via WarpLink.detect (preferred) or WarpRegistry.getInfoByAlias
-    try {
-      console.log(`Resolving alias ${warpId} via WarpLink...`);
-      const result = await warpLink.detect(warpId); // WarpLink can resolve both hashes and aliases
-      if (!result || !result.hash) {
-        throw new Error(`Alias or ID ${warpId} not found`);
-      }
-      const warpHash = result.hash;
-      console.log(`Resolved alias ${warpId} to hash: ${warpHash}`);
-      warp = await warpBuilder.createFromTransactionHash(warpHash);
-    } catch (error) {
-      console.error(`Error resolving alias ${warpId} via WarpLink: ${error.message}`);
-      // Fallback to WarpRegistry.getInfoByAlias
-      try {
-        console.log(`Falling back to WarpRegistry for alias ${warpId}...`);
-        const { registryInfo } = await registry.getInfoByAlias(warpId, { ttl: 3600 }); // Cache for 1 hour
-        if (!registryInfo || !registryInfo.hash) {
-          throw new Error(`Alias ${warpId} not found in registry`);
-        }
-        const warpHash = registryInfo.hash;
-        console.log(`Resolved alias ${warpId} to hash: ${warpHash}`);
-        warp = await warpBuilder.createFromTransactionHash(warpHash);
-      } catch (registryError) {
-        console.error(`Error resolving alias ${warpId} via WarpRegistry: ${registryError.message}`);
-        throw new Error(`Failed to resolve alias ${warpId}. Use a valid alias or hash.`);
-      }
+  // Try to resolve warpId using WarpLink.detect (handles both hashes and aliases)
+  try {
+    console.log(`Resolving ${warpId} via WarpLink...`);
+    const result = await warpLink.detect(warpId); // Pass warpId directly (hash or alias)
+    if (!result.match || !result.warp) {
+      throw new Error(`Could not resolve ${warpId}`);
     }
+    console.log(`Resolved ${warpId} to hash: ${result.warp.meta?.hash || 'unknown hash'}`);
+    return result.warp; // Return the full Warp blueprint
+  } catch (error) {
+    console.error(`Error resolving ${warpId} via WarpLink: ${error.message}`);
+    throw new Error(`Failed to resolve ${warpId}. Use a valid alias or hash.`);
   }
-  
-  if (!warp || !warp.actions || warp.actions.length === 0) {
-    throw new Error(`Invalid WARP: ${warpId}`);
-  }
-  
-  // Return the full blueprint for debugging/logging
-  console.log(`Fetched WARP Blueprint for ${warpId}:`, warp);
-  return warp; // Return the full warp object (including actions, inputs, etc.)
 }
 
 // Helper: Check transaction status with improved retry logic
@@ -144,13 +101,13 @@ async function checkTransactionStatus(txHash, retries = 20, delay = 3000) { // K
   throw new Error(`Transaction ${txHash} status could not be determined after ${retries} retries.`);
 }
 
-// Endpoint: Get WARP input requirements (updated to return full blueprint for debugging)
+// Endpoint: Get WARP input requirements (updated to return only inputs for Make.com mapping)
 app.get('/warpInfo', checkToken, async (req, res) => {
   try {
     const { warpId } = req.query;
     if (!warpId) throw new Error("Missing warpId in query parameters");
 
-    console.log(`Fetching WARP info for warpId: ${warpId}`);
+    console.log(`Fetching WARP input requirements for warpId: ${warpId}`);
     // Fetch WARP info
     const warp = await fetchWarpInfo(warpId);
     const action = warp.actions[0];
@@ -158,34 +115,42 @@ app.get('/warpInfo', checkToken, async (req, res) => {
       throw new Error(`WARP ${warpId} must have a 'contract' action`);
     }
 
-    // Return input requirements and full blueprint for debugging
+    // Extract and map only the inputs array, converting types for Make.com
     const inputs = action.inputs || [];
-    console.log(`WARP Info Response:`, {
-      warpId,
-      warpHash: warp.hash || warpId,
-      inputs: inputs,
-      fullBlueprint: warp
-    });
-    return res.json({
-      warpId,
-      warpHash: warp.hash || warpId,
-      inputs: inputs.map(input => ({
-        name: input.name,
-        type: input.type.split(':')[0], // e.g., "string" from "string:default"
-        required: input.required || false,
-        min: input.min,
-        max: input.max,
-        pattern: input.pattern,
-        patternDescription: input.patternDescription,
-        modifier: input.modifier // Include modifier for scaling (e.g., "scale:18")
-      })),
-      fullBlueprint: warp // Optionally return full blueprint for debugging
-    });
+    const mappedInputs = inputs.map(input => ({
+      name: input.name,
+      type: mapToMakeType(input.type.split(':')[0]), // Convert API type to Make.com type
+      label: input.name, // Use name as label since label isn’t explicitly provided
+      required: input.required || false,
+      min: input.min,
+      max: input.max,
+      pattern: input.pattern,
+      patternDescription: input.patternDescription,
+      modifier: input.modifier // Include modifier for scaling (e.g., "scale:Token Decimals")
+    }));
+
+    console.log(`WARP Input Requirements Response:`, mappedInputs);
+    return res.json(mappedInputs); // Return only the mapped inputs array
   } catch (error) {
     console.error("Error in /warpInfo:", error.message);
     return res.status(400).json({ error: error.message });
   }
 });
+
+// Helper function to map API types to Make.com types
+function mapToMakeType(apiType) {
+  switch (apiType) {
+    case "string":
+      return "text"; // Make.com uses "text" instead of "string"
+    case "biguint":
+    case "uint8":
+      return "number"; // Map large/unsigned integers to "number"
+    case "date":
+      return "date"; // Map date types to Make.com’s "date"
+    default:
+      return "text"; // Default to "text" if type isn’t recognized
+  }
+}
 
 // Endpoint: Execute WARP with no user inputs
 app.post('/executeWarp', checkToken, async (req, res) => {
@@ -227,7 +192,7 @@ app.post('/executeWarp', checkToken, async (req, res) => {
 
     return res.json({
       warpId,
-      warpHash: warpInfo.hash,
+      warpHash: warpInfo.meta?.hash,
       finalTxHash: txHash.toString(),
       finalStatus: status.status
     });
@@ -309,7 +274,7 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
 
     return res.json({
       warpId,
-      warpHash: warpInfo.hash,
+      warpHash: warpInfo.meta?.hash,
       finalTxHash: txHash.toString(),
       finalStatus: status.status
     });
