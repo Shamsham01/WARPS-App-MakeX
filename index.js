@@ -50,27 +50,30 @@ async function fetchWarpInfo(warpId) {
   try {
     console.log(`Resolving ${warpId}...`);
     let warp;
-    let resolutionSource = '';
+    let hash;
 
     if (warpId.startsWith('hash:')) {
-      resolutionSource = 'WarpRegistry.getInfoByHash';
-      warp = await warpRegistry.getInfoByHash(warpId.replace('hash:', ''));
+      hash = warpId.replace('hash:', '');
+      console.log(`Using provided hash: ${hash}`);
     } else {
-      // Try alias first via registry
-      resolutionSource = 'WarpRegistry.getInfoByAlias';
-      warp = await warpRegistry.getInfoByAlias(warpId);
-      if (!warp) {
-        resolutionSource = 'WarpLink.detect';
-        const result = await warpLink.detect(warpId);
-        if (!result.match || !result.warp) {
-          throw new Error(`Could not resolve ${warpId}`);
-        }
-        warp = result.warp; // Use the nested warp object from WarpLink.detect
+      // Try alias via registry to get hash
+      const registryInfo = await warpRegistry.getInfoByAlias(warpId);
+      console.log(`Registry info for ${warpId}:`, JSON.stringify(registryInfo, null, 2));
+      if (!registryInfo || !registryInfo.registryInfo?.hash) {
+        throw new Error(`No valid hash found for alias ${warpId} in registry`);
       }
+      hash = registryInfo.registryInfo.hash;
+      console.log(`Resolved alias ${warpId} to hash: ${hash}`);
     }
 
-    console.log(`Raw warp object from ${resolutionSource}:`, JSON.stringify(warp, null, 2));
-    console.log(`Resolved ${warpId} to hash: ${warp?.meta?.hash || 'unknown hash'}`);
+    // Fetch full blueprint using WarpLink.detect with the hash
+    const result = await warpLink.detect(hash);
+    if (!result.match || !result.warp) {
+      throw new Error(`Could not fetch blueprint for hash ${hash}`);
+    }
+    warp = result.warp;
+    console.log(`Raw warp object from WarpLink.detect:`, JSON.stringify(warp, null, 2));
+    console.log(`Resolved ${warpId} to hash: ${warp.meta?.hash || 'unknown hash'}`);
 
     // Ensure warp object consistency
     if (!warp) {
@@ -288,9 +291,9 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
     const signer = UserSigner.fromPem(pemContent);
     const userAddress = signer.getAddress();
 
-    // Fetch warp info via WarpLink (this may differ from registry-based warps)
+    // Fetch warp info
     const warpInfo = await fetchWarpInfo(warpId);
-    console.log("Fetched warp info via WarpLink:", JSON.stringify(warpInfo, null, 2));
+    console.log("Fetched warp info:", JSON.stringify(warpInfo, null, 2));
     console.log("User inputs received:", inputs);
 
     const action = warpInfo.actions[0];
@@ -330,7 +333,7 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
         userInputsArray.push(`${type}:${typedValue}`);
       }
     }
-    console.log("Prepared userInputsArray for WarpLink execution:", userInputsArray);
+    console.log("Prepared userInputsArray for execution:", userInputsArray);
 
     // Execute transaction
     const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
