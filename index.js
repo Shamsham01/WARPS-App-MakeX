@@ -41,6 +41,19 @@ function getPemContent(req) {
   return pemContent;
 };
 
+// Authorization Endpoint for Make.com
+app.post('/authorization', (req, res) => {
+  try {
+    const token = req.headers.authorization;
+    if (token === `Bearer ${SECURE_TOKEN}`) {
+      return res.json({ message: "Authorization successful" });
+    }
+    return res.status(401).json({ error: "Unauthorized" });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 // Helper: Fetch WARP info using WarpLink (retaining direct detection for simplicity)
 async function fetchWarpInfo(warpId) {
   const warpLink = new WarpLink(warpConfig);
