@@ -44,55 +44,31 @@ function getPemContent(req) {
 
 // Helper: Fetch WARP info using WarpRegistry and WarpLink
 async function fetchWarpInfo(warpId) {
-  const warpRegistry = new WarpRegistry(warpConfig);
   const warpLink = new WarpLink(warpConfig);
 
   try {
-    console.log(`Resolving ${warpId}...`);
-    let warp;
-    let hash;
-
-    if (warpId.startsWith('hash:')) {
-      hash = warpId.replace('hash:', '');
-      console.log(`Using provided hash: ${hash}`);
-    } else {
-      // Try alias via registry to get hash
-      const registryInfo = await warpRegistry.getInfoByAlias(warpId);
-      console.log(`Registry info for ${warpId}:`, JSON.stringify(registryInfo, null, 2));
-      if (!registryInfo || !registryInfo.registryInfo?.hash) {
-        throw new Error(`No valid hash found for alias ${warpId} in registry`);
-      }
-      hash = registryInfo.registryInfo.hash;
-      console.log(`Resolved alias ${warpId} to hash: ${hash}`);
+    console.log(`Resolving ${warpId} directly as hash...`);
+    let hash = warpId;
+    if (!warpId.startsWith('hash:')) {
+      hash = `hash:${warpId}`; // Ensure hash format
     }
-
-    // Verify hash format (should be 64 chars for SHA-256)
-    if (!hash || typeof hash !== 'string' || hash.length !== 64) {
-      throw new Error(`Invalid hash format for ${warpId}: ${hash}`);
-    }
-
-    // Attempt to fetch blueprint using WarpLink.detect with the hash
-    const result = await warpLink.detect(hash);
-    console.log(`WarpLink.detect result for hash ${hash}:`, JSON.stringify(result, null, 2));
+    const result = await warpLink.detect(hash.replace('hash:', ''));
+    console.log(`WarpLink.detect result for ${hash}:`, JSON.stringify(result, null, 2));
     if (!result.match || !result.warp) {
-      throw new Error(`Could not fetch blueprint for hash ${hash}: warp not found`);
+      throw new Error(`Could not fetch blueprint for ${hash}: warp not found`);
     }
-    warp = result.warp;
+    const warp = result.warp;
     console.log(`Raw warp object from WarpLink.detect:`, JSON.stringify(warp, null, 2));
     console.log(`Resolved ${warpId} to hash: ${warp.meta?.hash || 'unknown hash'}`);
 
-    // Ensure warp object consistency
-    if (!warp) {
-      throw new Error(`No warp data returned for ${warpId}`);
-    }
-    if (!Array.isArray(warp.actions) || warp.actions.length === 0) {
+    if (!warp || !Array.isArray(warp.actions) || warp.actions.length === 0) {
       throw new Error(`Invalid warp structure for ${warpId}: actions is missing or empty`);
     }
 
     return warp;
   } catch (error) {
     console.error(`Error resolving ${warpId}: ${error.message}`);
-    throw error; // Propagate the original error for better debugging
+    throw error;
   }
 }
 
