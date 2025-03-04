@@ -1,10 +1,14 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import { Address } from '@multiversx/sdk-core';
+import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
 import { WarpBuilder, WarpActionExecutor, WarpLink } from '@vleap/warps';
 import BigNumber from 'bignumber.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fetch from 'node-fetch';
 
 // Use mainnet (or revert to devnet by uncommenting the devnet line below)
 const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
@@ -25,6 +29,14 @@ const warpConfig = {
   userAddress: undefined
 };
 
+// Constants for usage fee
+const USAGE_FEE = 100; // Fee in REWARD tokens (adjust as needed)
+const REWARD_TOKEN = "REWARD-cf6eac"; // Token identifier (adjust as needed)
+const TREASURY_WALLET = "erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn"; // Treasury wallet (adjust as needed)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const whitelistFilePath = path.join(__dirname, 'whitelist.json');
+
 // Middleware: Token check
 const checkToken = (req, res, next) => {
   const token = req.headers.authorization;
@@ -39,6 +51,97 @@ function getPemContent(req) {
     throw new Error('Invalid PEM content');
   }
   return pemContent;
+};
+
+// Helper: Fetch token decimals from MultiversX API
+const getTokenDecimals = async (tokenTicker) => {
+  const apiUrl = `https://api.multiversx.com/tokens/${tokenTicker}`;
+  const response = await fetch(apiUrl);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch token info: ${response.statusText}`);
+  }
+  const tokenInfo = await response.json();
+  return tokenInfo.decimals || 0;
+};
+
+// Helper: Convert amount to blockchain-compatible value
+const convertAmountToBlockchainValue = (amount, decimals) => {
+  const factor = new BigNumber(10).pow(decimals);
+  return new BigNumber(amount).multipliedBy(factor).toFixed(0);
+};
+
+// Helper: Load whitelist from file
+const loadWhitelist = () => {
+  if (!fs.existsSync(whitelistFilePath)) {
+    fs.writeFileSync(whitelistFilePath, JSON.stringify([], null, 2));
+  }
+  const data = fs.readFileSync(whitelistFilePath);
+  return JSON.parse(data);
+};
+
+// Helper: Check if wallet is whitelisted
+const isWhitelisted = (walletAddress) => {
+  const whitelist = loadWhitelist();
+  return whitelist.some(entry => entry.walletAddress === walletAddress);
+};
+
+// Helper: Send usage fee transaction
+const sendUsageFee = async (pemContent) => {
+  const signer = UserSigner.fromPem(pemContent);
+  const senderAddress = signer.getAddress();
+  const receiverAddress = new Address(TREASURY_WALLET);
+
+  const accountOnNetwork = await provider.getAccount(senderAddress);
+  const nonce = accountOnNetwork.nonce;
+
+  const decimals = await getTokenDecimals(REWARD_TOKEN);
+  const convertedAmount = convertAmountToBlockchainValue(USAGE_FEE, decimals);
+
+  const factoryConfig = new TransactionsFactoryConfig({ chainID: "1" }); // Mainnet chain ID
+  const factory = new TransferTransactionsFactory({ config: factoryConfig });
+
+  const tx = factory.createTransactionForESDTTokenTransfer({
+    sender: senderAddress,
+    receiver: receiverAddress,
+    tokenTransfers: [
+      new TokenTransfer({
+        token: new Token({ identifier: REWARD_TOKEN }),
+        amount: BigInt(convertedAmount),
+      }),
+    ],
+  });
+
+  tx.nonce = nonce;
+  tx.gasLimit = BigInt(500000); // Adjust gas limit if needed
+
+  await signer.sign(tx);
+  const txHash = await provider.sendTransaction(tx);
+
+  const status = await checkTransactionStatus(txHash.toString());
+  if (status.status !== "success") {
+    throw new Error('Usage fee transaction failed. Ensure sufficient REWARD tokens are available.');
+  }
+  return txHash.toString();
+};
+
+// Middleware: Handle usage fee
+const handleUsageFee = async (req, res, next) => {
+  try {
+    const pemContent = getPemContent(req);
+    const walletAddress = UserSigner.fromPem(pemContent).getAddress().toString();
+
+    if (isWhitelisted(walletAddress)) {
+      console.log(`Wallet ${walletAddress} is whitelisted. Skipping usage fee.`);
+      return next();
+    }
+
+    const txHash = await sendUsageFee(pemContent);
+    req.usageFeeHash = txHash;
+    next();
+  } catch (error) {
+    console.error('Error processing usage fee:', error.message);
+    res.status(400).json({ error: error.message });
+  }
 };
 
 // Authorization Endpoint for Make.com
@@ -172,7 +275,7 @@ function mapToMakeType(apiType) {
 
 // 2. POST /executeWarpWithInputs
 // This endpoint executes a warp using inputs provided by Make.com via WarpLink, relying on WarpActionExecutor for scaling.
-app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
+app.post('/executeWarpWithInputs', checkToken, handleUsageFee, async (req, res) => {
   try {
     console.log("Incoming /executeWarpWithInputs request body:", req.body);
     const { warpId, inputs } = req.body;
@@ -245,7 +348,8 @@ app.post('/executeWarpWithInputs', checkToken, async (req, res) => {
       warpId,
       warpHash: warpInfo.meta?.hash,
       finalTxHash: txHash.toString(),
-      finalStatus: status.status
+      finalStatus: status.status,
+      usageFeeHash: req.usageFeeHash || 'N/A'
     });
   } catch (error) {
     console.error("Error in /executeWarpWithInputs:", error.message);
