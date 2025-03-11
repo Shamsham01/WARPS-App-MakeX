@@ -93,26 +93,43 @@ const getRewardPrice = async () => {
     // First get WEGLD price in USD
     const wegldResponse = await fetch('https://api.multiversx.com/economics');
     const wegldData = await wegldResponse.json();
-    const wegldPrice = wegldData.price;
+    const wegldPrice = new BigNumber(wegldData.price);
 
     // Get LP pool data
     const lpResponse = await fetch(`https://api.multiversx.com/accounts/${LP_CONTRACT}/tokens`);
     const lpData = await lpResponse.json();
 
     // Find REWARD and WEGLD reserves
-    const rewardReserve = lpData.find(token => token.identifier === REWARD_TOKEN)?.balance || 0;
-    const wegldReserve = lpData.find(token => token.identifier === WEGLD_TOKEN)?.balance || 0;
+    const rewardReserve = lpData.find(token => token.identifier === REWARD_TOKEN)?.balance || '0';
+    const wegldReserve = lpData.find(token => token.identifier === WEGLD_TOKEN)?.balance || '0';
 
     // Get token decimals
     const rewardDecimals = await getTokenDecimals(REWARD_TOKEN);
     const wegldDecimals = await getTokenDecimals(WEGLD_TOKEN);
 
-    // Calculate price
-    const rewardInWegld = (BigInt(wegldReserve) * BigInt(Math.pow(10, rewardDecimals))) / 
-                         (BigInt(rewardReserve) * BigInt(Math.pow(10, wegldDecimals)));
+    // Calculate price using BigNumber for precise decimal arithmetic
+    const rewardReserveBN = new BigNumber(rewardReserve);
+    const wegldReserveBN = new BigNumber(wegldReserve);
     
-    const rewardPriceUsd = (wegldPrice * Number(rewardInWegld)) / Math.pow(10, rewardDecimals);
-    return rewardPriceUsd;
+    if (rewardReserveBN.isZero()) {
+      throw new Error('REWARD reserve is zero');
+    }
+
+    // Calculate REWARD/WEGLD ratio
+    const rewardInWegld = wegldReserveBN
+      .multipliedBy(new BigNumber(10).pow(rewardDecimals))
+      .dividedBy(rewardReserveBN.multipliedBy(new BigNumber(10).pow(wegldDecimals)));
+    
+    // Calculate final USD price
+    const rewardPriceUsd = rewardInWegld
+      .multipliedBy(wegldPrice)
+      .dividedBy(new BigNumber(10).pow(rewardDecimals));
+
+    if (!rewardPriceUsd.isFinite() || rewardPriceUsd.isZero()) {
+      throw new Error('Invalid REWARD price calculation');
+    }
+
+    return rewardPriceUsd.toNumber();
   } catch (error) {
     console.error('Error fetching REWARD price:', error);
     throw error;
@@ -122,8 +139,19 @@ const getRewardPrice = async () => {
 // Helper: Calculate dynamic usage fee based on REWARD price
 const calculateDynamicUsageFee = async () => {
   const rewardPrice = await getRewardPrice();
-  const rewardAmount = FIXED_USD_FEE / rewardPrice;
+  
+  if (rewardPrice <= 0) {
+    throw new Error('Invalid REWARD token price');
+  }
+
+  const rewardAmount = new BigNumber(FIXED_USD_FEE).dividedBy(rewardPrice);
   const decimals = await getTokenDecimals(REWARD_TOKEN);
+  
+  // Ensure the amount is not too small or too large
+  if (!rewardAmount.isFinite() || rewardAmount.isZero()) {
+    throw new Error('Invalid usage fee calculation');
+  }
+
   return convertAmountToBlockchainValue(rewardAmount, decimals);
 };
 
