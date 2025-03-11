@@ -30,9 +30,11 @@ const warpConfig = {
 };
 
 // Constants for usage fee
-const USAGE_FEE = 100; // Fee in REWARD tokens (adjust as needed)
-const REWARD_TOKEN = "REWARD-cf6eac"; // Token identifier (adjust as needed)
-const TREASURY_WALLET = "erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn"; // Treasury wallet (adjust as needed)
+const FIXED_USD_FEE = 0.03; // $0.03 fixed fee
+const REWARD_TOKEN = "REWARD-cf6eac";
+const WEGLD_TOKEN = "WEGLD-bd4d79";
+const LP_CONTRACT = "erd1qqqqqqqqqqqqqpgq5e30gcakgtam8dpzj9xl2yd45fzdrw6c2jpsxe7ldq";
+const TREASURY_WALLET = "erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const whitelistFilePath = path.join(__dirname, 'whitelist.json');
@@ -85,6 +87,46 @@ const isWhitelisted = (walletAddress) => {
   return whitelist.some(entry => entry.walletAddress === walletAddress);
 };
 
+// Helper: Fetch REWARD token price from LP pool
+const getRewardPrice = async () => {
+  try {
+    // First get WEGLD price in USD
+    const wegldResponse = await fetch('https://api.multiversx.com/economics');
+    const wegldData = await wegldResponse.json();
+    const wegldPrice = wegldData.price;
+
+    // Get LP pool data
+    const lpResponse = await fetch(`https://api.multiversx.com/accounts/${LP_CONTRACT}/tokens`);
+    const lpData = await lpResponse.json();
+
+    // Find REWARD and WEGLD reserves
+    const rewardReserve = lpData.find(token => token.identifier === REWARD_TOKEN)?.balance || 0;
+    const wegldReserve = lpData.find(token => token.identifier === WEGLD_TOKEN)?.balance || 0;
+
+    // Get token decimals
+    const rewardDecimals = await getTokenDecimals(REWARD_TOKEN);
+    const wegldDecimals = await getTokenDecimals(WEGLD_TOKEN);
+
+    // Calculate price
+    const rewardInWegld = (BigInt(wegldReserve) * BigInt(Math.pow(10, rewardDecimals))) / 
+                         (BigInt(rewardReserve) * BigInt(Math.pow(10, wegldDecimals)));
+    
+    const rewardPriceUsd = (wegldPrice * Number(rewardInWegld)) / Math.pow(10, rewardDecimals);
+    return rewardPriceUsd;
+  } catch (error) {
+    console.error('Error fetching REWARD price:', error);
+    throw error;
+  }
+};
+
+// Helper: Calculate dynamic usage fee based on REWARD price
+const calculateDynamicUsageFee = async () => {
+  const rewardPrice = await getRewardPrice();
+  const rewardAmount = FIXED_USD_FEE / rewardPrice;
+  const decimals = await getTokenDecimals(REWARD_TOKEN);
+  return convertAmountToBlockchainValue(rewardAmount, decimals);
+};
+
 // Helper: Send usage fee transaction
 const sendUsageFee = async (pemContent) => {
   const signer = UserSigner.fromPem(pemContent);
@@ -94,10 +136,10 @@ const sendUsageFee = async (pemContent) => {
   const accountOnNetwork = await provider.getAccount(senderAddress);
   const nonce = accountOnNetwork.nonce;
 
-  const decimals = await getTokenDecimals(REWARD_TOKEN);
-  const convertedAmount = convertAmountToBlockchainValue(USAGE_FEE, decimals);
+  // Calculate dynamic fee
+  const dynamicFeeAmount = await calculateDynamicUsageFee();
 
-  const factoryConfig = new TransactionsFactoryConfig({ chainID: "1" }); // Mainnet chain ID
+  const factoryConfig = new TransactionsFactoryConfig({ chainID: "1" });
   const factory = new TransferTransactionsFactory({ config: factoryConfig });
 
   const tx = factory.createTransactionForESDTTokenTransfer({
@@ -106,13 +148,13 @@ const sendUsageFee = async (pemContent) => {
     tokenTransfers: [
       new TokenTransfer({
         token: new Token({ identifier: REWARD_TOKEN }),
-        amount: BigInt(convertedAmount),
+        amount: BigInt(dynamicFeeAmount),
       }),
     ],
   });
 
   tx.nonce = nonce;
-  tx.gasLimit = BigInt(500000); // Adjust gas limit if needed
+  tx.gasLimit = BigInt(500000);
 
   await signer.sign(tx);
   const txHash = await provider.sendTransaction(tx);
