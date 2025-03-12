@@ -90,10 +90,10 @@ const isWhitelisted = (walletAddress) => {
 // Helper: Fetch REWARD token price from LP pool
 const getRewardPrice = async () => {
   try {
-    // First get WEGLD price in USD
-    const wegldResponse = await fetch('https://api.multiversx.com/economics');
-    const wegldData = await wegldResponse.json();
-    const wegldPrice = new BigNumber(wegldData.price);
+    // Fetch EGLD price from CoinGecko
+    const coingeckoResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=elrond-erd-2&vs_currencies=usd');
+    const coingeckoData = await coingeckoResponse.json();
+    const eglPriceUsd = new BigNumber(coingeckoData['elrond-erd-2'].usd);
 
     // Get LP pool data
     const lpResponse = await fetch(`https://api.multiversx.com/accounts/${LP_CONTRACT}/tokens`);
@@ -126,10 +126,8 @@ const getRewardPrice = async () => {
     // Log ratio
     console.log(`REWARD/WEGLD Ratio: ${rewardInWegld.toString()}`);
 
-    // Calculate final USD price
-    const rewardPriceUsd = rewardInWegld
-      .multipliedBy(wegldPrice)
-      .dividedBy(new BigNumber(10).pow(rewardDecimals));
+    // Calculate final USD price using EGLD price from CoinGecko
+    const rewardPriceUsd = rewardInWegld.multipliedBy(eglPriceUsd);
 
     if (!rewardPriceUsd.isFinite() || rewardPriceUsd.isZero()) {
       throw new Error('Invalid REWARD price calculation');
