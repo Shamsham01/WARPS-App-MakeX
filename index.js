@@ -345,7 +345,7 @@ function mapToMakeType(apiType) {
 // This endpoint executes a warp using inputs provided by Make.com via WarpLink, relying on WarpActionExecutor for scaling.
 app.post('/executeWarpWithInputs', checkToken, handleUsageFee, async (req, res) => {
   try {
-    console.log("Incoming /executeWarpWithInputs request body:", req.body);
+    console.log("Incoming /executeWarpWithInputs request received.");
     const { warpId, inputs } = req.body;
     if (!warpId) throw new Error("Missing warpId in request body");
     if (!inputs || typeof inputs !== 'object') throw new Error("Missing or invalid 'inputs' object in request body");
@@ -357,8 +357,7 @@ app.post('/executeWarpWithInputs', checkToken, handleUsageFee, async (req, res) 
 
     // Fetch warp info
     const warpInfo = await fetchWarpInfo(warpId);
-    console.log("Fetched warp info:", JSON.stringify(warpInfo, null, 2));
-    console.log("User inputs received:", inputs);
+    console.log("Fetched warp info.");
 
     const action = warpInfo.actions[0];
     if (!action || action.type !== 'contract') {
@@ -380,7 +379,7 @@ app.post('/executeWarpWithInputs', checkToken, handleUsageFee, async (req, res) 
         const type = input.type.split(':')[0];
         
         // No manual scaling here—let WarpActionExecutor handle modifiers
-        console.log(`Passing raw ${input.name} value: ${typedValue} (type: ${type}) to WarpActionExecutor`);
+        console.log(`Passing raw ${input.name} value to WarpActionExecutor`);
 
         // Additional validations
         if (type === "address" && !Address.isValid(value)) {
@@ -393,7 +392,7 @@ app.post('/executeWarpWithInputs', checkToken, handleUsageFee, async (req, res) 
         userInputsArray.push(`${type}:${typedValue}`);
       }
     }
-    console.log("Prepared userInputsArray for execution:", userInputsArray);
+    console.log("Prepared user inputs for execution.");
 
     // Execute transaction, relying on WarpActionExecutor to handle scaling and modifiers
     const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
