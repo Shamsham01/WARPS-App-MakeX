@@ -103,9 +103,6 @@ const getRewardPrice = async () => {
     const rewardReserve = lpData.find(token => token.identifier === REWARD_TOKEN)?.balance || '0';
     const wegldReserve = lpData.find(token => token.identifier === WEGLD_TOKEN)?.balance || '0';
 
-    // Log reserves
-    console.log(`REWARD Reserve: ${rewardReserve}, WEGLD Reserve: ${wegldReserve}`);
-
     // Get token decimals
     const rewardDecimals = await getTokenDecimals(REWARD_TOKEN);
     const wegldDecimals = await getTokenDecimals(WEGLD_TOKEN);
@@ -122,9 +119,6 @@ const getRewardPrice = async () => {
     const rewardInWegld = wegldReserveBN
       .multipliedBy(new BigNumber(10).pow(rewardDecimals))
       .dividedBy(rewardReserveBN.multipliedBy(new BigNumber(10).pow(wegldDecimals)));
-    
-    // Log ratio
-    console.log(`REWARD/WEGLD Ratio: ${rewardInWegld.toString()}`);
 
     // Calculate final USD price using EGLD price from CoinGecko
     const rewardPriceUsd = rewardInWegld.multipliedBy(eglPriceUsd);
@@ -132,9 +126,6 @@ const getRewardPrice = async () => {
     if (!rewardPriceUsd.isFinite() || rewardPriceUsd.isZero()) {
       throw new Error('Invalid REWARD price calculation');
     }
-
-    // Log final price
-    console.log(`REWARD Price in USD: ${rewardPriceUsd.toString()}`);
 
     return rewardPriceUsd.toNumber();
   } catch (error) {
@@ -158,9 +149,6 @@ const calculateDynamicUsageFee = async () => {
   if (!rewardAmount.isFinite() || rewardAmount.isZero()) {
     throw new Error('Invalid usage fee calculation');
   }
-
-  // Log calculated reward amount
-  console.log(`Calculated REWARD Amount (pre-conversion): ${rewardAmount.toString()}`);
 
   return convertAmountToBlockchainValue(rewardAmount, decimals);
 };
