@@ -397,14 +397,13 @@ function mapToMakeType(apiType) {
   }
 }
 
-// 2. POST /executeWarpWithInputs
-// This endpoint executes a warp using inputs provided by Make.com via WarpLink, relying on WarpActionExecutor for scaling.
-app.post('/executeWarpWithInputs', checkToken, handleUsageFee, async (req, res) => {
+// 2. POST /executeWarp
+// This endpoint executes a warp with or without inputs provided by Make.com
+app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
   try {
-    console.log("Incoming /executeWarpWithInputs request received.");
+    console.log("Incoming /executeWarp request received.");
     const { warpId, inputs } = req.body;
     if (!warpId) throw new Error("Missing warpId in request body");
-    if (!inputs || typeof inputs !== 'object') throw new Error("Missing or invalid 'inputs' object in request body");
 
     // Extract PEM and signer details
     const pemContent = getPemContent(req);
@@ -419,36 +418,41 @@ app.post('/executeWarpWithInputs', checkToken, handleUsageFee, async (req, res) 
     if (!action || action.type !== 'contract') {
       throw new Error(`Warp ${warpId} must have a 'contract' action`);
     }
-    if (!action.inputs || action.inputs.length === 0) {
-      throw new Error(`Warp ${warpId} does not have input requirements; use /executeWarp instead`);
-    }
-
-    // Validate and prepare inputs dynamically, passing raw values to WarpActionExecutor
+    
+    // Prepare userInputsArray based on whether the warp has inputs or not
     const userInputsArray = [];
-    for (const input of action.inputs) {
-      const value = inputs[input.name];
-      if (input.required && (value === undefined || value === null)) {
-        throw new Error(`Missing required input: ${input.name}`);
-      }
-      if (value !== undefined) {
-        let typedValue = value;
-        const type = input.type.split(':')[0];
-        
-        // No manual scaling here—let WarpActionExecutor handle modifiers
-        console.log(`Passing raw ${input.name} value to WarpActionExecutor`);
-
-        // Additional validations
-        if (type === "address" && !Address.isValid(value)) {
-          throw new Error(`${input.name} must be a valid MultiversX address`);
+    
+    // Only process inputs if the action has input requirements and inputs were provided
+    if (action.inputs && action.inputs.length > 0 && inputs && typeof inputs === 'object') {
+      console.log("Processing warp with input requirements.");
+      
+      for (const input of action.inputs) {
+        const value = inputs[input.name];
+        if (input.required && (value === undefined || value === null)) {
+          throw new Error(`Missing required input: ${input.name}`);
         }
-        if (type === "string" && input.pattern && !new RegExp(input.pattern).test(value)) {
-          throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
-        }
+        if (value !== undefined) {
+          let typedValue = value;
+          const type = input.type.split(':')[0];
+          
+          // No manual scaling here—let WarpActionExecutor handle modifiers
+          console.log(`Passing raw ${input.name} value to WarpActionExecutor`);
 
-        userInputsArray.push(`${type}:${typedValue}`);
+          // Additional validations
+          if (type === "address" && !Address.isValid(value)) {
+            throw new Error(`${input.name} must be a valid MultiversX address`);
+          }
+          if (type === "string" && input.pattern && !new RegExp(input.pattern).test(value)) {
+            throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
+          }
+
+          userInputsArray.push(`${type}:${typedValue}`);
+        }
       }
+      console.log("Prepared user inputs for execution.");
+    } else {
+      console.log("Processing warp without input requirements.");
     }
-    console.log("Prepared user inputs for execution.");
 
     // Execute transaction, relying on WarpActionExecutor to handle scaling and modifiers
     const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
@@ -475,7 +479,7 @@ app.post('/executeWarpWithInputs', checkToken, handleUsageFee, async (req, res) 
       usageFeeHash: req.usageFeeHash || 'N/A'
     });
   } catch (error) {
-    console.error("Error in /executeWarpWithInputs:", error.message);
+    console.error("Error in /executeWarp:", error.message);
     return res.status(400).json({ error: error.message });
   }
 });
