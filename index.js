@@ -32,12 +32,13 @@ const warpConfig = {
 // Constants for usage fee
 const FIXED_USD_FEE = 0.03; // $0.03 fixed fee
 const REWARD_TOKEN = "REWARD-cf6eac";
-const WEGLD_TOKEN = "WEGLD-bd4d79";
-const LP_CONTRACT = "erd1qqqqqqqqqqqqqpgq5e30gcakgtam8dpzj9xl2yd45fzdrw6c2jpsxe7ldq";
 const TREASURY_WALLET = "erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const whitelistFilePath = path.join(__dirname, 'whitelist.json');
+
+// In-memory store for tracking pending transactions (in production, consider using Redis or a database)
+const pendingUsageFeeTransactions = new Map();
 
 // Middleware: Token check
 const checkToken = (req, res, next) => {
@@ -87,47 +88,28 @@ const isWhitelisted = (walletAddress) => {
   return whitelist.some(entry => entry.walletAddress === walletAddress);
 };
 
-// Helper: Fetch REWARD token price from LP pool
+// Helper: Fetch REWARD token price from MultiversX API
 const getRewardPrice = async () => {
   try {
-    // Fetch EGLD price from CoinGecko
-    const coingeckoResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=elrond-erd-2&vs_currencies=usd');
-    const coingeckoData = await coingeckoResponse.json();
-    const eglPriceUsd = new BigNumber(coingeckoData['elrond-erd-2'].usd);
-
-    // Get LP pool data
-    const lpResponse = await fetch(`https://api.multiversx.com/accounts/${LP_CONTRACT}/tokens`);
-    const lpData = await lpResponse.json();
-
-    // Find REWARD and WEGLD reserves
-    const rewardReserve = lpData.find(token => token.identifier === REWARD_TOKEN)?.balance || '0';
-    const wegldReserve = lpData.find(token => token.identifier === WEGLD_TOKEN)?.balance || '0';
-
-    // Get token decimals
-    const rewardDecimals = await getTokenDecimals(REWARD_TOKEN);
-    const wegldDecimals = await getTokenDecimals(WEGLD_TOKEN);
-
-    // Calculate price using BigNumber for precise decimal arithmetic
-    const rewardReserveBN = new BigNumber(rewardReserve);
-    const wegldReserveBN = new BigNumber(wegldReserve);
+    // Fetch token info directly from MultiversX API
+    const tokenResponse = await fetch(`https://api.multiversx.com/tokens?search=${REWARD_TOKEN}`);
+    if (!tokenResponse.ok) {
+      throw new Error(`Failed to fetch token info: ${tokenResponse.statusText}`);
+    }
     
-    if (rewardReserveBN.isZero()) {
-      throw new Error('REWARD reserve is zero');
+    const tokenData = await tokenResponse.json();
+    if (!tokenData || !tokenData.length || !tokenData[0].price) {
+      throw new Error('Token price not available');
     }
-
-    // Calculate REWARD/WEGLD ratio
-    const rewardInWegld = wegldReserveBN
-      .multipliedBy(new BigNumber(10).pow(rewardDecimals))
-      .dividedBy(rewardReserveBN.multipliedBy(new BigNumber(10).pow(wegldDecimals)));
-
-    // Calculate final USD price using EGLD price from CoinGecko
-    const rewardPriceUsd = rewardInWegld.multipliedBy(eglPriceUsd);
-
-    if (!rewardPriceUsd.isFinite() || rewardPriceUsd.isZero()) {
-      throw new Error('Invalid REWARD price calculation');
+    
+    // Get price directly from the API response
+    const tokenPrice = new BigNumber(tokenData[0].price);
+    
+    if (tokenPrice.isZero() || !tokenPrice.isFinite()) {
+      throw new Error('Invalid token price from API');
     }
-
-    return rewardPriceUsd.toNumber();
+    
+    return tokenPrice.toNumber();
   } catch (error) {
     console.error('Error fetching REWARD price:', error);
     throw error;
@@ -153,8 +135,84 @@ const calculateDynamicUsageFee = async () => {
   return convertAmountToBlockchainValue(rewardAmount, decimals);
 };
 
+// Helper: Check transaction status with consistent retry logic
+async function checkTransactionStatus(txHash, maxRetries = 20, retryInterval = 2000) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      // Only log first, last, and every 5th attempt to reduce noise
+      if (i === 0 || i === maxRetries - 1 || i % 5 === 0) {
+        console.log(`Checking transaction ${txHash} status (attempt ${i + 1}/${maxRetries})...`);
+      }
+      
+      const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
+      const response = await fetch(txStatusUrl, { timeout: 5000 });
+      
+      if (!response.ok) {
+        if (response.status === 404) {
+          // Transaction not yet visible, retry after interval
+          await new Promise(resolve => setTimeout(resolve, retryInterval));
+          continue;
+        }
+        throw new Error(`HTTP error ${response.status}`);
+      }
+      
+      const txStatus = await response.json();
+      
+      if (txStatus.status === "success") {
+        console.log(`Transaction ${txHash} completed successfully.`);
+        return { status: "success", txHash };
+      } else if (txStatus.status === "fail" || txStatus.status === "invalid") {
+        console.log(`Transaction ${txHash} failed with status: ${txStatus.status}`);
+        return { 
+          status: "fail", 
+          txHash, 
+          details: txStatus.error || txStatus.receipt?.data || 'No error details provided' 
+        };
+      }
+      
+      // Transaction still pending, retry after interval
+      await new Promise(resolve => setTimeout(resolve, retryInterval));
+    } catch (error) {
+      console.error(`Error checking transaction ${txHash}: ${error.message}`);
+      // Continue retrying even after fetch errors
+      await new Promise(resolve => setTimeout(resolve, retryInterval));
+    }
+  }
+  
+  // Max retries reached without definitive status
+  console.log(`Transaction ${txHash} status undetermined after ${maxRetries} retries`);
+  return { status: "pending", txHash };
+}
+
 // Helper: Send usage fee transaction
-const sendUsageFee = async (pemContent) => {
+const sendUsageFee = async (pemContent, walletAddress) => {
+  // Check if there's already a pending transaction for this wallet
+  const pendingTx = pendingUsageFeeTransactions.get(walletAddress);
+  if (pendingTx) {
+    try {
+      // Check if the pending transaction has completed
+      const status = await checkTransactionStatus(pendingTx.txHash);
+      
+      // If transaction succeeded, return the existing transaction hash
+      if (status.status === "success") {
+        pendingUsageFeeTransactions.delete(walletAddress); // Clean up the record
+        return pendingTx.txHash;
+      }
+      
+      // If transaction failed, continue with creating a new one
+      if (status.status === "fail") {
+        pendingUsageFeeTransactions.delete(walletAddress); // Clean up the failed transaction
+      } else if (status.status === "pending") {
+        // Transaction is still pending, return the existing hash
+        // This prevents double charging for slow transactions
+        return pendingTx.txHash;
+      }
+    } catch (error) {
+      // If the transaction check fails for any reason, clear it and try again
+      pendingUsageFeeTransactions.delete(walletAddress);
+    }
+  }
+
   const signer = UserSigner.fromPem(pemContent);
   const senderAddress = signer.getAddress();
   const receiverAddress = new Address(TREASURY_WALLET);
@@ -184,13 +242,38 @@ const sendUsageFee = async (pemContent) => {
 
   await signer.sign(tx);
   const txHash = await provider.sendTransaction(tx);
+  
+  // Store the pending transaction with timestamp
+  pendingUsageFeeTransactions.set(walletAddress, {
+    txHash: txHash.toString(),
+    timestamp: Date.now()
+  });
 
-  const status = await checkTransactionStatus(txHash.toString());
-  if (status.status !== "success") {
+  // We'll do a minimal initial check with just a few retries to avoid holding up the API
+  // Full status tracking happens through the pendingUsageFeeTransactions system
+  const status = await checkTransactionStatus(txHash.toString(), 3, 1000);
+  
+  if (status.status === "success") {
+    pendingUsageFeeTransactions.delete(walletAddress); // Clean up on success
+  } else if (status.status === "fail") {
+    pendingUsageFeeTransactions.delete(walletAddress); // Clean up on failure
     throw new Error('Usage fee transaction failed. Ensure sufficient REWARD tokens are available.');
   }
+  // For pending status, leave in the map for future checks
+  
   return txHash.toString();
 };
+
+// Periodic cleanup of old pending transactions (run every 30 minutes)
+setInterval(() => {
+  const now = Date.now();
+  for (const [wallet, txData] of pendingUsageFeeTransactions.entries()) {
+    // Remove transactions older than 1 hour (3600000 ms)
+    if (now - txData.timestamp > 3600000) {
+      pendingUsageFeeTransactions.delete(wallet);
+    }
+  }
+}, 1800000); // 30 minutes
 
 // Middleware: Handle usage fee
 const handleUsageFee = async (req, res, next) => {
@@ -203,7 +286,7 @@ const handleUsageFee = async (req, res, next) => {
       return next();
     }
 
-    const txHash = await sendUsageFee(pemContent);
+    const txHash = await sendUsageFee(pemContent, walletAddress);
     req.usageFeeHash = txHash;
     next();
   } catch (error) {
@@ -249,33 +332,6 @@ async function fetchWarpInfo(warpId) {
     console.error(`Error resolving ${warpId}: ${error.message}`);
     throw error;
   }
-}
-
-// Helper: Check transaction status with retry logic
-async function checkTransactionStatus(txHash, retries = 20, delay = 3000) {
-  const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
-  for (let i = 0; i < retries; i++) {
-    try {
-      console.log(`Attempt ${i + 1}/${retries} to check transaction ${txHash} at ${new Date().toISOString()}...`);
-      const response = await fetch(txStatusUrl, { timeout: 5000 });
-      if (!response.ok) {
-        console.warn(`Non-200 response for ${txHash}: ${response.status}`);
-        throw new Error(`HTTP error ${response.status}`);
-      }
-      const txStatus = await response.json();
-      console.log(`Transaction ${txHash} status: ${txStatus.status || 'undefined'}`);
-      if (txStatus.status === "success") {
-        return { status: "success", txHash };
-      } else if (txStatus.status === "fail" || txStatus.status === "invalid") {
-        return { status: "fail", txHash, details: txStatus.error || txStatus.receipt?.data || 'No error details provided' };
-      }
-      console.log(`Transaction ${txHash} still pending, retrying...`);
-      await new Promise(resolve => setTimeout(resolve, delay));
-    } catch (error) {
-      console.error(`Error fetching transaction ${txHash} (attempt ${i + 1}): ${error.message}`);
-    }
-  }
-  throw new Error(`Transaction ${txHash} status could not be determined after ${retries} retries.`);
 }
 
 // --- Endpoints ---
