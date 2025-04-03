@@ -172,6 +172,9 @@ const calculateDynamicUsageFee = async () => {
 
 // Helper: Check transaction status with consistent retry logic
 async function checkTransactionStatus(txHash, maxRetries = 60, retryInterval = 2000) {
+  let consecutiveErrors = 0;
+  const MAX_CONSECUTIVE_ERRORS = 3;
+  
   for (let i = 0; i < maxRetries; i++) {
     try {
       // Only log first, last, and every 10th attempt to reduce noise
@@ -180,7 +183,10 @@ async function checkTransactionStatus(txHash, maxRetries = 60, retryInterval = 2
       }
       
       const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
-      const response = await fetch(txStatusUrl, { timeout: 5000 });
+      const response = await fetch(txStatusUrl, { 
+        timeout: 10000, // Increase timeout to 10 seconds
+        headers: { 'User-Agent': 'WARPS-MakeX-Integration/1.0' }
+      });
       
       if (!response.ok) {
         if (response.status === 404) {
@@ -188,27 +194,114 @@ async function checkTransactionStatus(txHash, maxRetries = 60, retryInterval = 2
           await new Promise(resolve => setTimeout(resolve, retryInterval));
           continue;
         }
-        throw new Error(`HTTP error ${response.status}`);
+        
+        // For other HTTP errors
+        consecutiveErrors++;
+        log('warn', `HTTP error checking transaction`, { 
+          txHash, 
+          statusCode: response.status, 
+          attempt: i + 1,
+          consecutiveErrors
+        });
+        
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          throw new Error(`Multiple consecutive HTTP errors: ${response.status}`);
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, retryInterval));
+        continue;
       }
+      
+      // Reset consecutive errors counter on successful response
+      consecutiveErrors = 0;
       
       const txStatus = await response.json();
       
-      if (txStatus.status === "success") {
+      if (txStatus.status === "success" || txStatus.status === "executed") {
         log('info', `Transaction completed successfully`, { txHash });
+        
+        // Additional validation for smart contract calls
+        if (txStatus.results) {
+          // Check for any error indicators in the results
+          const hasErrors = txStatus.results.some(result => 
+            result.returnMessage && result.returnMessage.toLowerCase().includes('error')
+          );
+          
+          if (hasErrors) {
+            log('warn', `Transaction has error messages in results`, { 
+              txHash, 
+              errors: txStatus.results.filter(r => r.returnMessage && r.returnMessage.toLowerCase().includes('error'))
+                .map(r => r.returnMessage)
+            });
+            return { status: "fail", txHash, details: "Smart contract execution error" };
+          }
+        }
+        
         return { status: "success", txHash };
       } else if (txStatus.status === "fail" || txStatus.status === "invalid") {
-        log('warn', `Transaction failed`, { txHash, status: txStatus.status });
+        log('warn', `Transaction failed`, { 
+          txHash, 
+          status: txStatus.status,
+          errorDetails: txStatus.error || txStatus.receipt?.data || 'No error details provided'
+        });
         return { 
           status: "fail", 
           txHash, 
           details: txStatus.error || txStatus.receipt?.data || 'No error details provided' 
         };
+      } else if (txStatus.status === "pending") {
+        // Still pending, retry after interval
+        await new Promise(resolve => setTimeout(resolve, retryInterval));
+        continue;
+      } else {
+        // Unknown status
+        log('warn', `Unknown transaction status`, { txHash, status: txStatus.status });
+        await new Promise(resolve => setTimeout(resolve, retryInterval));
+      }
+    } catch (error) {
+      consecutiveErrors++;
+      log('error', `Error checking transaction`, { 
+        txHash, 
+        error: error.message, 
+        attempt: i + 1,
+        consecutiveErrors 
+      });
+      
+      // If we have multiple consecutive errors, we might need to try a different approach
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        log('error', `Too many consecutive errors checking transaction`, { 
+          txHash, 
+          consecutiveErrors,
+          error: error.message
+        });
+        
+        // Try a secondary API endpoint as backup
+        try {
+          const backupApiUrl = 'https://gateway.multiversx.com/transaction/';
+          log('info', `Trying backup API for transaction status`, { txHash, backupApiUrl });
+          
+          const backupResponse = await fetch(`${backupApiUrl}${txHash}`, { 
+            timeout: 10000,
+            headers: { 'User-Agent': 'WARPS-MakeX-Integration/1.0' }
+          });
+          
+          if (backupResponse.ok) {
+            const backupTxStatus = await backupResponse.json();
+            
+            if (backupTxStatus.status === "success") {
+              log('info', `Transaction confirmed successful via backup API`, { txHash });
+              return { status: "success", txHash };
+            } else if (backupTxStatus.status === "fail" || backupTxStatus.status === "invalid") {
+              log('warn', `Transaction confirmed failed via backup API`, { txHash });
+              return { status: "fail", txHash, details: backupTxStatus.error || 'Failed (from backup API)' };
+            }
+          }
+        } catch (backupError) {
+          log('error', `Backup API also failed`, { txHash, error: backupError.message });
+          // Continue with main flow after logging the backup attempt failure
+        }
       }
       
-      // Transaction still pending, retry after interval
-      await new Promise(resolve => setTimeout(resolve, retryInterval));
-    } catch (error) {
-      log('error', `Error checking transaction`, { txHash, error: error.message, attempt: i + 1 });
       // Continue retrying even after fetch errors
       await new Promise(resolve => setTimeout(resolve, retryInterval));
     }
@@ -230,7 +323,7 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   if (pendingTx) {
     try {
       // Check if the pending transaction has completed
-      const status = await checkTransactionStatus(pendingTx.txHash);
+      const status = await checkTransactionStatus(pendingTx.txHash, 10, 2000); // Increase retries for usage fee check
       
       // If transaction succeeded, return the existing transaction hash
       if (status.status === "success") {
@@ -287,8 +380,8 @@ const sendUsageFee = async (pemContent, walletAddress) => {
     timestamp: Date.now()
   });
 
-  // Initial check with minimal retries
-  const status = await checkTransactionStatus(txHash.toString(), 3, 1000);
+  // Initial check with more retries (10 instead of 3)
+  const status = await checkTransactionStatus(txHash.toString(), 10, 2000);
   
   if (status.status === "success") {
     pendingUsageFeeTransactions.delete(walletAddress); // Clean up on success
@@ -482,7 +575,8 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     const txHash = await provider.sendTransaction(tx);
     log('info', `Transaction sent to blockchain`, { txHash: txHash.toString(), warpId });
     
-    const status = await checkTransactionStatus(txHash.toString());
+    // Wait for transaction to complete with longer timeout for important actions
+    const status = await checkTransactionStatus(txHash.toString(), 60, 2000);
 
     if (status.status === "fail") {
       log('warn', `Transaction failed`, { 
@@ -492,6 +586,20 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
       });
       return res.status(400).json({
         error: `Transaction failed: ${status.details || 'Unknown reason'}`
+      });
+    } else if (status.status === "pending") {
+      // If still pending after max retries, we should not return success
+      log('warn', `Transaction status still pending after max retries`, { 
+        txHash: status.txHash, 
+        warpId 
+      });
+      return res.status(202).json({
+        warpId,
+        warpHash: warpInfo.meta?.hash,
+        finalTxHash: txHash.toString(),
+        finalStatus: status.status,
+        usageFeeHash: req.usageFeeHash || 'N/A',
+        message: "Transaction submitted but still pending. Please check the transaction hash manually."
       });
     }
 
