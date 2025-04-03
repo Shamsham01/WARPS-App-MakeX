@@ -9,15 +9,42 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fetch from 'node-fetch';
+import helmet from 'helmet';
+import dotenv from 'dotenv';
+
+// Load environment variables
+dotenv.config();
 
 // Production network provider setup
 const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
+const SECURE_TOKEN = process.env.SECURE_TOKEN;
 
+// Verify security-critical environment variables
+if (!SECURE_TOKEN) {
+  console.error('⚠️ WARNING: SECURE_TOKEN environment variable is not set. Using fallback value for development only.');
+  SECURE_TOKEN = 'MY_SECURE_TOKEN'; // Only used in development
+}
+
+// Apply security middleware
+app.use(helmet());
 app.use(bodyParser.json());
+
+// Simple structured logging helper
+function log(level, message, data = {}) {
+  // Ensure PEM content is never logged
+  if (data.walletPem) data.walletPem = '[REDACTED]';
+  if (data.pemContent) data.pemContent = '[REDACTED]';
+  
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level,
+    message,
+    ...data
+  }));
+}
 
 // Warp Configurations
 const warpConfig = {
@@ -74,11 +101,20 @@ const convertAmountToBlockchainValue = (amount, decimals) => {
 
 // Helper: Load whitelist from file
 const loadWhitelist = () => {
-  if (!fs.existsSync(whitelistFilePath)) {
-    fs.writeFileSync(whitelistFilePath, JSON.stringify([], null, 2));
+  try {
+    if (!fs.existsSync(whitelistFilePath)) {
+      log('warn', 'Whitelist file not found, creating empty whitelist');
+      fs.writeFileSync(whitelistFilePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    const data = fs.readFileSync(whitelistFilePath);
+    const whitelist = JSON.parse(data);
+    log('info', `Loaded whitelist with ${whitelist.length} entries`);
+    return whitelist;
+  } catch (error) {
+    log('error', 'Error loading whitelist', { error: error.message });
+    return []; // Return empty array as fallback
   }
-  const data = fs.readFileSync(whitelistFilePath);
-  return JSON.parse(data);
 };
 
 // Helper: Check if wallet is whitelisted
@@ -90,7 +126,9 @@ const isWhitelisted = (walletAddress) => {
 // Helper: Fetch REWARD token price from MultiversX API
 const getRewardPrice = async () => {
   try {
-    const tokenResponse = await fetch(`https://api.multiversx.com/tokens?search=${REWARD_TOKEN}`);
+    const tokenResponse = await fetch(`https://api.multiversx.com/tokens?search=${REWARD_TOKEN}`, { 
+      timeout: 10000 // Add timeout for API calls
+    });
     if (!tokenResponse.ok) {
       throw new Error(`Failed to fetch token info: ${tokenResponse.statusText}`);
     }
@@ -106,9 +144,10 @@ const getRewardPrice = async () => {
       throw new Error('Invalid token price from API');
     }
     
+    log('info', `Retrieved REWARD token price`, { price: tokenPrice.toString() });
     return tokenPrice.toNumber();
   } catch (error) {
-    console.error('Error fetching REWARD price:', error);
+    log('error', `Error fetching REWARD price`, { error: error.message });
     throw error;
   }
 };
@@ -132,12 +171,12 @@ const calculateDynamicUsageFee = async () => {
 };
 
 // Helper: Check transaction status with consistent retry logic
-async function checkTransactionStatus(txHash, maxRetries = 20, retryInterval = 2000) {
+async function checkTransactionStatus(txHash, maxRetries = 60, retryInterval = 2000) {
   for (let i = 0; i < maxRetries; i++) {
     try {
-      // Only log first, last, and every 5th attempt to reduce noise
-      if (i === 0 || i === maxRetries - 1 || i % 5 === 0) {
-        console.log(`Checking transaction ${txHash} status (attempt ${i + 1}/${maxRetries})...`);
+      // Only log first, last, and every 10th attempt to reduce noise
+      if (i === 0 || i === maxRetries - 1 || i % 10 === 0) {
+        log('info', `Checking transaction status`, { txHash, attempt: i + 1, maxRetries });
       }
       
       const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
@@ -155,10 +194,10 @@ async function checkTransactionStatus(txHash, maxRetries = 20, retryInterval = 2
       const txStatus = await response.json();
       
       if (txStatus.status === "success") {
-        console.log(`Transaction ${txHash} completed successfully.`);
+        log('info', `Transaction completed successfully`, { txHash });
         return { status: "success", txHash };
       } else if (txStatus.status === "fail" || txStatus.status === "invalid") {
-        console.log(`Transaction ${txHash} failed with status: ${txStatus.status}`);
+        log('warn', `Transaction failed`, { txHash, status: txStatus.status });
         return { 
           status: "fail", 
           txHash, 
@@ -169,14 +208,18 @@ async function checkTransactionStatus(txHash, maxRetries = 20, retryInterval = 2
       // Transaction still pending, retry after interval
       await new Promise(resolve => setTimeout(resolve, retryInterval));
     } catch (error) {
-      console.error(`Error checking transaction ${txHash}: ${error.message}`);
+      log('error', `Error checking transaction`, { txHash, error: error.message, attempt: i + 1 });
       // Continue retrying even after fetch errors
       await new Promise(resolve => setTimeout(resolve, retryInterval));
     }
   }
   
   // Max retries reached without definitive status
-  console.log(`Transaction ${txHash} status undetermined after ${maxRetries} retries`);
+  log('warn', `Transaction status undetermined after max retries`, { 
+    txHash, 
+    maxRetries, 
+    totalSeconds: maxRetries * retryInterval / 1000 
+  });
   return { status: "pending", txHash };
 }
 
@@ -257,17 +300,6 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   return txHash.toString();
 };
 
-// Periodic cleanup of old pending transactions (run every 30 minutes)
-setInterval(() => {
-  const now = Date.now();
-  for (const [wallet, txData] of pendingUsageFeeTransactions.entries()) {
-    // Remove transactions older than 1 hour
-    if (now - txData.timestamp > 3600000) {
-      pendingUsageFeeTransactions.delete(wallet);
-    }
-  }
-}, 1800000); // 30 minutes
-
 // Middleware: Handle usage fee
 const handleUsageFee = async (req, res, next) => {
   try {
@@ -275,7 +307,7 @@ const handleUsageFee = async (req, res, next) => {
     const walletAddress = UserSigner.fromPem(pemContent).getAddress().toString();
 
     if (isWhitelisted(walletAddress)) {
-      console.log(`Wallet ${walletAddress} is whitelisted. Skipping usage fee.`);
+      log('info', `Skipping usage fee for whitelisted wallet`, { walletAddress });
       return next();
     }
 
@@ -283,7 +315,7 @@ const handleUsageFee = async (req, res, next) => {
     req.usageFeeHash = txHash;
     next();
   } catch (error) {
-    console.error('Error processing usage fee:', error.message);
+    log('error', `Error processing usage fee`, { error: error.message });
     res.status(400).json({ error: error.message });
   }
 };
@@ -320,7 +352,7 @@ async function fetchWarpInfo(warpId) {
   const warpLink = new WarpLink(warpConfig);
 
   try {
-    console.log(`Resolving WARP: ${warpId}`);
+    log('info', `Resolving WARP`, { warpId });
     const result = await warpLink.detect(warpId);
     
     if (!result.match || !result.warp) {
@@ -328,12 +360,12 @@ async function fetchWarpInfo(warpId) {
     }
     
     const warp = result.warp;
-    console.log(`Resolved ${warpId} to hash: ${warp.meta?.hash || 'unknown'}`);
+    log('info', `Resolved WARP hash`, { warpId, hash: warp.meta?.hash || 'unknown' });
     
     validateWarp(warp, warpId);
     return warp;
   } catch (error) {
-    console.error(`Error resolving ${warpId}: ${error.message}`);
+    log('error', `Error resolving WARP`, { warpId, error: error.message });
     throw error;
   }
 }
@@ -365,7 +397,7 @@ app.get('/warpRPC', checkToken, async (req, res) => {
     const { warpId } = req.query;
     if (!warpId) throw new Error("Missing warpId in query parameters");
 
-    console.log(`Fetching input fields for WARP: ${warpId}`);
+    log('info', `Fetching input fields for WARP`, { warpId });
     const warp = await fetchWarpInfo(warpId);
     const action = warp.actions[0];
 
@@ -383,10 +415,10 @@ app.get('/warpRPC', checkToken, async (req, res) => {
       modifier: input.modifier
     }));
 
-    console.log(`Found ${mappedInputs.length} input fields for ${warpId}`);
+    log('info', `Found input fields for WARP`, { warpId, count: mappedInputs.length });
     return res.json(mappedInputs);
   } catch (error) {
-    console.error("Error in /warpRPC:", error.message);
+    log('error', `Error in /warpRPC`, { error: error.message, stack: error.stack });
     return res.status(400).json({ error: error.message });
   }
 });
@@ -395,9 +427,10 @@ app.get('/warpRPC', checkToken, async (req, res) => {
 // This endpoint executes a warp with or without inputs provided by Make.com
 app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
   try {
-    console.log(`Processing WARP execution request`);
     const { warpId, inputs } = req.body;
     if (!warpId) throw new Error("Missing warpId in request body");
+
+    log('info', `Processing WARP execution request`, { warpId });
 
     // Extract PEM and signer details
     const pemContent = getPemContent(req);
@@ -413,7 +446,7 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     
     // Only process inputs if the action has input requirements and inputs were provided
     if (action.inputs && action.inputs.length > 0 && inputs && typeof inputs === 'object') {
-      console.log(`Processing ${action.inputs.length} input fields for WARP: ${warpId}`);
+      log('info', `Processing inputs for WARP`, { warpId, inputCount: action.inputs.length });
       
       for (const input of action.inputs) {
         const value = inputs[input.name];
@@ -435,7 +468,7 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
         }
       }
     } else {
-      console.log(`Processing WARP without input requirements: ${warpId}`);
+      log('info', `Processing WARP without inputs`, { warpId });
     }
 
     // Execute transaction
@@ -447,16 +480,27 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     tx.nonce = accountOnNetwork.nonce;
     await signer.sign(tx);
     const txHash = await provider.sendTransaction(tx);
-    console.log(`Transaction sent: ${txHash.toString()}`);
+    log('info', `Transaction sent to blockchain`, { txHash: txHash.toString(), warpId });
     
     const status = await checkTransactionStatus(txHash.toString());
 
     if (status.status === "fail") {
+      log('warn', `Transaction failed`, { 
+        txHash: status.txHash, 
+        details: status.details, 
+        warpId 
+      });
       return res.status(400).json({
         error: `Transaction failed: ${status.details || 'Unknown reason'}`
       });
     }
 
+    log('info', `WARP execution completed successfully`, {
+      warpId,
+      txHash: status.txHash,
+      status: status.status
+    });
+    
     return res.json({
       warpId,
       warpHash: warpInfo.meta?.hash,
@@ -465,12 +509,37 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
       usageFeeHash: req.usageFeeHash || 'N/A'
     });
   } catch (error) {
-    console.error("Error in /executeWarp:", error.message);
+    log('error', `Error in /executeWarp`, { 
+      warpId: req.body?.warpId,
+      error: error.message, 
+      stack: error.stack 
+    });
     return res.status(400).json({ error: error.message });
   }
 });
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Setup global error handlers for uncaught exceptions
+process.on('uncaughtException', (error) => {
+  log('error', 'Uncaught Exception', { error: error.message, stack: error.stack });
+  // In production, we don't want to exit immediately to maintain uptime
+  // but in a real production environment, you might want to restart the process
+  // process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  log('error', 'Unhandled Promise Rejection', { reason: reason?.toString(), stack: reason?.stack });
+});
+
 // Start server
 app.listen(PORT, () => {
-  console.log(`WARP integration service running on port ${PORT}`);
+  log('info', `WARP integration service running on port ${PORT}`, { environment: process.env.NODE_ENV || 'development' });
 });
