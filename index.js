@@ -75,11 +75,24 @@ const checkToken = (req, res, next) => {
 
 // Helper: Get PEM and derive address
 function getPemContent(req) {
-  const pemContent = req.body.walletPem;
-  if (!pemContent || typeof pemContent !== 'string' || !pemContent.includes('-----BEGIN PRIVATE KEY-----')) {
-    throw new Error('Invalid PEM content');
+  try {
+    const pemContent = req.body.walletPem;
+    if (!pemContent || typeof pemContent !== 'string') {
+      throw new Error('Missing or invalid PEM content');
+    }
+    
+    if (!pemContent.includes('-----BEGIN PRIVATE KEY-----')) {
+      throw new Error('Invalid PEM format');
+    }
+    
+    return pemContent;
+  } catch (error) {
+    // Ensure error doesn't contain any partial PEM content
+    if (error.message && error.message.includes('KEY')) {
+      error.message = 'Invalid PEM format';
+    }
+    throw error;
   }
-  return pemContent;
 };
 
 // Helper: Fetch token decimals from MultiversX API
@@ -617,12 +630,22 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
       usageFeeHash: req.usageFeeHash || 'N/A'
     });
   } catch (error) {
+    // Sanitize error message to prevent PEM data from being included in logs or responses
+    const sanitizedMessage = error.message ? 
+      error.message.replace(/-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/g, '[REDACTED PEM DATA]') : 
+      'Unknown error';
+    
+    const sanitizedStack = error.stack ? 
+      error.stack.replace(/-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/g, '[REDACTED PEM DATA]') : 
+      '';
+    
     log('error', `Error in /executeWarp`, { 
       warpId: req.body?.warpId,
-      error: error.message, 
-      stack: error.stack 
+      error: sanitizedMessage,
+      stack: sanitizedStack
     });
-    return res.status(400).json({ error: error.message });
+    
+    return res.status(400).json({ error: sanitizedMessage });
   }
 });
 
@@ -637,14 +660,29 @@ app.get('/health', (req, res) => {
 
 // Setup global error handlers for uncaught exceptions
 process.on('uncaughtException', (error) => {
-  log('error', 'Uncaught Exception', { error: error.message, stack: error.stack });
+  // Sanitize error message and stack trace to ensure no PEM data is included
+  const sanitizedMessage = error.message ? error.message.replace(/-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/g, '[REDACTED PEM DATA]') : '';
+  const sanitizedStack = error.stack ? error.stack.replace(/-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/g, '[REDACTED PEM DATA]') : '';
+  
+  log('error', 'Uncaught Exception', { 
+    error: sanitizedMessage, 
+    stack: sanitizedStack 
+  });
   // In production, we don't want to exit immediately to maintain uptime
   // but in a real production environment, you might want to restart the process
   // process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  log('error', 'Unhandled Promise Rejection', { reason: reason?.toString(), stack: reason?.stack });
+  // Sanitize reason to ensure no PEM data is included
+  const reasonString = reason?.toString() || '';
+  const sanitizedReason = reasonString.replace(/-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/g, '[REDACTED PEM DATA]');
+  const sanitizedStack = reason?.stack ? reason.stack.replace(/-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/g, '[REDACTED PEM DATA]') : '';
+  
+  log('error', 'Unhandled Promise Rejection', { 
+    reason: sanitizedReason, 
+    stack: sanitizedStack 
+  });
 });
 
 // Start server
