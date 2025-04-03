@@ -10,17 +10,16 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fetch from 'node-fetch';
 
-// Use mainnet (or revert to devnet by uncommenting the devnet line below)
+// Production network provider setup
 const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { clientName: "warp-integration" });
-// const provider = new ProxyNetworkProvider("https://devnet-gateway.multiversx.com", { clientName: "warp-integration" });
 
 const app = express();
-const PORT = process.env.PORT || 10000; // Matches Render's detected port
+const PORT = process.env.PORT || 10000;
 const SECURE_TOKEN = process.env.SECURE_TOKEN || 'MY_SECURE_TOKEN';
 
 app.use(bodyParser.json());
 
-// Warp Configurations (adjust for mainnet or devnet as needed)
+// Warp Configurations
 const warpConfig = {
   providerUrl: "https://gateway.multiversx.com",
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
@@ -37,7 +36,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const whitelistFilePath = path.join(__dirname, 'whitelist.json');
 
-// In-memory store for tracking pending transactions (in production, consider using Redis or a database)
+// In-memory store for tracking pending transactions
 const pendingUsageFeeTransactions = new Map();
 
 // Middleware: Token check
@@ -91,7 +90,6 @@ const isWhitelisted = (walletAddress) => {
 // Helper: Fetch REWARD token price from MultiversX API
 const getRewardPrice = async () => {
   try {
-    // Fetch token info directly from MultiversX API
     const tokenResponse = await fetch(`https://api.multiversx.com/tokens?search=${REWARD_TOKEN}`);
     if (!tokenResponse.ok) {
       throw new Error(`Failed to fetch token info: ${tokenResponse.statusText}`);
@@ -102,7 +100,6 @@ const getRewardPrice = async () => {
       throw new Error('Token price not available');
     }
     
-    // Get price directly from the API response
     const tokenPrice = new BigNumber(tokenData[0].price);
     
     if (tokenPrice.isZero() || !tokenPrice.isFinite()) {
@@ -127,7 +124,6 @@ const calculateDynamicUsageFee = async () => {
   const rewardAmount = new BigNumber(FIXED_USD_FEE).dividedBy(rewardPrice);
   const decimals = await getTokenDecimals(REWARD_TOKEN);
   
-  // Ensure the amount is not too small or too large
   if (!rewardAmount.isFinite() || rewardAmount.isZero()) {
     throw new Error('Invalid usage fee calculation');
   }
@@ -204,7 +200,6 @@ const sendUsageFee = async (pemContent, walletAddress) => {
         pendingUsageFeeTransactions.delete(walletAddress); // Clean up the failed transaction
       } else if (status.status === "pending") {
         // Transaction is still pending, return the existing hash
-        // This prevents double charging for slow transactions
         return pendingTx.txHash;
       }
     } catch (error) {
@@ -249,8 +244,7 @@ const sendUsageFee = async (pemContent, walletAddress) => {
     timestamp: Date.now()
   });
 
-  // We'll do a minimal initial check with just a few retries to avoid holding up the API
-  // Full status tracking happens through the pendingUsageFeeTransactions system
+  // Initial check with minimal retries
   const status = await checkTransactionStatus(txHash.toString(), 3, 1000);
   
   if (status.status === "success") {
@@ -259,7 +253,6 @@ const sendUsageFee = async (pemContent, walletAddress) => {
     pendingUsageFeeTransactions.delete(walletAddress); // Clean up on failure
     throw new Error('Usage fee transaction failed. Ensure sufficient REWARD tokens are available.');
   }
-  // For pending status, leave in the map for future checks
   
   return txHash.toString();
 };
@@ -268,7 +261,7 @@ const sendUsageFee = async (pemContent, walletAddress) => {
 setInterval(() => {
   const now = Date.now();
   for (const [wallet, txData] of pendingUsageFeeTransactions.entries()) {
-    // Remove transactions older than 1 hour (3600000 ms)
+    // Remove transactions older than 1 hour
     if (now - txData.timestamp > 3600000) {
       pendingUsageFeeTransactions.delete(wallet);
     }
@@ -308,76 +301,42 @@ app.post('/authorization', (req, res) => {
   }
 });
 
-// Helper: Fetch WARP info using WarpLink (retaining direct detection for simplicity)
+// Helper: Validate WARP structure
+function validateWarp(warp, warpId) {
+  if (!warp || !Array.isArray(warp.actions) || warp.actions.length === 0) {
+    throw new Error(`Invalid WARP structure for ${warpId}: actions is missing or empty`);
+  }
+  
+  const action = warp.actions[0];
+  if (!action || action.type !== 'contract') {
+    throw new Error(`WARP ${warpId} must have a 'contract' action`);
+  }
+  
+  return action;
+}
+
+// Helper: Fetch WARP info using WarpLink
 async function fetchWarpInfo(warpId) {
   const warpLink = new WarpLink(warpConfig);
 
   try {
-    console.log(`Resolving ${warpId} directly with WarpLink...`);
+    console.log(`Resolving WARP: ${warpId}`);
     const result = await warpLink.detect(warpId);
-    console.log(`WarpLink.detect result for ${warpId}:`, JSON.stringify(result, null, 2));
+    
     if (!result.match || !result.warp) {
-      throw new Error(`Could not resolve ${warpId}: warp not found`);
+      throw new Error(`Could not resolve ${warpId}: WARP not found`);
     }
+    
     const warp = result.warp;
-    console.log(`Raw warp object from WarpLink.detect:`, JSON.stringify(warp, null, 2));
-    console.log(`Resolved ${warpId} to hash: ${warp.meta?.hash || 'unknown hash'}`);
-
-    if (!warp || !Array.isArray(warp.actions) || warp.actions.length === 0) {
-      throw new Error(`Invalid warp structure for ${warpId}: actions is missing or empty`);
-    }
-
+    console.log(`Resolved ${warpId} to hash: ${warp.meta?.hash || 'unknown'}`);
+    
+    validateWarp(warp, warpId);
     return warp;
   } catch (error) {
     console.error(`Error resolving ${warpId}: ${error.message}`);
     throw error;
   }
 }
-
-// --- Endpoints ---
-
-// 1. GET /warpRPC
-// This endpoint returns dynamic input fields for Make.com based on the warp blueprint.
-app.get('/warpRPC', checkToken, async (req, res) => {
-  try {
-    const { warpId } = req.query;
-    if (!warpId) throw new Error("Missing warpId in query parameters");
-
-    console.log(`Fetching dynamic input fields for warpId: ${warpId}`);
-    const warp = await fetchWarpInfo(warpId);
-    console.log(`Warp object received:`, JSON.stringify(warp, null, 2));
-
-    // Validate actions array
-    if (!Array.isArray(warp.actions) || warp.actions.length === 0) {
-      throw new Error(`Warp ${warpId} has no valid actions array`);
-    }
-
-    const action = warp.actions[0];
-    if (!action || action.type !== 'contract') {
-      throw new Error(`Warp ${warpId} must have a 'contract' action`);
-    }
-
-    // Map inputs for Make.com
-    const inputs = action.inputs || [];
-    const mappedInputs = inputs.map(input => ({
-      name: input.name,
-      type: mapToMakeType(input.type.split(':')[0]), // Converts API type to Make.com type
-      label: input.name,
-      required: input.required || false,
-      min: input.min,
-      max: input.max,
-      pattern: input.pattern,
-      patternDescription: input.patternDescription,
-      modifier: input.modifier // e.g., "scale:18"
-    }));
-
-    console.log(`Response from /warpRPC:`, mappedInputs);
-    return res.json(mappedInputs);
-  } catch (error) {
-    console.error("Error in /warpRPC:", error.message);
-    return res.status(400).json({ error: error.message });
-  }
-});
 
 // Helper function to map API types to Make.com types
 function mapToMakeType(apiType) {
@@ -397,11 +356,46 @@ function mapToMakeType(apiType) {
   }
 }
 
+// --- Endpoints ---
+
+// 1. GET /warpRPC
+// This endpoint returns dynamic input fields for Make.com based on the warp blueprint.
+app.get('/warpRPC', checkToken, async (req, res) => {
+  try {
+    const { warpId } = req.query;
+    if (!warpId) throw new Error("Missing warpId in query parameters");
+
+    console.log(`Fetching input fields for WARP: ${warpId}`);
+    const warp = await fetchWarpInfo(warpId);
+    const action = warp.actions[0];
+
+    // Map inputs for Make.com
+    const inputs = action.inputs || [];
+    const mappedInputs = inputs.map(input => ({
+      name: input.name,
+      type: mapToMakeType(input.type.split(':')[0]),
+      label: input.name,
+      required: input.required || false,
+      min: input.min,
+      max: input.max,
+      pattern: input.pattern,
+      patternDescription: input.patternDescription,
+      modifier: input.modifier
+    }));
+
+    console.log(`Found ${mappedInputs.length} input fields for ${warpId}`);
+    return res.json(mappedInputs);
+  } catch (error) {
+    console.error("Error in /warpRPC:", error.message);
+    return res.status(400).json({ error: error.message });
+  }
+});
+
 // 2. POST /executeWarp
 // This endpoint executes a warp with or without inputs provided by Make.com
 app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
   try {
-    console.log("Incoming /executeWarp request received.");
+    console.log(`Processing WARP execution request`);
     const { warpId, inputs } = req.body;
     if (!warpId) throw new Error("Missing warpId in request body");
 
@@ -412,19 +406,14 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
 
     // Fetch warp info
     const warpInfo = await fetchWarpInfo(warpId);
-    console.log("Fetched warp info.");
-
     const action = warpInfo.actions[0];
-    if (!action || action.type !== 'contract') {
-      throw new Error(`Warp ${warpId} must have a 'contract' action`);
-    }
     
     // Prepare userInputsArray based on whether the warp has inputs or not
     const userInputsArray = [];
     
     // Only process inputs if the action has input requirements and inputs were provided
     if (action.inputs && action.inputs.length > 0 && inputs && typeof inputs === 'object') {
-      console.log("Processing warp with input requirements.");
+      console.log(`Processing ${action.inputs.length} input fields for WARP: ${warpId}`);
       
       for (const input of action.inputs) {
         const value = inputs[input.name];
@@ -432,12 +421,8 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
           throw new Error(`Missing required input: ${input.name}`);
         }
         if (value !== undefined) {
-          let typedValue = value;
           const type = input.type.split(':')[0];
           
-          // No manual scaling here—let WarpActionExecutor handle modifiers
-          console.log(`Passing raw ${input.name} value to WarpActionExecutor`);
-
           // Additional validations
           if (type === "address" && !Address.isValid(value)) {
             throw new Error(`${input.name} must be a valid MultiversX address`);
@@ -446,15 +431,14 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
             throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
           }
 
-          userInputsArray.push(`${type}:${typedValue}`);
+          userInputsArray.push(`${type}:${value}`);
         }
       }
-      console.log("Prepared user inputs for execution.");
     } else {
-      console.log("Processing warp without input requirements.");
+      console.log(`Processing WARP without input requirements: ${warpId}`);
     }
 
-    // Execute transaction, relying on WarpActionExecutor to handle scaling and modifiers
+    // Execute transaction
     const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
     const tx = warpActionExecutor.createTransactionForExecute(action, userInputsArray, []);
@@ -463,6 +447,8 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     tx.nonce = accountOnNetwork.nonce;
     await signer.sign(tx);
     const txHash = await provider.sendTransaction(tx);
+    console.log(`Transaction sent: ${txHash.toString()}`);
+    
     const status = await checkTransactionStatus(txHash.toString());
 
     if (status.status === "fail") {
@@ -486,5 +472,5 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`Warp integration app is running on port ${PORT}`);
+  console.log(`WARP integration service running on port ${PORT}`);
 });
