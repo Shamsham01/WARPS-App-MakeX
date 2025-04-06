@@ -4,6 +4,10 @@
   "whitelistStart":"2024-11-26T10:00:00Z"},
   
   {"walletAddress":"erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn",
-    "label":"HodlTokenClubAssets",
+    "label":"HodlTokenClub",
+    "whitelistStart":"2024-12-01T10:00:00Z"},
+  
+  {"walletAddress":"erd1vza53l2jdal7u6qpvumgsgzsu9ttletl0zpzf0nl93nzz9pwm2ts6gltsl",
+    "label":"TestWallet",
     "whitelistStart":"2024-12-01T10:00:00Z"}
 ]
