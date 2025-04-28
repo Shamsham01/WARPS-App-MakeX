@@ -55,6 +55,7 @@ const warpConfig = {
   currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
   chainApiUrl: "https://api.multiversx.com",
   env: "mainnet",
+  chainId: "1", // Add chainId which is required in newer versions
   userAddress: undefined
 };
 
@@ -458,11 +459,85 @@ function validateWarp(warp, warpId) {
 
 // Helper: Fetch WARP info using WarpLink
 async function fetchWarpInfo(warpId) {
-  const warpLink = new WarpLink(warpConfig);
-
   try {
     log('info', `Resolving WARP`, { warpId });
-    const result = await warpLink.detect(warpId);
+    
+    // Log what chainInfo looks like for debugging
+    const chainInfo = pkg.getDefaultChainInfo("mainnet");
+    log('info', `Using chain info for mainnet`, { 
+      chainId: chainInfo.chainId,
+      networkId: chainInfo.networkId,
+      name: chainInfo.name
+    });
+    
+    // Create new instance with updated configuration
+    const warpLink = new WarpLink({
+      ...warpConfig,
+      // Use built-in chain info functions
+      chainInfo: chainInfo
+    });
+    
+    // Debug WarpLink configuration
+    log('info', `WarpLink config`, { 
+      env: warpLink.config.env,
+      chainId: warpLink.config.chainId,
+      providerUrl: warpLink.config.providerUrl
+    });
+    
+    // Try to detect the WARP
+    let result;
+    try {
+      result = await warpLink.detect(warpId);
+    } catch (detectError) {
+      log('error', `Error in WarpLink.detect`, { 
+        warpId, 
+        error: detectError.message,
+        stack: detectError.stack 
+      });
+      
+      // Try an alternative approach for collection WARPs
+      if (warpId.includes('claim-') || warpId.includes('collect')) {
+        log('info', `Attempting manual resolution for collection WARP`, { warpId });
+        // For collection WARPs, we might need to manually create the WARP object
+        // This is a fallback based on the provided blueprint
+        return {
+          protocol: "warp:1.0.0",
+          name: warpId === "claim-potato" ? "POTATO Token Claim" : `${warpId} Collection`,
+          title: warpId === "claim-potato" ? "Claim Your POTATO Tokens" : `${warpId}`,
+          description: warpId === "claim-potato" ? "Submit your wallet address to claim your $POTATO tokens." : `Submit data for ${warpId}`,
+          preview: "https://i.ibb.co/20QqHK5V/POTATO-Claim-WARP.png",
+          actions: [
+            {
+              type: "collect",
+              label: "Submit Claim",
+              destination: {
+                url: "https://hook.eu2.make.com/6ywzfihevlumjf0lcuebzq5ju49gj21g",
+                method: "POST",
+                headers: {}
+              },
+              inputs: [
+                {
+                  name: "Wallet Address",
+                  as: "address",
+                  type: "string",
+                  position: "arg:1",
+                  source: "field",
+                  required: true
+                }
+              ]
+            },
+            {
+              type: "link",
+              label: warpId === "claim-potato" ? "Join HOT POTATO Game" : "Learn More",
+              description: warpId === "claim-potato" ? "Join our Discord server to participate in the HOT POTATO Game" : "Learn more about this collection",
+              url: "https://discord.gg/RBtGMjwTDw"
+            }
+          ]
+        };
+      }
+      
+      throw detectError;
+    }
     
     if (!result.match || !result.warp) {
       throw new Error(`Could not resolve ${warpId}: WARP not found`);
@@ -507,6 +582,7 @@ app.get('/warpRPC', checkToken, async (req, res) => {
     if (!warpId) throw new Error("Missing warpId in query parameters");
 
     log('info', `Fetching input fields for WARP`, { warpId });
+    // Get the WARP - we've added fallback handling for collect type WARPs
     const warp = await fetchWarpInfo(warpId);
     const action = warp.actions[0];
 
@@ -530,7 +606,13 @@ app.get('/warpRPC', checkToken, async (req, res) => {
       as: input.as
     }));
 
-    log('info', `Found input fields for WARP`, { warpId, count: mappedInputs.length, actionType: action.type });
+    log('info', `Found input fields for WARP`, { 
+      warpId, 
+      count: mappedInputs.length, 
+      actionType: action.type,
+      inputNames: mappedInputs.map(i => i.name).join(', ')
+    });
+    
     return res.json(mappedInputs);
   } catch (error) {
     log('error', `Error in /warpRPC`, { error: error.message, stack: error.stack });
@@ -556,8 +638,13 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     const warpInfo = await fetchWarpInfo(warpId);
     const action = warpInfo.actions[0];
     
-    // Setup executor configuration
-    const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
+    // Setup executor configuration with updated configuration for new SDK
+    const executorConfig = { 
+      ...warpConfig, 
+      userAddress: userAddress.bech32(),
+      chainInfo: pkg.getDefaultChainInfo("mainnet")
+    };
+    
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
     
     // Handle different action types
@@ -590,6 +677,31 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     });
     
     return res.status(400).json({ error: sanitizedMessage });
+  }
+});
+
+// 3. GET /warp/:warpId
+// This endpoint returns the full WARP info for debugging or direct loading
+app.get('/warp/:warpId', async (req, res) => {
+  try {
+    const { warpId } = req.params;
+    if (!warpId) throw new Error("Missing warpId parameter");
+
+    log('info', `Direct WARP access request`, { warpId });
+    
+    // Attempt to get a WARP definition from our system
+    const warp = await fetchWarpInfo(warpId);
+    
+    return res.json({
+      success: true,
+      warp
+    });
+  } catch (error) {
+    log('error', `Error in /warp/:warpId`, { error: error.message });
+    return res.status(400).json({ 
+      success: false,
+      error: error.message 
+    });
   }
 });
 
