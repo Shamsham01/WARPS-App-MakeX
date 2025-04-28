@@ -3,7 +3,7 @@ import bodyParser from 'body-parser';
 import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
-import { WarpBuilder, WarpActionExecutor, WarpLink } from '@vleap/warps';
+import { WarpBuilder, WarpActionExecutor, WarpLink, WarpCollectAction, WarpQueryAction } from '@vleap/warps';
 import BigNumber from 'bignumber.js';
 import fs from 'fs';
 import path from 'path';
@@ -446,8 +446,8 @@ function validateWarp(warp, warpId) {
   }
   
   const action = warp.actions[0];
-  if (!action || action.type !== 'contract') {
-    throw new Error(`WARP ${warpId} must have a 'contract' action`);
+  if (!action || (action.type !== 'contract' && action.type !== 'collect' && action.type !== 'query')) {
+    throw new Error(`WARP ${warpId} must have a valid action type (contract, collect, or query)`);
   }
   
   return action;
@@ -507,21 +507,27 @@ app.get('/warpRPC', checkToken, async (req, res) => {
     const warp = await fetchWarpInfo(warpId);
     const action = warp.actions[0];
 
+    log('info', `Processing WARP action type: ${action.type}`, { warpId });
+
     // Map inputs for Make.com
     const inputs = action.inputs || [];
     const mappedInputs = inputs.map(input => ({
       name: input.name,
-      type: mapToMakeType(input.type.split(':')[0]),
+      type: mapToMakeType(input.type ? input.type.split(':')[0] : 'string'),
       label: input.name,
       required: input.required || false,
       min: input.min,
       max: input.max,
       pattern: input.pattern,
       patternDescription: input.patternDescription,
-      modifier: input.modifier
+      modifier: input.modifier,
+      // Include additional fields for collection types
+      position: input.position,
+      source: input.source,
+      as: input.as
     }));
 
-    log('info', `Found input fields for WARP`, { warpId, count: mappedInputs.length });
+    log('info', `Found input fields for WARP`, { warpId, count: mappedInputs.length, actionType: action.type });
     return res.json(mappedInputs);
   } catch (error) {
     log('error', `Error in /warpRPC`, { error: error.message, stack: error.stack });
@@ -547,88 +553,23 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     const warpInfo = await fetchWarpInfo(warpId);
     const action = warpInfo.actions[0];
     
-    // Prepare userInputsArray based on whether the warp has inputs or not
-    const userInputsArray = [];
-    
-    // Only process inputs if the action has input requirements and inputs were provided
-    if (action.inputs && action.inputs.length > 0 && inputs && typeof inputs === 'object') {
-      log('info', `Processing inputs for WARP`, { warpId, inputCount: action.inputs.length });
-      
-      for (const input of action.inputs) {
-        const value = inputs[input.name];
-        if (input.required && (value === undefined || value === null)) {
-          throw new Error(`Missing required input: ${input.name}`);
-        }
-        if (value !== undefined) {
-          const type = input.type.split(':')[0];
-          
-          // Additional validations
-          if (type === "address" && !Address.isValid(value)) {
-            throw new Error(`${input.name} must be a valid MultiversX address`);
-          }
-          if (type === "string" && input.pattern && !new RegExp(input.pattern).test(value)) {
-            throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
-          }
-
-          userInputsArray.push(`${type}:${value}`);
-        }
-      }
-    } else {
-      log('info', `Processing WARP without inputs`, { warpId });
-    }
-
-    // Execute transaction
+    // Setup executor configuration
     const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
-    const tx = warpActionExecutor.createTransactionForExecute(action, userInputsArray, []);
-
-    const accountOnNetwork = await provider.getAccount(userAddress);
-    tx.nonce = accountOnNetwork.nonce;
-    await signer.sign(tx);
-    const txHash = await provider.sendTransaction(tx);
-    log('info', `Transaction sent to blockchain`, { txHash: txHash.toString(), warpId });
     
-    // Wait for transaction to complete with longer timeout for important actions
-    const status = await checkTransactionStatus(txHash.toString(), 60, 2000);
-
-    if (status.status === "fail") {
-      log('warn', `Transaction failed`, { 
-        txHash: status.txHash, 
-        details: status.details, 
-        warpId 
-      });
+    // Handle different action types
+    if (action.type === 'contract' || action.type === 'transfer') {
+      return await handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent);
+    } else if (action.type === 'query') {
+      return await handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor);
+    } else if (action.type === 'collect') {
+      return await handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor);
+    } else {
+      log('warn', `Unhandled action type`, { warpId, actionType: action.type });
       return res.status(400).json({
-        error: `Transaction failed: ${status.details || 'Unknown reason'}`
-      });
-    } else if (status.status === "pending") {
-      // If still pending after max retries, we should not return success
-      log('warn', `Transaction status still pending after max retries`, { 
-        txHash: status.txHash, 
-        warpId 
-      });
-      return res.status(202).json({
-        warpId,
-        warpHash: warpInfo.meta?.hash,
-        finalTxHash: txHash.toString(),
-        finalStatus: status.status,
-        usageFeeHash: req.usageFeeHash || 'N/A',
-        message: "Transaction submitted but still pending. Please check the transaction hash manually."
+        error: `Unsupported WARP action type: ${action.type}`
       });
     }
-
-    log('info', `WARP execution completed successfully`, {
-      warpId,
-      txHash: status.txHash,
-      status: status.status
-    });
-    
-    return res.json({
-      warpId,
-      warpHash: warpInfo.meta?.hash,
-      finalTxHash: txHash.toString(),
-      finalStatus: status.status,
-      usageFeeHash: req.usageFeeHash || 'N/A'
-    });
   } catch (error) {
     // Sanitize error message to prevent PEM data from being included in logs or responses
     const sanitizedMessage = error.message ? 
@@ -648,6 +589,180 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     return res.status(400).json({ error: sanitizedMessage });
   }
 });
+
+// Helper: Handle contract action execution
+async function handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent) {
+  const { warpId, inputs } = req.body;
+  
+  // Prepare userInputsArray based on whether the warp has inputs or not
+  const userInputsArray = [];
+  
+  // Only process inputs if the action has input requirements and inputs were provided
+  if (action.inputs && action.inputs.length > 0 && inputs && typeof inputs === 'object') {
+    log('info', `Processing inputs for WARP`, { warpId, inputCount: action.inputs.length });
+    
+    for (const input of action.inputs) {
+      const value = inputs[input.name];
+      if (input.required && (value === undefined || value === null)) {
+        throw new Error(`Missing required input: ${input.name}`);
+      }
+      if (value !== undefined) {
+        const type = input.type.split(':')[0];
+        
+        // Additional validations
+        if (type === "address" && !Address.isValid(value)) {
+          throw new Error(`${input.name} must be a valid MultiversX address`);
+        }
+        if (type === "string" && input.pattern && !new RegExp(input.pattern).test(value)) {
+          throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
+        }
+
+        userInputsArray.push(`${type}:${value}`);
+      }
+    }
+  } else {
+    log('info', `Processing WARP without inputs`, { warpId });
+  }
+
+  // Execute transaction
+  const tx = warpActionExecutor.createTransactionForExecute(action, userInputsArray, []);
+
+  // Get the user's account
+  const signer = UserSigner.fromPem(pemContent);
+  const accountOnNetwork = await provider.getAccount(userAddress);
+  tx.nonce = accountOnNetwork.nonce;
+  await signer.sign(tx);
+  const txHash = await provider.sendTransaction(tx);
+  log('info', `Transaction sent to blockchain`, { txHash: txHash.toString(), warpId });
+  
+  // Wait for transaction to complete with longer timeout for important actions
+  const status = await checkTransactionStatus(txHash.toString(), 60, 2000);
+
+  if (status.status === "fail") {
+    log('warn', `Transaction failed`, { 
+      txHash: status.txHash, 
+      details: status.details, 
+      warpId 
+    });
+    return res.status(400).json({
+      error: `Transaction failed: ${status.details || 'Unknown reason'}`
+    });
+  } else if (status.status === "pending") {
+    // If still pending after max retries, we should not return success
+    log('warn', `Transaction status still pending after max retries`, { 
+      txHash: status.txHash, 
+      warpId 
+    });
+    return res.status(202).json({
+      warpId,
+      warpHash: warpInfo.meta?.hash,
+      finalTxHash: txHash.toString(),
+      finalStatus: status.status,
+      usageFeeHash: req.usageFeeHash || 'N/A',
+      message: "Transaction submitted but still pending. Please check the transaction hash manually."
+    });
+  }
+
+  log('info', `WARP execution completed successfully`, {
+    warpId,
+    txHash: status.txHash,
+    status: status.status
+  });
+  
+  return res.json({
+    warpId,
+    warpHash: warpInfo.meta?.hash,
+    finalTxHash: txHash.toString(),
+    finalStatus: status.status,
+    usageFeeHash: req.usageFeeHash || 'N/A'
+  });
+}
+
+// Helper: Handle query action execution
+async function handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor) {
+  const { warpId, inputs } = req.body;
+  
+  // Process inputs for query
+  const processedInputs = {};
+  
+  if (action.inputs && action.inputs.length > 0 && inputs && typeof inputs === 'object') {
+    log('info', `Processing inputs for query WARP`, { warpId, inputCount: action.inputs.length });
+    
+    for (const input of action.inputs) {
+      const value = inputs[input.name];
+      if (input.required && (value === undefined || value === null)) {
+        throw new Error(`Missing required input: ${input.name}`);
+      }
+      if (value !== undefined) {
+        processedInputs[input.name] = value;
+      }
+    }
+  }
+  
+  try {
+    log('info', `Executing query WARP`, { warpId });
+    const result = await warpActionExecutor.executeQuery(action, processedInputs);
+    
+    log('info', `Query execution successful`, { warpId });
+    return res.json({
+      warpId,
+      warpHash: warpInfo.meta?.hash,
+      result: result,
+      usageFeeHash: req.usageFeeHash || 'N/A'
+    });
+  } catch (error) {
+    log('error', `Query execution failed`, { warpId, error: error.message });
+    return res.status(400).json({
+      error: `Query execution failed: ${error.message}`
+    });
+  }
+}
+
+// Helper: Handle collect action execution
+async function handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor) {
+  const { warpId, inputs } = req.body;
+  
+  // Process inputs for collect action
+  const newData = {};
+  
+  if (action.inputs && action.inputs.length > 0 && inputs && typeof inputs === 'object') {
+    log('info', `Processing inputs for collect WARP`, { warpId, inputCount: action.inputs.length });
+    
+    for (const input of action.inputs) {
+      const value = inputs[input.name];
+      if (input.required && (value === undefined || value === null)) {
+        throw new Error(`Missing required input: ${input.name}`);
+      }
+      if (value !== undefined) {
+        // Use the input name or 'as' property if defined
+        const fieldName = input.as || input.name;
+        newData[fieldName] = value;
+      }
+    }
+  } else {
+    log('info', `Processing collect WARP without inputs`, { warpId });
+  }
+  
+  try {
+    log('info', `Executing collect WARP`, { warpId, data: newData });
+    // The warp parameter provides access to the warp context (needed for executeCollect)
+    const result = await warpActionExecutor.executeCollect(action, newData, { warp: warpInfo });
+    
+    log('info', `Collect execution successful`, { warpId, result });
+    return res.json({
+      warpId,
+      warpHash: warpInfo.meta?.hash,
+      result: result,
+      usageFeeHash: req.usageFeeHash || 'N/A',
+      message: "Data collected successfully"
+    });
+  } catch (error) {
+    log('error', `Collect execution failed`, { warpId, error: error.message });
+    return res.status(400).json({
+      error: `Collect execution failed: ${error.message}`
+    });
+  }
+}
 
 // Health check endpoint
 app.get('/health', (req, res) => {
