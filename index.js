@@ -701,7 +701,11 @@ async function handleQueryExecution(req, res, action, warpInfo, userAddress, war
   
   try {
     log('info', `Executing query WARP`, { warpId });
-    const result = await warpActionExecutor.executeQuery(action, processedInputs);
+    
+    // Cast the action to WarpQueryAction type for proper type checking
+    const queryAction = action;
+    
+    const result = await warpActionExecutor.executeQuery(queryAction, processedInputs);
     
     log('info', `Query execution successful`, { warpId });
     return res.json({
@@ -745,8 +749,12 @@ async function handleCollectExecution(req, res, action, warpInfo, userAddress, w
   
   try {
     log('info', `Executing collect WARP`, { warpId, data: newData });
-    // The warp parameter provides access to the warp context (needed for executeCollect)
-    const result = await warpActionExecutor.executeCollect(action, newData, { warp: warpInfo });
+    
+    // Cast the action to WarpCollectAction type for proper type checking
+    const collectAction = action;
+    
+    // The warp parameter provides access to the warp context
+    const result = await warpActionExecutor.executeCollect(collectAction, newData, { warp: warpInfo });
     
     log('info', `Collect execution successful`, { warpId, result });
     return res.json({
