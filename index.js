@@ -3,7 +3,10 @@ import bodyParser from 'body-parser';
 import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
-import { WarpBuilder, WarpActionExecutor, WarpLink, WarpCollectAction, WarpQueryAction } from '@vleap/warps';
+import pkg from '@vleap/warps';
+const { WarpBuilder, WarpActionExecutor, WarpLink } = pkg;
+// Log available exports for debugging
+console.log('Available WARPS SDK exports:', Object.keys(pkg));
 import BigNumber from 'bignumber.js';
 import fs from 'fs';
 import path from 'path';
@@ -702,10 +705,7 @@ async function handleQueryExecution(req, res, action, warpInfo, userAddress, war
   try {
     log('info', `Executing query WARP`, { warpId });
     
-    // Cast the action to WarpQueryAction type for proper type checking
-    const queryAction = action;
-    
-    const result = await warpActionExecutor.executeQuery(queryAction, processedInputs);
+    const result = await warpActionExecutor.executeQuery(action, processedInputs);
     
     log('info', `Query execution successful`, { warpId });
     return res.json({
@@ -750,11 +750,8 @@ async function handleCollectExecution(req, res, action, warpInfo, userAddress, w
   try {
     log('info', `Executing collect WARP`, { warpId, data: newData });
     
-    // Cast the action to WarpCollectAction type for proper type checking
-    const collectAction = action;
-    
     // The warp parameter provides access to the warp context
-    const result = await warpActionExecutor.executeCollect(collectAction, newData, { warp: warpInfo });
+    const result = await warpActionExecutor.executeCollect(action, newData, { warp: warpInfo });
     
     log('info', `Collect execution successful`, { warpId, result });
     return res.json({
