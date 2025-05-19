@@ -480,54 +480,14 @@ async function fetchWarpInfo(warpId, req, userAddress) {
   const warpLink = new WarpLink(warpConfig);
   try {
     log('info', `Resolving WARP`, { warpId });
-    // For collection WARPs, use a manual approach for now
-    if (warpId.includes('claim-') || warpId.includes('collect')) {
-      log('info', `Using manual definition for collection WARP`, { warpId });
-      return {
-        protocol: "warp:1.0.0",
-        name: warpId === "claim-potato" ? "POTATO Token Claim" : `${warpId} Collection`,
-        title: warpId === "claim-potato" ? "Claim Your POTATO Tokens" : `${warpId}`,
-        description: warpId === "claim-potato" ? "Submit your wallet address to claim your $POTATO tokens." : `Submit data for ${warpId}`,
-        preview: "https://i.ibb.co/20QqHK5V/POTATO-Claim-WARP.png",
-        actions: [
-          {
-            type: "collect",
-            label: "Submit Claim",
-            destination: {
-              url: "https://hook.eu2.make.com/6ywzfihevlumjf0lcuebzq5ju49gj21g",
-              method: "POST",
-              headers: {}
-            },
-            inputs: [
-              {
-                name: "Wallet Address",
-                as: "address",
-                type: "string",
-                position: "arg:1",
-                source: "field",
-                required: true
-              }
-            ]
-          },
-          {
-            type: "link",
-            label: warpId === "claim-potato" ? "Join HOT POTATO Game" : "Learn More",
-            description: warpId === "claim-potato" ? "Join our Discord server to participate in the HOT POTATO Game" : "Learn more about this collection",
-            url: "https://discord.gg/RBtGMjwTDw"
-          }
-        ]
-      };
-    }
-    // For other WARPs, try the normal resolution
+    // Always use dynamic detection for all warpIds
     const result = await warpLink.detect(warpId);
-    // v1.5.0: result may now include results/messages, handle accordingly
     if (!result.match || !result.warp) {
       throw new Error(`Could not resolve ${warpId}: WARP not found`);
     }
     const warp = result.warp;
     log('info', `Resolved WARP hash`, { warpId, hash: warp.meta?.hash || 'unknown' });
     validateWarp(warp, warpId);
-    // Optionally, attach result.results/messages if needed for downstream logic
     return warp;
   } catch (error) {
     log('error', `Error resolving WARP`, { warpId, error: error.message });
