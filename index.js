@@ -3,7 +3,7 @@ import bodyParser from 'body-parser';
 import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
-import { WarpBuilder, WarpActionExecutor, WarpLink } from '@vleap/warps';
+import { WarpActionExecutor, WarpLink } from '@vleap/warp-sdk-core';
 import BigNumber from 'bignumber.js';
 import fs from 'fs';
 import path from 'path';
@@ -453,17 +453,36 @@ function validateWarp(warp, warpId) {
   return action;
 }
 
-// Helper: Fetch WARP info using WarpLink
-async function fetchWarpInfo(warpId) {
-  const warpLink = new WarpLink(warpConfig);
+// --- Advanced features: cacheTTL, simulate, verbose, fields ---
+function getWarpConfigFromRequest(req, userAddress) {
+  // Accept advanced params from body or query
+  const cacheTTL = req.body.cacheTTL || req.query.cacheTTL;
+  const providerUrl = req.body.providerUrl || req.query.providerUrl || "https://gateway.multiversx.com";
+  const chainApiUrl = req.body.chainApiUrl || req.query.chainApiUrl || "https://api.multiversx.com";
+  const env = req.body.chain || req.query.chain || 'mainnet';
+  const cacheStrategy = req.body.cacheStrategy || req.query.cacheStrategy;
+  // Validate chain and providerUrl if needed
+  // (Add more validation as needed for your use case)
+  return {
+    providerUrl,
+    currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
+    chainApiUrl,
+    env,
+    userAddress: userAddress ? userAddress.bech32() : undefined,
+    cacheStrategy,
+    cacheTTL: cacheTTL ? Number(cacheTTL) : undefined // advanced: custom TTL in seconds
+  };
+}
 
+// Helper: Fetch WARP info using WarpLink
+async function fetchWarpInfo(warpId, req, userAddress) {
+  const warpConfig = getWarpConfigFromRequest(req, userAddress);
+  const warpLink = new WarpLink(warpConfig);
   try {
     log('info', `Resolving WARP`, { warpId });
-    
     // For collection WARPs, use a manual approach for now
     if (warpId.includes('claim-') || warpId.includes('collect')) {
       log('info', `Using manual definition for collection WARP`, { warpId });
-      // Manual definition for collection WARPs
       return {
         protocol: "warp:1.0.0",
         name: warpId === "claim-potato" ? "POTATO Token Claim" : `${warpId} Collection`,
@@ -499,18 +518,16 @@ async function fetchWarpInfo(warpId) {
         ]
       };
     }
-    
     // For other WARPs, try the normal resolution
     const result = await warpLink.detect(warpId);
-    
+    // v1.5.0: result may now include results/messages, handle accordingly
     if (!result.match || !result.warp) {
       throw new Error(`Could not resolve ${warpId}: WARP not found`);
     }
-    
     const warp = result.warp;
     log('info', `Resolved WARP hash`, { warpId, hash: warp.meta?.hash || 'unknown' });
-    
     validateWarp(warp, warpId);
+    // Optionally, attach result.results/messages if needed for downstream logic
     return warp;
   } catch (error) {
     log('error', `Error resolving WARP`, { warpId, error: error.message });
@@ -536,6 +553,16 @@ function mapToMakeType(apiType) {
   }
 }
 
+// --- Advanced: filter response fields ---
+function filterResponseFields(response, fields) {
+  if (!fields || !Array.isArray(fields) || fields.length === 0) return response;
+  const filtered = {};
+  for (const key of fields) {
+    if (key in response) filtered[key] = response[key];
+  }
+  return filtered;
+}
+
 // --- Endpoints ---
 
 // 1. GET /warpRPC
@@ -546,7 +573,7 @@ app.get('/warpRPC', checkToken, async (req, res) => {
     if (!warpId) throw new Error("Missing warpId in query parameters");
 
     log('info', `Fetching input fields for WARP`, { warpId });
-    const warp = await fetchWarpInfo(warpId);
+    const warp = await fetchWarpInfo(warpId, req, null);
     const action = warp.actions[0];
 
     log('info', `Processing WARP action type: ${action.type}`, { warpId });
@@ -587,37 +614,33 @@ app.get('/warpRPC', checkToken, async (req, res) => {
 // This endpoint executes a warp with or without inputs provided by Make.com
 app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
   try {
-    const { warpId, inputs } = req.body;
+    const { warpId, inputs, chain, cacheStrategy, cacheTTL, simulate, verbose, fields } = req.body;
     if (!warpId) throw new Error("Missing warpId in request body");
-
     log('info', `Processing WARP execution request`, { warpId });
-
-    // Extract PEM and signer details
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
     const userAddress = signer.getAddress();
-
-    // Fetch warp info
-    const warpInfo = await fetchWarpInfo(warpId);
+    const warpInfo = await fetchWarpInfo(warpId, req, userAddress);
     const action = warpInfo.actions[0];
-    
-    // Setup executor configuration
-    const executorConfig = { ...warpConfig, userAddress: userAddress.bech32() };
+    const executorConfig = getWarpConfigFromRequest(req, userAddress);
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
-    
-    // Handle different action types
+    let response;
     if (action.type === 'contract' || action.type === 'transfer') {
-      return await handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent);
+      response = await handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent, simulate, verbose);
     } else if (action.type === 'query') {
-      return await handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor);
+      response = await handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose);
     } else if (action.type === 'collect') {
-      return await handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor);
+      response = await handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose);
     } else {
       log('warn', `Unhandled action type`, { warpId, actionType: action.type });
-      return res.status(400).json({
-        error: `Unsupported WARP action type: ${action.type}`
-      });
+      return res.status(400).json({ error: `Unsupported WARP action type: ${action.type}` });
     }
+    // If handler returns a response object (not sent yet), filter fields and send
+    if (response && typeof response === 'object' && !response.__sent) {
+      const filtered = filterResponseFields(response, fields);
+      return res.json(filtered);
+    }
+    // Otherwise, handler already sent response
   } catch (error) {
     // Sanitize error message to prevent PEM data from being included in logs or responses
     const sanitizedMessage = error.message ? 
@@ -648,7 +671,7 @@ app.get('/warp/:warpId', async (req, res) => {
     log('info', `Direct WARP access request`, { warpId });
     
     // Attempt to get a WARP definition from our system
-    const warp = await fetchWarpInfo(warpId);
+    const warp = await fetchWarpInfo(warpId, null, null);
     
     return res.json({
       success: true,
@@ -663,106 +686,88 @@ app.get('/warp/:warpId', async (req, res) => {
   }
 });
 
-// Helper: Handle contract action execution
-async function handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent) {
-  const { warpId, inputs } = req.body;
-  
-  // Prepare userInputsArray based on whether the warp has inputs or not
-  const userInputsArray = [];
-  
-  // Only process inputs if the action has input requirements and inputs were provided
-  if (action.inputs && action.inputs.length > 0 && inputs && typeof inputs === 'object') {
-    log('info', `Processing inputs for WARP`, { warpId, inputCount: action.inputs.length });
-    
+// --- Input auto-injection for userWallet ---
+function autoInjectInputs(action, inputs, userAddress) {
+  const result = { ...inputs };
+  if (action.inputs) {
     for (const input of action.inputs) {
-      const value = inputs[input.name];
+      if (input.source === 'userWallet' && userAddress) {
+        result[input.name] = userAddress.bech32();
+      }
+    }
+  }
+  return result;
+}
+
+// Update handleContractExecution to support simulate and verbose
+async function handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent, simulate, verbose) {
+  const { warpId, inputs } = req.body;
+  const mergedInputs = autoInjectInputs(action, inputs || {}, userAddress);
+  const userInputsArray = [];
+  if (action.inputs && action.inputs.length > 0 && mergedInputs && typeof mergedInputs === 'object') {
+    log('info', `Processing inputs for WARP`, { warpId, inputCount: action.inputs.length });
+    for (const input of action.inputs) {
+      const value = mergedInputs[input.name];
       if (input.required && (value === undefined || value === null)) {
         throw new Error(`Missing required input: ${input.name}`);
       }
       if (value !== undefined) {
         const type = input.type.split(':')[0];
-        
-        // Additional validations
         if (type === "address" && !Address.isValid(value)) {
           throw new Error(`${input.name} must be a valid MultiversX address`);
         }
         if (type === "string" && input.pattern && !new RegExp(input.pattern).test(value)) {
           throw new Error(`${input.name} must match pattern: ${input.patternDescription || input.pattern}`);
         }
-
         userInputsArray.push(`${type}:${value}`);
       }
     }
   } else {
     log('info', `Processing WARP without inputs`, { warpId });
   }
-
-  // Execute transaction
-  const tx = warpActionExecutor.createTransactionForExecute(action, userInputsArray, []);
-
-  // Get the user's account
-  const signer = UserSigner.fromPem(pemContent);
-  const accountOnNetwork = await provider.getAccount(userAddress);
-  tx.nonce = accountOnNetwork.nonce;
-  await signer.sign(tx);
-  const txHash = await provider.sendTransaction(tx);
-  log('info', `Transaction sent to blockchain`, { txHash: txHash.toString(), warpId });
-  
-  // Wait for transaction to complete with longer timeout for important actions
-  const status = await checkTransactionStatus(txHash.toString(), 60, 2000);
-
-  if (status.status === "fail") {
-    log('warn', `Transaction failed`, { 
-      txHash: status.txHash, 
-      details: status.details, 
-      warpId 
-    });
-    return res.status(400).json({
-      error: `Transaction failed: ${status.details || 'Unknown reason'}`
-    });
-  } else if (status.status === "pending") {
-    // If still pending after max retries, we should not return success
-    log('warn', `Transaction status still pending after max retries`, { 
-      txHash: status.txHash, 
-      warpId 
-    });
-    return res.status(202).json({
+  let execResult;
+  try {
+    // Advanced: simulate (dry run) support if SDK provides
+    if (simulate && typeof warpActionExecutor.simulate === 'function') {
+      execResult = await warpActionExecutor.simulate(action, userInputsArray, { pem: pemContent });
+    } else {
+      execResult = await warpActionExecutor.execute(action, userInputsArray, { pem: pemContent });
+    }
+    log('info', `WARP execution completed`, { warpId, execResult });
+    const response = {
       warpId,
       warpHash: warpInfo.meta?.hash,
-      finalTxHash: txHash.toString(),
-      finalStatus: status.status,
-      usageFeeHash: req.usageFeeHash || 'N/A',
-      message: "Transaction submitted but still pending. Please check the transaction hash manually."
-    });
+      ...execResult,
+      results: execResult.results,
+      messages: execResult.messages,
+      usageFeeHash: req.usageFeeHash || 'N/A'
+    };
+    if (verbose) {
+      response.debug = {
+        action,
+        userInputsArray,
+        executorConfig: warpActionExecutor.config,
+        rawResult: execResult
+      };
+    }
+    // Instead of sending, return for field filtering
+    response.__sent = false;
+    return response;
+  } catch (error) {
+    log('error', `Contract execution failed`, { warpId, error: error.message });
+    return res.status(400).json({ error: `Contract execution failed: ${error.message}` });
   }
-
-  log('info', `WARP execution completed successfully`, {
-    warpId,
-    txHash: status.txHash,
-    status: status.status
-  });
-  
-  return res.json({
-    warpId,
-    warpHash: warpInfo.meta?.hash,
-    finalTxHash: txHash.toString(),
-    finalStatus: status.status,
-    usageFeeHash: req.usageFeeHash || 'N/A'
-  });
 }
 
-// Helper: Handle query action execution
-async function handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor) {
+// Update handleQueryExecution to support verbose
+async function handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose) {
   const { warpId, inputs } = req.body;
-  
-  // Process inputs for query
+  const mergedInputs = autoInjectInputs(action, inputs || {}, userAddress);
   const processedInputs = {};
-  
-  if (action.inputs && action.inputs.length > 0 && inputs && typeof inputs === 'object') {
+  if (action.inputs && action.inputs.length > 0 && mergedInputs && typeof mergedInputs === 'object') {
     log('info', `Processing inputs for query WARP`, { warpId, inputCount: action.inputs.length });
-    
     for (const input of action.inputs) {
-      const value = inputs[input.name];
+      const value = mergedInputs[input.name];
       if (input.required && (value === undefined || value === null)) {
         throw new Error(`Missing required input: ${input.name}`);
       }
@@ -771,44 +776,47 @@ async function handleQueryExecution(req, res, action, warpInfo, userAddress, war
       }
     }
   }
-  
   try {
     log('info', `Executing query WARP`, { warpId });
-    
-    const result = await warpActionExecutor.executeQuery(action, processedInputs);
-    
-    log('info', `Query execution successful`, { warpId });
-    return res.json({
+    const queryResult = await warpActionExecutor.executeQuery(action, processedInputs);
+    log('info', `Query execution successful`, { warpId, queryResult });
+    const response = {
       warpId,
       warpHash: warpInfo.meta?.hash,
-      result: result,
+      ...queryResult,
+      results: queryResult.results,
+      messages: queryResult.messages,
       usageFeeHash: req.usageFeeHash || 'N/A'
-    });
+    };
+    if (verbose) {
+      response.debug = {
+        action,
+        processedInputs,
+        executorConfig: warpActionExecutor.config,
+        rawResult: queryResult
+      };
+    }
+    response.__sent = false;
+    return response;
   } catch (error) {
     log('error', `Query execution failed`, { warpId, error: error.message });
-    return res.status(400).json({
-      error: `Query execution failed: ${error.message}`
-    });
+    return res.status(400).json({ error: `Query execution failed: ${error.message}` });
   }
 }
 
-// Helper: Handle collect action execution
-async function handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor) {
+// Update handleCollectExecution to support verbose
+async function handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose) {
   const { warpId, inputs } = req.body;
-  
-  // Process inputs for collect action
+  const mergedInputs = autoInjectInputs(action, inputs || {}, userAddress);
   const newData = {};
-  
-  if (action.inputs && action.inputs.length > 0 && inputs && typeof inputs === 'object') {
+  if (action.inputs && action.inputs.length > 0 && mergedInputs && typeof mergedInputs === 'object') {
     log('info', `Processing inputs for collect WARP`, { warpId, inputCount: action.inputs.length });
-    
     for (const input of action.inputs) {
-      const value = inputs[input.name];
+      const value = mergedInputs[input.name];
       if (input.required && (value === undefined || value === null)) {
         throw new Error(`Missing required input: ${input.name}`);
       }
       if (value !== undefined) {
-        // Use the input name or 'as' property if defined
         const fieldName = input.as || input.name;
         newData[fieldName] = value;
       }
@@ -816,42 +824,42 @@ async function handleCollectExecution(req, res, action, warpInfo, userAddress, w
   } else {
     log('info', `Processing collect WARP without inputs`, { warpId });
   }
-  
   try {
     log('info', `Executing collect WARP`, { warpId, data: newData });
-    
-    // For now, we'll simulate a successful collect action
-    // since the SDK might not fully support this yet
-    const collectResponse = {
-      success: true,
-      data: newData,
-      timestamp: new Date().toISOString()
-    };
-    
-    // Also try the SDK method if available
+    let collectResult;
     try {
       if (typeof warpActionExecutor.executeCollect === 'function') {
-        const result = await warpActionExecutor.executeCollect(action, newData, { warp: warpInfo });
-        collectResponse.sdkResult = result;
+        collectResult = await warpActionExecutor.executeCollect(action, newData, { warp: warpInfo });
+      } else {
+        collectResult = { success: true, data: newData, timestamp: new Date().toISOString() };
       }
     } catch (collectError) {
       log('warn', `SDK collect method failed, using fallback`, { error: collectError.message });
-      // Using our fallback instead
+      collectResult = { success: true, data: newData, timestamp: new Date().toISOString() };
     }
-    
-    log('info', `Collect execution successful`, { warpId });
-    return res.json({
+    log('info', `Collect execution successful`, { warpId, collectResult });
+    const response = {
       warpId,
       warpHash: warpInfo.meta?.hash,
-      result: collectResponse,
+      ...collectResult,
+      results: collectResult.results,
+      messages: collectResult.messages,
       usageFeeHash: req.usageFeeHash || 'N/A',
       message: "Data collected successfully"
-    });
+    };
+    if (verbose) {
+      response.debug = {
+        action,
+        newData,
+        executorConfig: warpActionExecutor.config,
+        rawResult: collectResult
+      };
+    }
+    response.__sent = false;
+    return response;
   } catch (error) {
     log('error', `Collect execution failed`, { warpId, error: error.message });
-    return res.status(400).json({
-      error: `Collect execution failed: ${error.message}`
-    });
+    return res.status(400).json({ error: `Collect execution failed: ${error.message}` });
   }
 }
 
