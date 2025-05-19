@@ -3,7 +3,7 @@ import bodyParser from 'body-parser';
 import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token } from '@multiversx/sdk-core';
 import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
 import { UserSigner } from '@multiversx/sdk-wallet';
-import { WarpActionExecutor, WarpLink } from '@vleap/warp-sdk-core';
+import { WarpActionExecutor, WarpLink } from '@vleap/warps';
 import BigNumber from 'bignumber.js';
 import fs from 'fs';
 import path from 'path';
