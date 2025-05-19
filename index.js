@@ -461,14 +461,13 @@ function getWarpConfigFromRequest(req, userAddress) {
   const chainApiUrl = req.body.chainApiUrl || req.query.chainApiUrl || "https://api.multiversx.com";
   const env = req.body.chain || req.query.chain || 'mainnet';
   const cacheStrategy = req.body.cacheStrategy || req.query.cacheStrategy;
-  // Validate chain and providerUrl if needed
-  // (Add more validation as needed for your use case)
+  // Use new v2 SDK config for user
   return {
     providerUrl,
     currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
     chainApiUrl,
     env,
-    userAddress: userAddress ? userAddress.bech32() : undefined,
+    user: { wallet: userAddress ? userAddress.bech32() : undefined },
     cacheStrategy,
     cacheTTL: cacheTTL ? Number(cacheTTL) : undefined // advanced: custom TTL in seconds
   };
