@@ -1,8 +1,6 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token } from '@multiversx/sdk-core';
-import { ProxyNetworkProvider } from '@multiversx/sdk-network-providers';
-import { UserSigner } from '@multiversx/sdk-wallet';
+import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token, ProxyNetworkProvider, UserSigner } from '@multiversx/sdk-core';
 import { WarpActionExecutor, WarpLink } from '@vleap/warps';
 import BigNumber from 'bignumber.js';
 import fs from 'fs';
