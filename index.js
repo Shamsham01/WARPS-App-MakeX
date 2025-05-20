@@ -656,7 +656,7 @@ function autoInjectInputs(action, inputs, userAddress) {
   return result;
 }
 
-// Update handleContractExecution to support simulate and verbose
+// Update handleContractExecution for v2
 async function handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent, simulate, verbose) {
   const { warpId, inputs } = req.body;
   const mergedInputs = autoInjectInputs(action, inputs || {}, userAddress);
@@ -684,12 +684,17 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
   }
   let execResult;
   try {
-    // Advanced: simulate (dry run) support if SDK provides
-    if (simulate && typeof warpActionExecutor.simulate === 'function') {
-      execResult = await warpActionExecutor.simulate(action, userInputsArray, { pem: pemContent });
-    } else {
-      execResult = await warpActionExecutor.execute(action, userInputsArray, { pem: pemContent });
-    }
+    // v2: Build, sign, send, and parse transaction
+    const signer = UserSigner.fromPem(pemContent);
+    // 1. Build transaction
+    const tx = await warpActionExecutor.createTransactionForExecute(action, userInputsArray);
+    // 2. Sign and send
+    await signer.sign(tx);
+    const txHash = await provider.sendTransaction(tx);
+    // 3. Wait for confirmation (optional)
+    const txOnNetwork = await provider.getTransaction(txHash);
+    // 4. Get execution results
+    execResult = await warpActionExecutor.getTransactionExecutionResults(warpInfo, 0, txOnNetwork);
     log('info', `WARP execution completed`, { warpId, execResult });
     const response = {
       warpId,
@@ -707,7 +712,6 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
         rawResult: execResult
       };
     }
-    // Instead of sending, return for field filtering
     response.__sent = false;
     return response;
   } catch (error) {
@@ -716,7 +720,7 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
   }
 }
 
-// Update handleQueryExecution to support verbose
+// Update handleQueryExecution for v2
 async function handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose) {
   const { warpId, inputs } = req.body;
   const mergedInputs = autoInjectInputs(action, inputs || {}, userAddress);
@@ -735,7 +739,8 @@ async function handleQueryExecution(req, res, action, warpInfo, userAddress, war
   }
   try {
     log('info', `Executing query WARP`, { warpId });
-    const queryResult = await warpActionExecutor.executeQuery(action, processedInputs);
+    // v2: Use executeQuery(warp, actionIndex, inputsArray)
+    const queryResult = await warpActionExecutor.executeQuery(warpInfo, 0, Object.values(processedInputs));
     log('info', `Query execution successful`, { warpId, queryResult });
     const response = {
       warpId,
@@ -761,7 +766,7 @@ async function handleQueryExecution(req, res, action, warpInfo, userAddress, war
   }
 }
 
-// Update handleCollectExecution to support verbose
+// Update handleCollectExecution for v2
 async function handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose) {
   const { warpId, inputs } = req.body;
   const mergedInputs = autoInjectInputs(action, inputs || {}, userAddress);
@@ -783,16 +788,13 @@ async function handleCollectExecution(req, res, action, warpInfo, userAddress, w
   }
   try {
     log('info', `Executing collect WARP`, { warpId, data: newData });
+    // v2: Use executeCollect(warp, actionIndex, inputsArray)
     let collectResult;
     try {
-      if (typeof warpActionExecutor.executeCollect === 'function') {
-        collectResult = await warpActionExecutor.executeCollect(action, newData, { warp: warpInfo });
-      } else {
-        collectResult = { success: true, data: newData, timestamp: new Date().toISOString() };
-      }
+      collectResult = await warpActionExecutor.executeCollect(warpInfo, 0, Object.values(newData));
     } catch (collectError) {
-      log('warn', `SDK collect method failed, using fallback`, { error: collectError.message });
-      collectResult = { success: true, data: newData, timestamp: new Date().toISOString() };
+      log('warn', `SDK collect method failed`, { error: collectError.message });
+      collectResult = { success: false, error: collectError.message };
     }
     log('info', `Collect execution successful`, { warpId, collectResult });
     const response = {
