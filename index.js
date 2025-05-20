@@ -713,7 +713,7 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     // 3. Wait for confirmation (optional)
     const txOnNetwork = await provider.awaitTransactionCompleted(txHash);
     // 4. Get execution results
-    execResult = await warpActionExecutor.getTransactionExecutionResults(warpInfo, 0, txOnNetwork);
+    execResult = await warpActionExecutor.getTransactionExecutionResults(warpInfo, 1, txOnNetwork);
     log('info', `WARP execution completed`, { warpId, execResult });
     const response = {
       warpId,
@@ -759,7 +759,7 @@ async function handleQueryExecution(req, res, action, warpInfo, userAddress, war
   try {
     log('info', `Executing query WARP`, { warpId });
     // v2: Use executeQuery(warp, actionIndex, inputsArray)
-    const queryResult = await warpActionExecutor.executeQuery(warpInfo, 0, Object.values(processedInputs));
+    const queryResult = await warpActionExecutor.executeQuery(warpInfo, 1, Object.values(processedInputs));
     log('info', `Query execution successful`, { warpId, queryResult });
     const response = {
       warpId,
@@ -810,7 +810,7 @@ async function handleCollectExecution(req, res, action, warpInfo, userAddress, w
     // v2: Use executeCollect(warp, actionIndex, inputsArray)
     let collectResult;
     try {
-      collectResult = await warpActionExecutor.executeCollect(warpInfo, 0, Object.values(newData));
+      collectResult = await warpActionExecutor.executeCollect(warpInfo, 1, Object.values(newData));
     } catch (collectError) {
       log('warn', `SDK collect method failed`, { error: collectError.message });
       collectResult = { success: false, error: collectError.message };
