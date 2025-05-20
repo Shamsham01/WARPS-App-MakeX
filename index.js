@@ -696,6 +696,9 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     const signer = UserSigner.fromPem(pemContent);
     // 1. Build transaction
     const tx = await warpActionExecutor.createTransactionForExecute(action, userInputsArray);
+    // Fetch current nonce from the network for the sender
+    const accountOnNetwork = await provider.getAccount(userAddress);
+    tx.nonce = accountOnNetwork.nonce;
     // 2. Sign and send
     tx.signature = await signer.sign(new TransactionComputer().computeBytesForSigning(tx));
     let txHash;
