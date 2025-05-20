@@ -383,7 +383,15 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   tx.gasLimit = BigInt(500000);
 
   const signedTx = await signer.sign(tx);
-  const txHash = await provider.sendTransaction(signedTx);
+  let txHash;
+  try {
+    txHash = await provider.sendTransaction(signedTx);
+  } catch (err) {
+    throw new Error('Failed to send transaction: ' + err.message);
+  }
+  if (!txHash) {
+    throw new Error('Transaction hash is undefined after sending transaction.');
+  }
   
   // Store the pending transaction with timestamp
   pendingUsageFeeTransactions.set(walletAddress, {
@@ -690,7 +698,15 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     const tx = await warpActionExecutor.createTransactionForExecute(action, userInputsArray);
     // 2. Sign and send
     const signedTx = await signer.sign(tx);
-    const txHash = await provider.sendTransaction(signedTx);
+    let txHash;
+    try {
+      txHash = await provider.sendTransaction(signedTx);
+    } catch (err) {
+      throw new Error('Failed to send transaction: ' + err.message);
+    }
+    if (!txHash) {
+      throw new Error('Transaction hash is undefined after sending transaction.');
+    }
     // 3. Wait for confirmation (optional)
     const txOnNetwork = await provider.getTransaction(txHash);
     // 4. Get execution results
