@@ -658,7 +658,7 @@ function autoInjectInputs(action, inputs, userAddress) {
   const result = { ...inputs };
   if (action.inputs) {
     for (const input of action.inputs) {
-      if (input.source === 'userWallet' && userAddress) {
+      if ((input.source === 'user:wallet' || input.source === 'userWallet') && userAddress) {
         result[input.name] = userAddress.bech32();
       }
     }
