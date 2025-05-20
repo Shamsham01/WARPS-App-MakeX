@@ -718,9 +718,11 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     const response = {
       warpId,
       warpHash: warpInfo.meta?.hash,
-      ...execResult,
+      finalTxHash: execResult.txHash?.toString?.() || null,
+      finalStatus: execResult.success ? "success" : "fail",
       results: execResult.results,
       messages: execResult.messages,
+      next: execResult.next,
       usageFeeHash: req.usageFeeHash || 'N/A'
     };
     if (verbose) {
@@ -764,9 +766,11 @@ async function handleQueryExecution(req, res, action, warpInfo, userAddress, war
     const response = {
       warpId,
       warpHash: warpInfo.meta?.hash,
-      ...queryResult,
+      finalTxHash: queryResult.txHash?.toString?.() || null,
+      finalStatus: queryResult.success ? "success" : "fail",
       results: queryResult.results,
       messages: queryResult.messages,
+      next: queryResult.next,
       usageFeeHash: req.usageFeeHash || 'N/A'
     };
     if (verbose) {
@@ -819,9 +823,11 @@ async function handleCollectExecution(req, res, action, warpInfo, userAddress, w
     const response = {
       warpId,
       warpHash: warpInfo.meta?.hash,
-      ...collectResult,
+      finalTxHash: collectResult.txHash?.toString?.() || null,
+      finalStatus: collectResult.success ? "success" : "fail",
       results: collectResult.results,
       messages: collectResult.messages,
+      next: collectResult.next,
       usageFeeHash: req.usageFeeHash || 'N/A',
       message: "Data collected successfully"
     };
