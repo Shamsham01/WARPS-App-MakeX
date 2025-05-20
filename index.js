@@ -1,6 +1,6 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token, ProxyNetworkProvider, UserSigner } from '@multiversx/sdk-core';
+import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token, ProxyNetworkProvider, UserSigner, TransactionComputer } from '@multiversx/sdk-core';
 import { WarpActionExecutor, WarpLink } from '@vleap/warps';
 import BigNumber from 'bignumber.js';
 import fs from 'fs';
@@ -382,7 +382,7 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   tx.nonce = nonce;
   tx.gasLimit = BigInt(500000);
 
-  tx.signature = await signer.sign(tx);
+  tx.signature = await signer.sign(new TransactionComputer().computeBytesForSigning(tx));
   let txHash;
   try {
     txHash = await provider.sendTransaction(tx);
@@ -697,7 +697,7 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     // 1. Build transaction
     const tx = await warpActionExecutor.createTransactionForExecute(action, userInputsArray);
     // 2. Sign and send
-    tx.signature = await signer.sign(tx);
+    tx.signature = await signer.sign(new TransactionComputer().computeBytesForSigning(tx));
     let txHash;
     try {
       txHash = await provider.sendTransaction(tx);
