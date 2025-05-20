@@ -382,10 +382,10 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   tx.nonce = nonce;
   tx.gasLimit = BigInt(500000);
 
-  const signedTx = await signer.sign(tx);
+  tx.signature = await signer.sign(tx);
   let txHash;
   try {
-    txHash = await provider.sendTransaction(signedTx);
+    txHash = await provider.sendTransaction(tx);
   } catch (err) {
     throw new Error('Failed to send transaction: ' + err.message);
   }
@@ -697,10 +697,10 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     // 1. Build transaction
     const tx = await warpActionExecutor.createTransactionForExecute(action, userInputsArray);
     // 2. Sign and send
-    const signedTx = await signer.sign(tx);
+    tx.signature = await signer.sign(tx);
     let txHash;
     try {
-      txHash = await provider.sendTransaction(signedTx);
+      txHash = await provider.sendTransaction(tx);
     } catch (err) {
       throw new Error('Failed to send transaction: ' + err.message);
     }
