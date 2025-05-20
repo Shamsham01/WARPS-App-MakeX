@@ -711,7 +711,7 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
       throw new Error('Transaction hash is undefined after sending transaction.');
     }
     // 3. Wait for confirmation (optional)
-    const txOnNetwork = await provider.getTransaction(txHash);
+    const txOnNetwork = await provider.awaitTransactionCompleted(txHash);
     // 4. Get execution results
     execResult = await warpActionExecutor.getTransactionExecutionResults(warpInfo, 0, txOnNetwork);
     log('info', `WARP execution completed`, { warpId, execResult });
