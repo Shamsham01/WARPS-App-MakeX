@@ -545,21 +545,23 @@ app.get('/warpRPC', checkToken, async (req, res) => {
 
     // Map inputs for Make.com
     const inputs = action.inputs || [];
-    const mappedInputs = inputs.map(input => ({
-      name: input.name,
-      type: mapToMakeType(input.type ? input.type.split(':')[0] : 'string'),
-      label: input.name,
-      required: input.required || false,
-      min: input.min,
-      max: input.max,
-      pattern: input.pattern,
-      patternDescription: input.patternDescription,
-      modifier: input.modifier,
-      // Include additional fields for collection types
-      position: input.position,
-      source: input.source,
-      as: input.as
-    }));
+    const mappedInputs = inputs
+      .filter(input => input.source === "field")
+      .map(input => ({
+        name: input.name,
+        type: mapToMakeType(input.type ? input.type.split(':')[0] : 'string'),
+        label: input.name,
+        required: input.required || false,
+        min: input.min,
+        max: input.max,
+        pattern: input.pattern,
+        patternDescription: input.patternDescription,
+        modifier: input.modifier,
+        // Include additional fields for collection types
+        position: input.position,
+        source: input.source,
+        as: input.as
+      }));
 
     log('info', `Found input fields for WARP`, { 
       warpId, 
