@@ -382,8 +382,8 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   tx.nonce = nonce;
   tx.gasLimit = BigInt(500000);
 
-  await signer.sign(tx);
-  const txHash = await provider.sendTransaction(tx);
+  const signedTx = await signer.sign(tx);
+  const txHash = await provider.sendTransaction(signedTx);
   
   // Store the pending transaction with timestamp
   pendingUsageFeeTransactions.set(walletAddress, {
@@ -689,8 +689,8 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     // 1. Build transaction
     const tx = await warpActionExecutor.createTransactionForExecute(action, userInputsArray);
     // 2. Sign and send
-    await signer.sign(tx);
-    const txHash = await provider.sendTransaction(tx);
+    const signedTx = await signer.sign(tx);
+    const txHash = await provider.sendTransaction(signedTx);
     // 3. Wait for confirmation (optional)
     const txOnNetwork = await provider.getTransaction(txHash);
     // 4. Get execution results
