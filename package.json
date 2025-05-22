@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@multiversx/sdk-core": "^14.0.0",
-    "@vleap/warps": "2.0.0-alpha.23",
+    "@vleap/warps": "2.0.0-beta.24",
     "express": "^4.18.2",
     "body-parser": "^1.20.2",
     "node-fetch": "^3.2.10",

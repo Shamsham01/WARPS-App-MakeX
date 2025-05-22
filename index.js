@@ -821,6 +821,7 @@ async function handleCollectExecution(req, res, action, warpInfo, userAddress, w
       log('warn', `SDK collect method failed`, { error: collectError.message });
       collectResult = { success: false, error: collectError.message };
     }
+    log('info', 'Collect result details', { collectResult });
     log('info', `Collect execution successful`, { warpId, collectResult });
     const response = {
       warpId,
