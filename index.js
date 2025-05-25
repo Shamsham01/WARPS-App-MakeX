@@ -697,7 +697,7 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     // v2: Build, sign, send, and parse transaction
     const signer = UserSigner.fromPem(pemContent);
     // 1. Build transaction
-    const tx = await warpActionExecutor.createTransactionForExecute(action, userInputsArray);
+    const tx = await warpActionExecutor.createTransactionForExecute(warpInfo, 1, userInputsArray);
     // Fetch current nonce from the network for the sender
     const accountOnNetwork = await provider.getAccount(userAddress);
     tx.nonce = accountOnNetwork.nonce;
