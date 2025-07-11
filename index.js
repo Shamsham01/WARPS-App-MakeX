@@ -56,7 +56,7 @@ const warpConfig = {
 // Constants for usage fee
 const FIXED_USD_FEE = 0.03; // $0.03 fixed fee
 const REWARD_TOKEN = "REWARD-cf6eac";
-const TREASURY_WALLET = "erd158k2c3aserjmwnyxzpln24xukl2fsvlk9x46xae4dxl5xds79g6sdz37qn";
+const TREASURY_WALLET = "erd1t2r97zcjg8uvf0e9nk4psj2kvg27mph9kq5xls6xtnyg2aemp8hszcmn8f";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const whitelistFilePath = path.join(__dirname, 'whitelist.json');
