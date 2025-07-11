@@ -9,5 +9,13 @@
   
   {"walletAddress":"erd1vza53l2jdal7u6qpvumgsgzsu9ttletl0zpzf0nl93nzz9pwm2ts6gltsl",
     "label":"TestWallet",
+    "whitelistStart":"2024-12-01T10:00:00Z"},
+  
+  {"walletAddress":"erd1t8q84083ys7grwdy594s6z442vjsxxuhpw43a0v8ryeq46n0jyes7e8aez",
+    "label":"HodlCommunityTipFund",
+    "whitelistStart":"2024-12-01T10:00:00Z"},
+  
+  {"walletAddress":"erd1t2r97zcjg8uvf0e9nk4psj2kvg27mph9kq5xls6xtnyg2aemp8hszcmn8f",
+    "label":"MakexUsageFee",
     "whitelistStart":"2024-12-01T10:00:00Z"}
 ]
