@@ -10,11 +10,17 @@ import fetch from 'node-fetch';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 
-// IMPORTANT: MultiversX SDK v14+ Compatibility Fix
+// IMPORTANT: MultiversX SDK v15+ Compatibility Fix
 // The error "Cannot read properties of undefined (reading 'tokenTransfers')" was caused by
-// breaking changes in the MultiversX SDK v14+ where the transaction creation API changed.
+// breaking changes in the MultiversX SDK v15+ where the transaction creation API changed.
 // This code now includes fallback methods to handle different API signatures and provides
 // detailed logging for debugging future SDK compatibility issues.
+//
+// Additional fixes implemented:
+// - Fixed userAddress.bech32() method calls (SDK v15+ compatibility)
+// - Added proper async/await handling for transaction creation methods
+// - Implemented manual transaction creation as fallback
+// - Added comprehensive validation and error handling
 
 // Load environment variables
 dotenv.config();
@@ -823,13 +829,39 @@ function getWarpConfigFromRequest(req, userAddress) {
   const chainApiUrl = req.body.chainApiUrl || req.query.chainApiUrl || "https://api.multiversx.com";
   const env = req.body.chain || req.query.chain || 'mainnet';
   const cacheStrategy = req.body.cacheStrategy || req.query.cacheStrategy;
+  
+  // Get wallet address string - handle both old and new SDK versions
+  let walletAddress;
+  if (userAddress) {
+    try {
+      // Try the new SDK v15+ method first
+      if (typeof userAddress.toString === 'function') {
+        walletAddress = userAddress.toString();
+      } else if (typeof userAddress.bech32 === 'function') {
+        walletAddress = userAddress.bech32();
+      } else {
+        // Fallback: try to get the address as a string
+        walletAddress = String(userAddress);
+      }
+      log('info', 'Wallet address extracted successfully', { 
+        method: 'SDK v15+ compatible',
+        address: walletAddress,
+        userAddressType: typeof userAddress,
+        userAddressMethods: Object.getOwnPropertyNames(Object.getPrototypeOf(userAddress) || {})
+      });
+    } catch (error) {
+      log('warn', 'Error extracting wallet address, using fallback', { error: error.message });
+      walletAddress = String(userAddress);
+    }
+  }
+  
   // Use new v2 SDK config for user
   return {
     providerUrl,
     currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
     chainApiUrl,
     env,
-    user: { wallet: userAddress ? userAddress.bech32() : undefined },
+    user: { wallet: walletAddress },
     cacheStrategy,
     cacheTTL: cacheTTL ? Number(cacheTTL) : undefined // advanced: custom TTL in seconds
   };
@@ -837,6 +869,18 @@ function getWarpConfigFromRequest(req, userAddress) {
 
 // Helper: Fetch WARP info using WarpLink
 async function fetchWarpInfo(warpId, req, userAddress) {
+  // Debug userAddress object
+  if (userAddress) {
+    log('info', 'UserAddress object details', {
+      type: typeof userAddress,
+      constructor: userAddress?.constructor?.name || 'Unknown',
+      availableMethods: Object.getOwnPropertyNames(Object.getPrototypeOf(userAddress) || {}),
+      hasToString: typeof userAddress.toString === 'function',
+      hasBech32: typeof userAddress.bech32 === 'function',
+      value: String(userAddress)
+    });
+  }
+  
   const warpConfig = getWarpConfigFromRequest(req, userAddress);
   const warpLink = new WarpLink(warpConfig);
   try {
@@ -935,6 +979,13 @@ app.get('/warpRPC', checkToken, async (req, res) => {
 
 // 2. POST /executeWarp
 // This endpoint executes a warp with or without inputs provided by Make.com
+// SUPPORTED WARP TYPES:
+// - contract/transfer: Smart contract interactions and token transfers
+// - query: Read-only blockchain data queries
+// - collect: Data collection and storage operations
+// 
+// NOTE: All WARP types continue to work with the recent SDK v15+ compatibility fixes.
+// The userAddress conversion is handled transparently and doesn't affect WARP functionality.
 app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
   try {
     const { warpId, inputs, chain, cacheStrategy, cacheTTL, simulate, verbose, fields } = req.body;
@@ -942,17 +993,54 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     log('info', `Processing WARP execution request`, { warpId });
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
-    const userAddress = signer.getAddress();
+    const userAddressObj = signer.getAddress();
+    
+    // Convert Address object to string - handle both old and new SDK versions
+    let userAddress;
+    try {
+      // Try the new SDK v15+ method first
+      if (typeof userAddressObj.toString === 'function') {
+        userAddress = userAddressObj.toString();
+      } else if (typeof userAddressObj.bech32 === 'function') {
+        userAddress = userAddressObj.bech32();
+      } else {
+        // Fallback: try to get the address as a string
+        userAddress = String(userAddressObj);
+      }
+      log('info', 'UserAddress converted successfully', { 
+        method: 'SDK v15+ compatible',
+        address: userAddress,
+        originalType: userAddressObj.constructor.name
+      });
+    } catch (error) {
+      log('warn', 'Error converting userAddress, using fallback', { error: error.message });
+      userAddress = String(userAddressObj);
+    }
+    
     const warpInfo = await fetchWarpInfo(warpId, req, userAddress);
     const action = warpInfo.actions[0];
+    
+    // Log WARP type and ensure compatibility
+    log('info', 'WARP execution details', {
+      warpId,
+      actionType: action.type,
+      actionInputs: action.inputs?.length || 0,
+      userAddressType: typeof userAddress,
+      userAddress: userAddress,
+      supportedTypes: ['contract', 'transfer', 'query', 'collect']
+    });
+    
     const executorConfig = getWarpConfigFromRequest(req, userAddress);
     const warpActionExecutor = new WarpActionExecutor(executorConfig);
     let response;
     if (action.type === 'contract' || action.type === 'transfer') {
+      log('info', 'Executing contract/transfer WARP', { warpId, actionType: action.type });
       response = await handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent, simulate, verbose);
     } else if (action.type === 'query') {
+      log('info', 'Executing query WARP', { warpId, actionType: action.type });
       response = await handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose);
     } else if (action.type === 'collect') {
+      log('info', 'Executing collect WARP', { warpId, actionType: action.type });
       response = await handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose);
     } else {
       log('warn', `Unhandled action type`, { warpId, actionType: action.type });
@@ -1015,7 +1103,24 @@ function autoInjectInputs(action, inputs, userAddress) {
   if (action.inputs) {
     for (const input of action.inputs) {
       if ((input.source === 'user:wallet' || input.source === 'userWallet') && userAddress) {
-        result[input.name] = userAddress.bech32();
+        // Get wallet address string - handle both old and new SDK versions
+        let walletAddress;
+        try {
+          // Try the new SDK v15+ method first
+          if (typeof userAddress.toString === 'function') {
+            walletAddress = userAddress.toString();
+          } else if (typeof userAddress.bech32 === 'function') {
+            walletAddress = userAddress.bech32();
+          } else {
+            // Fallback: try to get the address as a string
+            walletAddress = String(userAddress);
+          }
+        } catch (error) {
+          log('warn', 'Error extracting wallet address in autoInjectInputs, using fallback', { error: error.message });
+          walletAddress = String(userAddress);
+        }
+        
+        result[input.name] = walletAddress;
       }
     }
   }
@@ -1054,8 +1159,18 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     const signer = UserSigner.fromPem(pemContent);
     // 1. Build transaction
     const tx = await warpActionExecutor.createTransactionForExecute(warpInfo, 1, userInputsArray);
+    
+    // Convert userAddress string back to Address object for provider.getAccount()
+    let userAddressObj;
+    try {
+      userAddressObj = new Address(userAddress);
+    } catch (error) {
+      log('error', 'Failed to create Address object from string', { error: error.message, userAddress });
+      throw new Error(`Invalid user address format: ${userAddress}`);
+    }
+    
     // Fetch current nonce from the network for the sender
-    const accountOnNetwork = await provider.getAccount(userAddress);
+    const accountOnNetwork = await provider.getAccount(userAddressObj);
     tx.nonce = accountOnNetwork.nonce;
     // 2. Sign and send
     tx.signature = await signer.sign(new TransactionComputer().computeBytesForSigning(tx));
