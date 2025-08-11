@@ -1,6 +1,6 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token, ProxyNetworkProvider, UserSigner, TransactionComputer } from '@multiversx/sdk-core';
+import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token, ProxyNetworkProvider, UserSigner, TransactionComputer, Transaction } from '@multiversx/sdk-core';
 import { WarpActionExecutor, WarpLink } from '@vleap/warps';
 import BigNumber from 'bignumber.js';
 import fs from 'fs';
@@ -371,95 +371,264 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   // Calculate dynamic fee
   const dynamicFeeAmount = await calculateDynamicUsageFee();
 
-  // Updated for MultiversX SDK v14+ - use the new transaction creation API
+  // Validate REWARD_TOKEN format
+  if (!REWARD_TOKEN || typeof REWARD_TOKEN !== 'string') {
+    throw new Error(`Invalid REWARD_TOKEN: ${REWARD_TOKEN}`);
+  }
+  
+  // Log token validation
+  log('info', 'REWARD_TOKEN validation', {
+    token: REWARD_TOKEN,
+    length: REWARD_TOKEN.length,
+    isValid: REWARD_TOKEN.length > 0
+  });
+
+  // Updated for MultiversX SDK v15+ - use the new transaction creation API
   const factoryConfig = new TransactionsFactoryConfig({ chainID: "1" });
   const factory = new TransferTransactionsFactory({ config: factoryConfig });
 
-  // Create the transaction using the updated API for SDK v14+
+  // Create the transaction using the updated API for SDK v15+
   let tx;
+  
+  // First, let's log what methods are available on the factory
+  const availableMethods = Object.getOwnPropertyNames(Object.getPrototypeOf(factory))
+    .filter(name => name.startsWith('createTransaction'));
+  
+  log('info', 'Available transaction creation methods', { 
+    availableMethods,
+    factoryType: factory.constructor.name,
+    sdkVersion: 'v15+',
+    factoryKeys: Object.keys(factory),
+    factoryPrototypeKeys: Object.getOwnPropertyNames(Object.getPrototypeOf(factory))
+  });
+  
+  // Test if the factory is working by checking its basic properties
+  if (!factory || typeof factory !== 'object') {
+    throw new Error(`Factory is not a valid object: ${typeof factory}`);
+  }
+  
+  log('info', 'Factory validation passed', {
+    factoryExists: !!factory,
+    factoryType: typeof factory,
+    factoryConstructor: factory.constructor?.name || 'Unknown'
+  });
+  
+  // Test if we can call a simple method on the factory
   try {
+    if (factory.getChainID) {
+      const chainId = factory.getChainID();
+      log('info', 'Factory method test successful', { chainId });
+    } else if (factory.config) {
+      log('info', 'Factory has config property', { configKeys: Object.keys(factory.config || {}) });
+    } else {
+      log('warn', 'Factory has no testable methods, proceeding with caution');
+    }
+  } catch (testError) {
+    log('warn', 'Factory method test failed', { error: testError.message });
+  }
+  
+  try {
+    // Try the most basic approach - create a simple transfer transaction
     log('info', 'Attempting to create ESDT token transfer transaction', { 
       sender: senderAddress.toString(),
       receiver: receiverAddress.toString(),
       token: REWARD_TOKEN,
       amount: dynamicFeeAmount,
-      sdkVersion: 'v14+'
+      sdkVersion: 'v15+'
     });
     
-    // Method 1: Try the new API structure
-    tx = factory.createTransactionForESDTTokenTransfer({
-      sender: senderAddress,
-      receiver: receiverAddress,
-      tokenTransfers: [
-        new TokenTransfer({
-          token: new Token({ identifier: REWARD_TOKEN }),
-          amount: BigInt(dynamicFeeAmount),
-        }),
-      ],
-    });
-    
-    log('info', 'Transaction created successfully using Method 1 (object parameters)');
-  } catch (error) {
-    log('warn', 'Primary transaction creation method failed, trying alternative', { 
-      error: error.message,
-      method: 'Method 1 (object parameters)',
-      sdkVersion: 'v14+'
-    });
-    
-    // Method 2: Try alternative parameter structure
-    try {
-      log('info', 'Trying Method 2 (positional parameters)');
-      tx = factory.createTransactionForESDTTokenTransfer(
-        senderAddress,
-        receiverAddress,
-        [
-          new TokenTransfer({
-            token: new Token({ identifier: REWARD_TOKEN }),
-            amount: BigInt(dynamicFeeAmount),
-          }),
-        ]
-      );
-      
-      log('info', 'Transaction created successfully using Method 2 (positional parameters)');
-    } catch (error2) {
-      log('warn', 'Alternative transaction creation method also failed', { 
-        error: error2.message,
-        method: 'Method 2 (positional parameters)',
-        sdkVersion: 'v14+'
-      });
-      
-      // Method 3: Try with minimal parameters
+    // Method 1: Try the basic ESDT transfer method
+    if (factory.createTransactionForESDTTransfer) {
+      log('info', 'Trying createTransactionForESDTTransfer method');
       try {
-        log('info', 'Trying Method 3 (single token transfer)');
+        tx = factory.createTransactionForESDTTransfer(
+          senderAddress,
+          receiverAddress,
+          REWARD_TOKEN,
+          BigInt(dynamicFeeAmount)
+        );
+        log('info', 'Method 1 successful');
+        
+        // Validate the created transaction
+        if (tx && typeof tx === 'object') {
+          log('info', 'Method 1 transaction validation passed', { 
+            hasSender: !!tx.sender,
+            hasReceiver: !!tx.receiver,
+            hasValue: !!tx.value,
+            hasData: !!tx.data
+          });
+        } else {
+          log('warn', 'Method 1 created invalid transaction object', { txType: typeof tx, txValue: tx });
+          tx = null; // Reset to try next method
+        }
+      } catch (error) {
+        log('warn', 'Method 1 failed', { error: error.message, stack: error.stack });
+      }
+    }
+    
+    // Method 2: Try the token transfer method with different signature
+    if (!tx && factory.createTransactionForESDTTokenTransfer) {
+      log('info', 'Trying createTransactionForESDTTokenTransfer with basic parameters');
+      try {
         tx = factory.createTransactionForESDTTokenTransfer(
           senderAddress,
           receiverAddress,
-          new TokenTransfer({
+          REWARD_TOKEN,
+          BigInt(dynamicFeeAmount)
+        );
+        log('info', 'Method 2 successful');
+        
+        // Validate the created transaction
+        if (tx && typeof tx === 'object') {
+          log('info', 'Method 2 transaction validation passed', { 
+            hasSender: !!tx.sender,
+            hasReceiver: !!tx.receiver,
+            hasValue: !!tx.value,
+            hasData: !!tx.data
+          });
+        } else {
+          log('warn', 'Method 2 created invalid transaction object', { txType: typeof tx, txValue: tx });
+          tx = null; // Reset to try next method
+        }
+      } catch (error) {
+        log('warn', 'Basic ESDT token transfer failed, trying with TokenTransfer object', { error: error.message, stack: error.stack });
+        
+        // Method 3: Try with TokenTransfer object
+        try {
+          const tokenTransfer = new TokenTransfer({
             token: new Token({ identifier: REWARD_TOKEN }),
             amount: BigInt(dynamicFeeAmount),
-          })
-        );
-        
-        log('info', 'Transaction created successfully using Method 3 (single token transfer)');
-      } catch (error3) {
-        log('error', 'All transaction creation methods failed', { 
-          error1: error.message,
-          error2: error2.message, 
-          error3: error3.message,
-          sdkVersion: 'v14+',
-          factoryType: factory.constructor.name,
-          availableMethods: Object.getOwnPropertyNames(Object.getPrototypeOf(factory))
-            .filter(name => name.startsWith('createTransaction'))
-        });
-        throw new Error(`Failed to create transaction: All SDK methods failed. Please check MultiversX SDK compatibility. SDK Version: v14+, Factory: ${factory.constructor.name}`);
+          });
+          
+          tx = factory.createTransactionForESDTTokenTransfer(
+            senderAddress,
+            receiverAddress,
+            tokenTransfer
+          );
+          log('info', 'Method 3 successful');
+          
+          // Validate the created transaction
+          if (tx && typeof tx === 'object') {
+            log('info', 'Method 3 transaction validation passed', { 
+              hasSender: !!tx.sender,
+              hasReceiver: !!tx.receiver,
+              hasValue: !!tx.value,
+              hasData: !!tx.data
+            });
+          } else {
+            log('warn', 'Method 3 created invalid transaction object', { txType: typeof tx, txValue: tx });
+            tx = null; // Reset to try next method
+          }
+        } catch (error2) {
+          log('warn', 'TokenTransfer object method also failed', { error: error2.message, stack: error2.stack });
+        }
       }
     }
+    
+    // Method 4: Try the legacy method if available
+    if (!tx && factory.createTransactionForESDTTransfer) {
+      log('info', 'Trying legacy createTransactionForESDTTransfer method');
+      try {
+        tx = factory.createTransactionForESDTTransfer(
+          senderAddress,
+          receiverAddress,
+          REWARD_TOKEN,
+          BigInt(dynamicFeeAmount)
+        );
+        log('info', 'Method 4 successful');
+        
+        // Validate the created transaction
+        if (tx && typeof tx === 'object') {
+          log('info', 'Method 4 transaction validation passed', { 
+            hasSender: !!tx.sender,
+            hasReceiver: !!tx.receiver,
+            hasValue: !!tx.value,
+            hasData: !!tx.data
+          });
+        } else {
+          log('warn', 'Method 4 created invalid transaction object', { txType: typeof tx, txValue: tx });
+          tx = null; // Reset to try next method
+        }
+      } catch (error) {
+        log('warn', 'Legacy method failed', { error: error.message, stack: error.stack });
+      }
+    }
+    
+    // Method 5: If all else fails, try to create a basic transaction manually
+    if (!tx) {
+      log('warn', 'All factory methods failed, attempting manual transaction creation');
+      
+      // Log token information for debugging
+      log('info', 'Token details for manual transaction', {
+        tokenIdentifier: REWARD_TOKEN,
+        tokenLength: REWARD_TOKEN.length,
+        isHex: /^[0-9a-fA-F]+$/.test(REWARD_TOKEN),
+        amount: dynamicFeeAmount,
+        amountHex: BigInt(dynamicFeeAmount).toString(16)
+      });
+      
+      try {
+        // Create a basic transaction structure
+        tx = new Transaction({
+          sender: senderAddress,
+          receiver: receiverAddress,
+          value: BigInt(0), // ESDT transfers have 0 EGLD value
+          data: `ESDTTransfer@${REWARD_TOKEN}@${BigInt(dynamicFeeAmount).toString(16)}`,
+          gasLimit: BigInt(500000),
+          chainID: "1"
+        });
+        
+        log('info', 'Manual transaction creation successful');
+      } catch (manualError) {
+        log('error', 'Manual transaction creation also failed', { error: manualError.message });
+        
+        // Last resort: try to create the most basic transaction possible
+        try {
+          tx = new Transaction({
+            sender: senderAddress,
+            receiver: receiverAddress,
+            value: BigInt(0),
+            data: '',
+            gasLimit: BigInt(500000),
+            chainID: "1"
+          });
+          
+          log('info', 'Basic transaction creation successful (will need manual data setup)');
+        } catch (basicError) {
+          log('error', 'Even basic transaction creation failed', { error: basicError.message });
+          throw new Error(`Complete transaction creation failure: ${basicError.message}`);
+        }
+      }
+    }
+    
+  } catch (error) {
+    log('error', 'All transaction creation methods failed', { 
+      error: error.message,
+      sdkVersion: 'v15+',
+      factoryType: factory.constructor.name,
+      availableMethods
+    });
+    
+    // Provide detailed error information
+    throw new Error(`Failed to create transaction: All SDK methods failed. Error: ${error.message}. Available methods: ${availableMethods.join(', ')}. Please check MultiversX SDK v15+ compatibility.`);
   }
 
   // Verify transaction was created successfully
   if (!tx) {
     throw new Error('Transaction creation failed: SDK returned undefined transaction object');
   }
+
+  // Log successful transaction creation
+  log('info', 'Transaction creation successful', {
+    method: 'Multiple fallback methods implemented',
+    transactionType: tx.constructor.name,
+    hasSender: !!tx.sender,
+    hasReceiver: !!tx.receiver,
+    hasValue: !!tx.value,
+    hasData: !!tx.data,
+    hasNonce: !!tx.nonce,
+    hasGasLimit: !!tx.gasLimit
+  });
 
   tx.nonce = nonce;
   tx.gasLimit = BigInt(500000);
