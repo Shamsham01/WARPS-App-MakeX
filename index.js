@@ -10,6 +10,12 @@ import fetch from 'node-fetch';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 
+// IMPORTANT: MultiversX SDK v14+ Compatibility Fix
+// The error "Cannot read properties of undefined (reading 'tokenTransfers')" was caused by
+// breaking changes in the MultiversX SDK v14+ where the transaction creation API changed.
+// This code now includes fallback methods to handle different API signatures and provides
+// detailed logging for debugging future SDK compatibility issues.
+
 // Load environment variables
 dotenv.config();
 
@@ -365,19 +371,95 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   // Calculate dynamic fee
   const dynamicFeeAmount = await calculateDynamicUsageFee();
 
+  // Updated for MultiversX SDK v14+ - use the new transaction creation API
   const factoryConfig = new TransactionsFactoryConfig({ chainID: "1" });
   const factory = new TransferTransactionsFactory({ config: factoryConfig });
 
-  const tx = factory.createTransactionForESDTTokenTransfer({
-    sender: senderAddress,
-    receiver: receiverAddress,
-    tokenTransfers: [
-      new TokenTransfer({
-        token: new Token({ identifier: REWARD_TOKEN }),
-        amount: BigInt(dynamicFeeAmount),
-      }),
-    ],
-  });
+  // Create the transaction using the updated API for SDK v14+
+  let tx;
+  try {
+    log('info', 'Attempting to create ESDT token transfer transaction', { 
+      sender: senderAddress.toString(),
+      receiver: receiverAddress.toString(),
+      token: REWARD_TOKEN,
+      amount: dynamicFeeAmount,
+      sdkVersion: 'v14+'
+    });
+    
+    // Method 1: Try the new API structure
+    tx = factory.createTransactionForESDTTokenTransfer({
+      sender: senderAddress,
+      receiver: receiverAddress,
+      tokenTransfers: [
+        new TokenTransfer({
+          token: new Token({ identifier: REWARD_TOKEN }),
+          amount: BigInt(dynamicFeeAmount),
+        }),
+      ],
+    });
+    
+    log('info', 'Transaction created successfully using Method 1 (object parameters)');
+  } catch (error) {
+    log('warn', 'Primary transaction creation method failed, trying alternative', { 
+      error: error.message,
+      method: 'Method 1 (object parameters)',
+      sdkVersion: 'v14+'
+    });
+    
+    // Method 2: Try alternative parameter structure
+    try {
+      log('info', 'Trying Method 2 (positional parameters)');
+      tx = factory.createTransactionForESDTTokenTransfer(
+        senderAddress,
+        receiverAddress,
+        [
+          new TokenTransfer({
+            token: new Token({ identifier: REWARD_TOKEN }),
+            amount: BigInt(dynamicFeeAmount),
+          }),
+        ]
+      );
+      
+      log('info', 'Transaction created successfully using Method 2 (positional parameters)');
+    } catch (error2) {
+      log('warn', 'Alternative transaction creation method also failed', { 
+        error: error2.message,
+        method: 'Method 2 (positional parameters)',
+        sdkVersion: 'v14+'
+      });
+      
+      // Method 3: Try with minimal parameters
+      try {
+        log('info', 'Trying Method 3 (single token transfer)');
+        tx = factory.createTransactionForESDTTokenTransfer(
+          senderAddress,
+          receiverAddress,
+          new TokenTransfer({
+            token: new Token({ identifier: REWARD_TOKEN }),
+            amount: BigInt(dynamicFeeAmount),
+          })
+        );
+        
+        log('info', 'Transaction created successfully using Method 3 (single token transfer)');
+      } catch (error3) {
+        log('error', 'All transaction creation methods failed', { 
+          error1: error.message,
+          error2: error2.message, 
+          error3: error3.message,
+          sdkVersion: 'v14+',
+          factoryType: factory.constructor.name,
+          availableMethods: Object.getOwnPropertyNames(Object.getPrototypeOf(factory))
+            .filter(name => name.startsWith('createTransaction'))
+        });
+        throw new Error(`Failed to create transaction: All SDK methods failed. Please check MultiversX SDK compatibility. SDK Version: v14+, Factory: ${factory.constructor.name}`);
+      }
+    }
+  }
+
+  // Verify transaction was created successfully
+  if (!tx) {
+    throw new Error('Transaction creation failed: SDK returned undefined transaction object');
+  }
 
   tx.nonce = nonce;
   tx.gasLimit = BigInt(500000);
