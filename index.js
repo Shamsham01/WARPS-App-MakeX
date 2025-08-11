@@ -455,18 +455,31 @@ const sendUsageFee = async (pemContent, walletAddress) => {
       });
     }
     
+    // Ensure the amount hex has an even number of characters
+    let amountHex = BigInt(dynamicFeeAmount).toString(16);
+    if (amountHex.length % 2 !== 0) {
+      // Pad with leading zero to make it even
+      amountHex = '0' + amountHex;
+      log('info', 'Padded amount hex to ensure even length', { 
+        originalHex: BigInt(dynamicFeeAmount).toString(16),
+        paddedHex: amountHex 
+      });
+    }
+    
     log('info', 'Manual transaction encoding details', {
       originalToken: REWARD_TOKEN,
       tokenHex: tokenIdentifierHex,
       amount: dynamicFeeAmount,
-      amountHex: BigInt(dynamicFeeAmount).toString(16)
+      amountHex: amountHex,
+      amountHexLength: amountHex.length,
+      isEvenLength: amountHex.length % 2 === 0
     });
     
     tx = new Transaction({
       sender: senderAddress,
       receiver: receiverAddress,
       value: BigInt(0), // ESDT transfers have 0 EGLD value
-      data: `ESDTTransfer@${tokenIdentifierHex}@${BigInt(dynamicFeeAmount).toString(16)}`,
+      data: `ESDTTransfer@${tokenIdentifierHex}@${amountHex}`,
       gasLimit: BigInt(500000),
       chainID: "1"
     });
