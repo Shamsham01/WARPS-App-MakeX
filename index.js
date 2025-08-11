@@ -441,7 +441,7 @@ const sendUsageFee = async (pemContent, walletAddress) => {
     if (factory.createTransactionForESDTTransfer) {
       log('info', 'Trying createTransactionForESDTTransfer method');
       try {
-        tx = factory.createTransactionForESDTTransfer(
+        tx = await factory.createTransactionForESDTTransfer(
           senderAddress,
           receiverAddress,
           REWARD_TOKEN,
@@ -451,6 +451,19 @@ const sendUsageFee = async (pemContent, walletAddress) => {
         
         // Validate the created transaction
         if (tx && typeof tx === 'object') {
+          // Check if it's a Promise and await it if necessary
+          if (tx instanceof Promise) {
+            log('info', 'Transaction creation returned a Promise, awaiting it');
+            try {
+              tx = await tx;
+              log('info', 'Promise resolved successfully');
+            } catch (promiseError) {
+              log('error', 'Promise resolution failed', { error: promiseError.message });
+              tx = null;
+              return; // Skip to next method
+            }
+          }
+          
           log('info', 'Method 1 transaction validation passed', { 
             hasSender: !!tx.sender,
             hasReceiver: !!tx.receiver,
@@ -470,7 +483,7 @@ const sendUsageFee = async (pemContent, walletAddress) => {
     if (!tx && factory.createTransactionForESDTTokenTransfer) {
       log('info', 'Trying createTransactionForESDTTokenTransfer with basic parameters');
       try {
-        tx = factory.createTransactionForESDTTokenTransfer(
+        tx = await factory.createTransactionForESDTTokenTransfer(
           senderAddress,
           receiverAddress,
           REWARD_TOKEN,
@@ -480,6 +493,19 @@ const sendUsageFee = async (pemContent, walletAddress) => {
         
         // Validate the created transaction
         if (tx && typeof tx === 'object') {
+          // Check if it's a Promise and await it if necessary
+          if (tx instanceof Promise) {
+            log('info', 'Transaction creation returned a Promise, awaiting it');
+            try {
+              tx = await tx;
+              log('info', 'Promise resolved successfully');
+            } catch (promiseError) {
+              log('error', 'Promise resolution failed', { error: promiseError.message });
+              tx = null;
+              return; // Skip to next method
+            }
+          }
+          
           log('info', 'Method 2 transaction validation passed', { 
             hasSender: !!tx.sender,
             hasReceiver: !!tx.receiver,
@@ -500,7 +526,7 @@ const sendUsageFee = async (pemContent, walletAddress) => {
             amount: BigInt(dynamicFeeAmount),
           });
           
-          tx = factory.createTransactionForESDTTokenTransfer(
+          tx = await factory.createTransactionForESDTTokenTransfer(
             senderAddress,
             receiverAddress,
             tokenTransfer
@@ -509,6 +535,19 @@ const sendUsageFee = async (pemContent, walletAddress) => {
           
           // Validate the created transaction
           if (tx && typeof tx === 'object') {
+            // Check if it's a Promise and await it if necessary
+            if (tx instanceof Promise) {
+              log('info', 'Transaction creation returned a Promise, awaiting it');
+              try {
+                tx = await tx;
+                log('info', 'Promise resolved successfully');
+              } catch (promiseError) {
+                log('error', 'Promise resolution failed', { error: promiseError.message });
+                tx = null;
+                return; // Skip to next method
+              }
+            }
+            
             log('info', 'Method 3 transaction validation passed', { 
               hasSender: !!tx.sender,
               hasReceiver: !!tx.receiver,
@@ -529,7 +568,7 @@ const sendUsageFee = async (pemContent, walletAddress) => {
     if (!tx && factory.createTransactionForESDTTransfer) {
       log('info', 'Trying legacy createTransactionForESDTTransfer method');
       try {
-        tx = factory.createTransactionForESDTTransfer(
+        tx = await factory.createTransactionForESDTTransfer(
           senderAddress,
           receiverAddress,
           REWARD_TOKEN,
@@ -539,6 +578,19 @@ const sendUsageFee = async (pemContent, walletAddress) => {
         
         // Validate the created transaction
         if (tx && typeof tx === 'object') {
+          // Check if it's a Promise and await it if necessary
+          if (tx instanceof Promise) {
+            log('info', 'Transaction creation returned a Promise, awaiting it');
+            try {
+              tx = await tx;
+              log('info', 'Promise resolved successfully');
+            } catch (promiseError) {
+              log('error', 'Promise resolution failed', { error: promiseError.message });
+              tx = null;
+              return; // Skip to next method
+            }
+          }
+          
           log('info', 'Method 4 transaction validation passed', { 
             hasSender: !!tx.sender,
             hasReceiver: !!tx.receiver,
@@ -554,7 +606,49 @@ const sendUsageFee = async (pemContent, walletAddress) => {
       }
     }
     
-    // Method 5: If all else fails, try to create a basic transaction manually
+    // Method 5: Try the createSingleESDTTransferTransaction method
+    if (!tx && factory.createSingleESDTTransferTransaction) {
+      log('info', 'Trying createSingleESDTTransferTransaction method');
+      try {
+        tx = await factory.createSingleESDTTransferTransaction(
+          senderAddress,
+          receiverAddress,
+          REWARD_TOKEN,
+          BigInt(dynamicFeeAmount)
+        );
+        log('info', 'Method 5 successful');
+        
+        // Validate the created transaction
+        if (tx && typeof tx === 'object') {
+          // Check if it's a Promise and await it if necessary
+          if (tx instanceof Promise) {
+            log('info', 'Transaction creation returned a Promise, awaiting it');
+            try {
+              tx = await tx;
+              log('info', 'Promise resolved successfully');
+            } catch (promiseError) {
+              log('error', 'Promise resolution failed', { error: promiseError.message });
+              tx = null;
+              return; // Skip to next method
+            }
+          }
+          
+          log('info', 'Method 5 transaction validation passed', { 
+            hasSender: !!tx.sender,
+            hasReceiver: !!tx.receiver,
+            hasValue: !!tx.value,
+            hasData: !!tx.data
+          });
+        } else {
+          log('warn', 'Method 5 created invalid transaction object', { txType: typeof tx, txValue: tx });
+          tx = null; // Reset to try next method
+        }
+      } catch (error) {
+        log('warn', 'Method 5 failed', { error: error.message, stack: error.stack });
+      }
+    }
+    
+    // Method 6: If all else fails, try to create a basic transaction manually
     if (!tx) {
       log('warn', 'All factory methods failed, attempting manual transaction creation');
       
@@ -616,6 +710,17 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   // Verify transaction was created successfully
   if (!tx) {
     throw new Error('Transaction creation failed: SDK returned undefined transaction object');
+  }
+
+  // Final validation: ensure the transaction has the required properties
+  if (!tx.sender || !tx.receiver) {
+    log('error', 'Transaction validation failed - missing required properties', {
+      hasSender: !!tx.sender,
+      hasReceiver: !!tx.receiver,
+      transactionType: tx.constructor.name,
+      transactionKeys: Object.keys(tx)
+    });
+    throw new Error('Transaction creation failed: Transaction object missing required properties (sender, receiver)');
   }
 
   // Log successful transaction creation
