@@ -42,6 +42,22 @@ if (!SECURE_TOKEN) {
 app.use(helmet());
 app.use(bodyParser.json());
 
+// Request timeout middleware (30 seconds)
+app.use((req, res, next) => {
+  const timeout = 30000; // 30 seconds
+  req.setTimeout(timeout, () => {
+    if (!res.headersSent) {
+      log('warn', 'Request timeout', { 
+        path: req.path, 
+        method: req.method,
+        timeout 
+      });
+      res.status(408).json({ error: 'Request timeout' });
+    }
+  });
+  next();
+});
+
 // Simple structured logging helper
 function log(level, message, data = {}) {
   // Ensure PEM content is never logged
@@ -713,6 +729,68 @@ function filterResponseFields(response, fields) {
   return filtered;
 }
 
+// Utility function to safely serialize objects and prevent circular reference errors
+function safeStringify(obj, maxDepth = 3) {
+  const seen = new WeakSet();
+  
+  function safeSerialize(value, depth = 0) {
+    if (depth > maxDepth) {
+      return '[Max Depth Reached]';
+    }
+    
+    if (value === null || value === undefined) {
+      return value;
+    }
+    
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      return value;
+    }
+    
+    if (value instanceof Date) {
+      return value.toISOString();
+    }
+    
+    if (typeof value === 'function') {
+      return '[Function]';
+    }
+    
+    if (seen.has(value)) {
+      return '[Circular Reference]';
+    }
+    
+    if (Array.isArray(value)) {
+      seen.add(value);
+      const result = value.map(item => safeSerialize(item, depth + 1));
+      seen.delete(value);
+      return result;
+    }
+    
+    if (typeof value === 'object') {
+      seen.add(value);
+      const result = {};
+      for (const key in value) {
+        if (value.hasOwnProperty(key)) {
+          try {
+            result[key] = safeSerialize(value[key], depth + 1);
+          } catch (err) {
+            result[key] = '[Serialization Error]';
+          }
+        }
+      }
+      seen.delete(value);
+      return result;
+    }
+    
+    return '[Unknown Type]';
+  }
+  
+  try {
+    return safeSerialize(obj);
+  } catch (error) {
+    return { error: 'Failed to serialize object', message: error.message };
+  }
+}
+
 // --- Endpoints ---
 
 // 1. GET /warpRPC
@@ -831,10 +909,24 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
       log('warn', `Unhandled action type`, { warpId, actionType: action.type });
       return res.status(400).json({ error: `Unsupported WARP action type: ${action.type}` });
     }
-    // If handler returns a response object (not sent yet), filter fields and send
+    // If handler returns a response object ( not sent yet), filter fields and send
     if (response && typeof response === 'object' && !response.__sent) {
-      const filtered = filterResponseFields(response, fields);
-      return res.json(filtered);
+      try {
+        const filtered = filterResponseFields(response, fields);
+        // Use safe serialization to prevent circular reference errors
+        const safeResponse = safeStringify(filtered);
+        return res.json(safeResponse);
+      } catch (serializeError) {
+        log('error', `Failed to serialize response`, { 
+          warpId, 
+          error: serializeError.message,
+          originalResponse: safeStringify(response)
+        });
+        return res.status(500).json({ 
+          error: 'Internal server error: Failed to serialize response',
+          warpId 
+        });
+      }
     }
     // Otherwise, handler already sent response
   } catch (error) {
@@ -853,7 +945,12 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
       stack: sanitizedStack
     });
     
-    return res.status(400).json({ error: sanitizedMessage });
+    // Check if response has already been sent
+    if (!res.headersSent) {
+      return res.status(400).json({ error: sanitizedMessage });
+    } else {
+      log('warn', `Response already sent, cannot send error response`, { warpId });
+    }
   }
 });
 
@@ -878,6 +975,38 @@ app.get('/warp/:warpId', async (req, res) => {
     return res.status(400).json({ 
       success: false,
       error: error.message 
+    });
+  }
+});
+
+// 4. GET /transaction/:txHash/status
+// This endpoint allows users to check transaction status later if they got a pending response
+app.get('/transaction/:txHash/status', async (req, res) => {
+  try {
+    const { txHash } = req.params;
+    if (!txHash) throw new Error("Missing txHash parameter");
+
+    log('info', `Transaction status check request`, { txHash });
+    
+    // Use the existing retry logic with reasonable limits for status checks
+    const status = await checkTransactionStatus(txHash, 30, 2000); // 30 retries = 1 minute
+    
+    return res.json({
+      success: true,
+      txHash,
+      status: status.status,
+      details: status.details || null,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    log('error', `Error checking transaction status`, { 
+      txHash: req.params.txHash,
+      error: error.message 
+    });
+    return res.status(400).json({ 
+      success: false,
+      error: error.message,
+      txHash: req.params.txHash
     });
   }
 });
@@ -968,34 +1097,170 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     if (!txHash) {
       throw new Error('Transaction hash is undefined after sending transaction.');
     }
-    // 3. Wait for confirmation (optional)
-    const txOnNetwork = await provider.awaitTransactionCompleted(txHash);
-    // 4. Get execution results
-    execResult = await warpActionExecutor.getTransactionExecutionResults(warpInfo, 1, txOnNetwork);
+    
+    // 3. Wait for confirmation with configurable timeout and retry logic
+    log('info', `Transaction sent, waiting for confirmation`, { warpId, txHash });
+    
+    // Use custom retry logic instead of blocking SDK call
+    const maxWaitTime = simulate ? 10000 : 120000; // 10s for simulate, 2min for real
+    const maxRetries = Math.ceil(maxWaitTime / 2000); // 2-second intervals
+    
+    const txStatus = await checkTransactionStatus(txHash, maxRetries, 2000);
+    
+    if (txStatus.status === "pending") {
+      // Transaction still pending after max wait time
+      log('warn', `Transaction still pending after max wait time`, { 
+        warpId, 
+        txHash, 
+        maxWaitTime: maxWaitTime / 1000 + 's' 
+      });
+      
+      // Return early with pending status - user can check later
+      const response = {
+        warpId,
+        warpHash: warpInfo.meta?.hash,
+        finalTxHash: txHash,
+        finalStatus: "pending",
+        message: `Transaction sent but still pending. Check status later with hash: ${txHash}`,
+        results: [],
+        messages: [],
+        next: null,
+        usageFeeHash: req.usageFeeHash || 'N/A'
+      };
+      
+      if (verbose) {
+        response.debug = {
+          action: {
+            type: action.type,
+            inputs: action.inputs?.map(input => ({
+              name: input.name,
+              type: input.type,
+              required: input.required,
+              source: input.source
+            }))
+          },
+          userInputsArray,
+          executorConfig: {
+            chainId: warpActionExecutor.config.chainId,
+            gatewayUrl: warpActionExecutor.config.gatewayUrl
+          },
+          txStatus: txStatus,
+          maxWaitTime: maxWaitTime / 1000 + 's'
+        };
+      }
+      response.__sent = false;
+      return response;
+    }
+    
+    if (txStatus.status === "fail") {
+      // Transaction failed on blockchain
+      log('error', `Transaction failed on blockchain`, { 
+        warpId, 
+        txHash, 
+        details: txStatus.details 
+      });
+      
+      const response = {
+        warpId,
+        warpHash: warpInfo.meta?.hash,
+        finalTxHash: txHash,
+        finalStatus: "fail",
+        message: `Transaction failed: ${txStatus.details}`,
+        results: [],
+        messages: [txStatus.details],
+        next: null,
+        usageFeeHash: req.usageFeeHash || 'N/A'
+      };
+      
+      if (verbose) {
+        response.debug = {
+          action: {
+            type: action.type,
+            inputs: action.inputs?.map(input => ({
+              name: input.name,
+              type: input.type,
+              required: input.required,
+              source: input.source
+            }))
+          },
+          userInputsArray,
+          executorConfig: {
+            chainId: warpActionExecutor.config.chainId,
+            gatewayUrl: warpActionExecutor.config.gatewayUrl
+          },
+          txStatus: txStatus
+        };
+      }
+      response.__sent = false;
+      return response;
+    }
+    
+    // Transaction succeeded - get execution results
+    log('info', `Transaction confirmed successful, getting execution results`, { warpId, txHash });
+    
+    // 4. Get execution results from the confirmed transaction
+    let execResult;
+    try {
+      // Get transaction details from network for execution results
+      const txOnNetwork = await provider.getTransactionInfo(txHash);
+      execResult = await warpActionExecutor.getTransactionExecutionResults(warpInfo, 1, txOnNetwork);
+    } catch (execError) {
+      log('warn', `Failed to get execution results, but transaction succeeded`, { 
+        warpId, 
+        txHash, 
+        error: execError.message 
+      });
+      
+      // Transaction succeeded but couldn't get detailed results
+      execResult = {
+        success: true,
+        results: [],
+        messages: ['Transaction succeeded but execution details unavailable'],
+        next: null
+      };
+    }
+    
     log('info', `WARP execution completed`, { warpId, execResult });
+    
+    // Create a safe response object without circular references
     const response = {
       warpId,
       warpHash: warpInfo.meta?.hash,
-      finalTxHash: execResult.txHash?.toString?.() || null,
-      finalStatus: execResult.success ? "success" : "fail",
-      results: execResult.results,
-      messages: execResult.messages,
-      next: execResult.next,
+      finalTxHash: txHash,
+      finalStatus: "success",
+      results: execResult.results || [],
+      messages: execResult.messages || [],
+      next: execResult.next || null,
       usageFeeHash: req.usageFeeHash || 'N/A'
     };
+    
     if (verbose) {
+      // Only include safe, serializable debug info
       response.debug = {
-        action,
+        action: {
+          type: action.type,
+          inputs: action.inputs?.map(input => ({
+            name: input.name,
+            type: input.type,
+            required: input.required,
+            source: input.source
+          }))
+        },
         userInputsArray,
-        executorConfig: warpActionExecutor.config,
-        rawResult: execResult
+        executorConfig: {
+          chainId: warpActionExecutor.config.chainId,
+          gatewayUrl: warpActionExecutor.config.gatewayUrl
+        },
+        txStatus: txStatus,
+        execResult: execResult
       };
     }
     response.__sent = false;
     return response;
   } catch (error) {
     log('error', `Contract execution failed`, { warpId, error: error.message });
-    return res.status(400).json({ error: `Contract execution failed: ${error.message}` });
+    // Return error object instead of sending response directly
+    throw error;
   }
 }
 
@@ -1032,18 +1297,30 @@ async function handleQueryExecution(req, res, action, warpInfo, userAddress, war
       usageFeeHash: req.usageFeeHash || 'N/A'
     };
     if (verbose) {
+      // Only include safe, serializable debug info
       response.debug = {
-        action,
+        action: {
+          type: action.type,
+          inputs: action.inputs?.map(input => ({
+            name: input.name,
+            type: input.type,
+            required: input.required,
+            source: input.source
+          }))
+        },
         processedInputs,
-        executorConfig: warpActionExecutor.config,
-        rawResult: queryResult
+        executorConfig: {
+          chainId: warpActionExecutor.config.chainId,
+          gatewayUrl: warpActionExecutor.config.gatewayUrl
+        }
       };
     }
     response.__sent = false;
     return response;
   } catch (error) {
     log('error', `Query execution failed`, { warpId, error: error.message });
-    return res.status(400).json({ error: `Query execution failed: ${error.message}` });
+    // Return error object instead of sending response directly
+    throw error;
   }
 }
 
@@ -1091,20 +1368,65 @@ async function handleCollectExecution(req, res, action, warpInfo, userAddress, w
       message: "Data collected successfully"
     };
     if (verbose) {
+      // Only include safe, serializable debug info
       response.debug = {
-        action,
+        action: {
+          type: action.type,
+          inputs: action.inputs?.map(input => ({
+            name: input.name,
+            type: input.type,
+            required: input.required,
+            source: input.source
+          }))
+        },
         newData,
-        executorConfig: warpActionExecutor.config,
-        rawResult: collectResult
+        executorConfig: {
+          chainId: warpActionExecutor.config.chainId,
+          gatewayUrl: warpActionExecutor.config.gatewayUrl
+        }
       };
     }
     response.__sent = false;
     return response;
   } catch (error) {
     log('error', `Collect execution failed`, { warpId, error: error.message });
-    return res.status(400).json({ error: `Collect execution failed: ${error.message}` });
+    // Return error object instead of sending response directly
+    throw error;
   }
 }
+
+// Global error handling middleware
+app.use((error, req, res, next) => {
+  // Check if response has already been sent
+  if (res.headersSent) {
+    log('warn', 'Response already sent, cannot send error response', { 
+      path: req.path,
+      method: req.method,
+      error: error.message 
+    });
+    return;
+  }
+  
+  // Sanitize error message
+  const sanitizedMessage = error.message ? 
+    error.message.replace(/-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/g, '[REDACTED PEM DATA]') : 
+    'Internal server error';
+  
+  // Log the error
+  log('error', 'Global error handler caught error', { 
+    path: req.path,
+    method: req.method,
+    error: sanitizedMessage,
+    stack: error.stack ? error.stack.replace(/-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/g, '[REDACTED PEM DATA]') : ''
+  });
+  
+  // Send error response
+  res.status(500).json({ 
+    error: sanitizedMessage,
+    path: req.path,
+    method: req.method
+  });
+});
 
 // Health check endpoint
 app.get('/health', (req, res) => {
