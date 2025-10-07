@@ -92,6 +92,24 @@ const whitelistFilePath = path.join(__dirname, 'whitelist.json');
 // In-memory store for tracking pending transactions
 const pendingUsageFeeTransactions = new Map();
 
+// Rate limiter for API calls (2 requests per second max)
+let lastApiCall = 0;
+const API_RATE_LIMIT = 500; // 500ms between calls = 2 per second
+
+// Helper: Rate-limited API call
+async function rateLimitedApiCall(url, options = {}) {
+  const now = Date.now();
+  const timeSinceLastCall = now - lastApiCall;
+  
+  if (timeSinceLastCall < API_RATE_LIMIT) {
+    const delay = API_RATE_LIMIT - timeSinceLastCall;
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+  
+  lastApiCall = Date.now();
+  return fetch(url, options);
+}
+
 // Middleware: Token check
 const checkToken = (req, res, next) => {
   const token = req.headers.authorization;
@@ -124,7 +142,7 @@ function getPemContent(req) {
 // Helper: Fetch token decimals from MultiversX API
 const getTokenDecimals = async (tokenTicker) => {
   const apiUrl = `https://api.multiversx.com/tokens/${tokenTicker}`;
-  const response = await fetch(apiUrl);
+  const response = await rateLimitedApiCall(apiUrl);
   if (!response.ok) {
     throw new Error(`Failed to fetch token info: ${response.statusText}`);
   }
@@ -165,7 +183,7 @@ const isWhitelisted = (walletAddress) => {
 // Helper: Fetch REWARD token price from MultiversX API
 const getRewardPrice = async () => {
   try {
-    const tokenResponse = await fetch(`https://api.multiversx.com/tokens?search=${REWARD_TOKEN}`, { 
+    const tokenResponse = await rateLimitedApiCall(`https://api.multiversx.com/tokens?search=${REWARD_TOKEN}`, { 
       timeout: 10000 // Add timeout for API calls
     });
     if (!tokenResponse.ok) {
@@ -209,21 +227,29 @@ const calculateDynamicUsageFee = async () => {
   return convertAmountToBlockchainValue(rewardAmount, decimals);
 };
 
-// Helper: Check transaction status with consistent retry logic
-async function checkTransactionStatus(txHash, maxRetries = 60, retryInterval = 2000) {
+// Helper: Check transaction status with improved error detection and rate limiting
+async function checkTransactionStatus(txHash, maxRetries = 30, retryInterval = 2000) {
   let consecutiveErrors = 0;
   const MAX_CONSECUTIVE_ERRORS = 3;
   
+  // Rate limiting: respect 2tx/second limit
+  const rateLimitDelay = 500; // 500ms between requests = 2 requests per second
+  
   for (let i = 0; i < maxRetries; i++) {
     try {
-      // Only log first, last, and every 10th attempt to reduce noise
-      if (i === 0 || i === maxRetries - 1 || i % 10 === 0) {
+      // Only log first, last, and every 5th attempt to reduce noise
+      if (i === 0 || i === maxRetries - 1 || i % 5 === 0) {
         log('info', `Checking transaction status`, { txHash, attempt: i + 1, maxRetries });
       }
       
+      // Rate limiting delay
+      if (i > 0) {
+        await new Promise(resolve => setTimeout(resolve, rateLimitDelay));
+      }
+      
       const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
-      const response = await fetch(txStatusUrl, { 
-        timeout: 10000, // Increase timeout to 10 seconds
+      const response = await rateLimitedApiCall(txStatusUrl, { 
+        timeout: 10000,
         headers: { 'User-Agent': 'WARPS-MakeX-Integration/1.0' }
       });
       
@@ -256,6 +282,39 @@ async function checkTransactionStatus(txHash, maxRetries = 60, retryInterval = 2
       
       const txStatus = await response.json();
       
+      // Check for failed transactions first
+      if (txStatus.status === "fail" || txStatus.status === "invalid") {
+        // Extract error details from operations array
+        let errorMessage = 'Transaction failed';
+        if (txStatus.operations && txStatus.operations.length > 0) {
+          const errorOp = txStatus.operations.find(op => op.action === 'signalError' || op.type === 'error');
+          if (errorOp && errorOp.message) {
+            errorMessage = errorOp.message;
+          } else if (errorOp && errorOp.data) {
+            // Decode base64 error message
+            try {
+              errorMessage = Buffer.from(errorOp.data, 'base64').toString('utf8');
+            } catch (e) {
+              errorMessage = errorOp.data;
+            }
+          }
+        }
+        
+        log('warn', `Transaction failed`, { 
+          txHash, 
+          status: txStatus.status,
+          errorMessage,
+          operations: txStatus.operations?.length || 0
+        });
+        
+        return { 
+          status: "fail", 
+          txHash, 
+          details: errorMessage
+        };
+      }
+      
+      // Check for successful transactions
       if (txStatus.status === "success" || txStatus.status === "executed") {
         log('info', `Transaction completed successfully`, { txHash });
         
@@ -277,26 +336,19 @@ async function checkTransactionStatus(txHash, maxRetries = 60, retryInterval = 2
         }
         
         return { status: "success", txHash };
-      } else if (txStatus.status === "fail" || txStatus.status === "invalid") {
-        log('warn', `Transaction failed`, { 
-          txHash, 
-          status: txStatus.status,
-          errorDetails: txStatus.error || txStatus.receipt?.data || 'No error details provided'
-        });
-        return { 
-          status: "fail", 
-          txHash, 
-          details: txStatus.error || txStatus.receipt?.data || 'No error details provided' 
-        };
-      } else if (txStatus.status === "pending") {
+      }
+      
+      // Handle pending status
+      if (txStatus.status === "pending") {
         // Still pending, retry after interval
         await new Promise(resolve => setTimeout(resolve, retryInterval));
         continue;
-      } else {
-        // Unknown status
-        log('warn', `Unknown transaction status`, { txHash, status: txStatus.status });
-        await new Promise(resolve => setTimeout(resolve, retryInterval));
       }
+      
+      // Unknown status
+      log('warn', `Unknown transaction status`, { txHash, status: txStatus.status });
+      await new Promise(resolve => setTimeout(resolve, retryInterval));
+      
     } catch (error) {
       consecutiveErrors++;
       log('error', `Error checking transaction`, { 
@@ -306,7 +358,7 @@ async function checkTransactionStatus(txHash, maxRetries = 60, retryInterval = 2
         consecutiveErrors 
       });
       
-      // If we have multiple consecutive errors, we might need to try a different approach
+      // If we have multiple consecutive errors, try backup API
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         log('error', `Too many consecutive errors checking transaction`, { 
           txHash, 
@@ -319,7 +371,7 @@ async function checkTransactionStatus(txHash, maxRetries = 60, retryInterval = 2
           const backupApiUrl = 'https://gateway.multiversx.com/transaction/';
           log('info', `Trying backup API for transaction status`, { txHash, backupApiUrl });
           
-          const backupResponse = await fetch(`${backupApiUrl}${txHash}`, { 
+          const backupResponse = await rateLimitedApiCall(`${backupApiUrl}${txHash}`, { 
             timeout: 10000,
             headers: { 'User-Agent': 'WARPS-MakeX-Integration/1.0' }
           });
@@ -362,7 +414,7 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   if (pendingTx) {
     try {
       // Check if the pending transaction has completed
-      const status = await checkTransactionStatus(pendingTx.txHash, 10, 2000); // Increase retries for usage fee check
+      const status = await checkTransactionStatus(pendingTx.txHash, 5, 2000); // Reduced retries for usage fee check
       
       // If transaction succeeded, return the existing transaction hash
       if (status.status === "success") {
@@ -562,8 +614,8 @@ const sendUsageFee = async (pemContent, walletAddress) => {
     timestamp: Date.now()
   });
 
-  // Initial check with more retries (10 instead of 3)
-  const status = await checkTransactionStatus(txHash.toString(), 10, 2000);
+  // Initial check with reduced retries
+  const status = await checkTransactionStatus(txHash.toString(), 5, 2000);
   
   if (status.status === "success") {
     pendingUsageFeeTransactions.delete(walletAddress); // Clean up on success
@@ -989,7 +1041,7 @@ app.get('/transaction/:txHash/status', async (req, res) => {
     log('info', `Transaction status check request`, { txHash });
     
     // Use the existing retry logic with reasonable limits for status checks
-    const status = await checkTransactionStatus(txHash, 30, 2000); // 30 retries = 1 minute
+    const status = await checkTransactionStatus(txHash, 15, 2000); // 15 retries = 30 seconds
     
     return res.json({
       success: true,
@@ -1102,7 +1154,7 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     log('info', `Transaction sent, waiting for confirmation`, { warpId, txHash });
     
     // Use custom retry logic instead of blocking SDK call
-    const maxWaitTime = simulate ? 10000 : 120000; // 10s for simulate, 2min for real
+    const maxWaitTime = simulate ? 10000 : 60000; // 10s for simulate, 1min for real
     const maxRetries = Math.ceil(maxWaitTime / 2000); // 2-second intervals
     
     const txStatus = await checkTransactionStatus(txHash, maxRetries, 2000);
