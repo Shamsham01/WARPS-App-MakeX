@@ -915,12 +915,20 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     const userAddress = signer.getAddress().toString();
     const requestKey = `${warpId}-${userAddress}-${JSON.stringify(inputs || {})}`;
     
+    log('info', `Request key generated`, { 
+      warpId, 
+      userAddress, 
+      inputs: inputs || {},
+      requestKey 
+    });
+    
     // Check if this request is already being processed
     if (activeRequests.has(requestKey)) {
       log('warn', `Duplicate request detected, returning existing result`, { 
         warpId, 
         userAddress, 
-        requestKey 
+        requestKey,
+        activeRequestsCount: activeRequests.size
       });
       
       const existingResult = activeRequests.get(requestKey);
@@ -928,13 +936,16 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
         // Wait for the existing request to complete
         try {
           const result = await existingResult.promise;
+          log('info', `Returning result from existing request`, { requestKey });
           return res.json(result);
         } catch (error) {
           // If the existing request failed, remove it and continue
+          log('warn', `Existing request failed, removing and continuing`, { requestKey, error: error.message });
           activeRequests.delete(requestKey);
         }
       } else {
         // Return the cached result
+        log('info', `Returning cached result`, { requestKey });
         return res.json(existingResult);
       }
     }
@@ -1321,14 +1332,40 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
       
       const txOnNetwork = await txDetailsResponse.json();
       
+      // Log the transaction structure for debugging
+      log('info', `Transaction details structure`, { 
+        txHash, 
+        hasStatus: !!txOnNetwork.status,
+        hasResults: !!txOnNetwork.results,
+        resultsLength: txOnNetwork.results?.length || 0,
+        keys: Object.keys(txOnNetwork)
+      });
+      
       // Try to get execution results using the WARP executor
       try {
-        execResult = await warpActionExecutor.getTransactionExecutionResults(warpInfo, txOnNetwork);
+        // The WARPS SDK might expect a different transaction object structure
+        // Let's try to create a compatible structure
+        const compatibleTx = {
+          ...txOnNetwork,
+          status: txOnNetwork.status || 'success',
+          results: txOnNetwork.results || []
+        };
+        
+        execResult = await warpActionExecutor.getTransactionExecutionResults(warpInfo, compatibleTx);
+        log('info', `WARP execution results parsed successfully`, { 
+          warpId, 
+          txHash, 
+          execResult: execResult 
+        });
       } catch (execError) {
         log('warn', `WARP executor failed to parse results, using basic success`, { 
           warpId, 
           txHash, 
-          error: execError.message 
+          error: execError.message,
+          stack: execError.stack,
+          txOnNetworkKeys: Object.keys(txOnNetwork),
+          txOnNetworkStatus: txOnNetwork.status,
+          txOnNetworkResults: txOnNetwork.results
         });
         
         // If WARP executor fails, create a basic success result
