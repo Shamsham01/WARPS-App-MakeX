@@ -92,6 +92,9 @@ const whitelistFilePath = path.join(__dirname, 'whitelist.json');
 // In-memory store for tracking pending transactions
 const pendingUsageFeeTransactions = new Map();
 
+// In-memory store for tracking active requests to prevent duplicates
+const activeRequests = new Map();
+
 // Rate limiter for API calls (2 requests per second max)
 let lastApiCall = 0;
 const API_RATE_LIMIT = 500; // 500ms between calls = 2 per second
@@ -905,82 +908,133 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
   try {
     const { warpId, inputs, chain, cacheStrategy, cacheTTL, simulate, verbose, fields } = req.body;
     if (!warpId) throw new Error("Missing warpId in request body");
-    log('info', `Processing WARP execution request`, { warpId });
+    
+    // Create a unique request key to prevent duplicate processing
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
-    const userAddressObj = signer.getAddress();
+    const userAddress = signer.getAddress().toString();
+    const requestKey = `${warpId}-${userAddress}-${JSON.stringify(inputs || {})}`;
     
-    // Convert Address object to string - handle both old and new SDK versions
-    let userAddress;
-    try {
-      // Try the new SDK v15+ method first
-      if (typeof userAddressObj.toString === 'function') {
-        userAddress = userAddressObj.toString();
-      } else if (typeof userAddressObj.bech32 === 'function') {
-        userAddress = userAddressObj.bech32();
+    // Check if this request is already being processed
+    if (activeRequests.has(requestKey)) {
+      log('warn', `Duplicate request detected, returning existing result`, { 
+        warpId, 
+        userAddress, 
+        requestKey 
+      });
+      
+      const existingResult = activeRequests.get(requestKey);
+      if (existingResult.promise) {
+        // Wait for the existing request to complete
+        try {
+          const result = await existingResult.promise;
+          return res.json(result);
+        } catch (error) {
+          // If the existing request failed, remove it and continue
+          activeRequests.delete(requestKey);
+        }
       } else {
-        // Fallback: try to get the address as a string
+        // Return the cached result
+        return res.json(existingResult);
+      }
+    }
+    
+    log('info', `Processing WARP execution request`, { warpId, requestKey });
+    
+    // Create a promise for this request to prevent duplicates
+    const executionPromise = (async () => {
+      const userAddressObj = signer.getAddress();
+      
+      // Convert Address object to string - handle both old and new SDK versions
+      let userAddress;
+      try {
+        // Try the new SDK v15+ method first
+        if (typeof userAddressObj.toString === 'function') {
+          userAddress = userAddressObj.toString();
+        } else if (typeof userAddressObj.bech32 === 'function') {
+          userAddress = userAddressObj.bech32();
+        } else {
+          // Fallback: try to get the address as a string
+          userAddress = String(userAddressObj);
+        }
+        log('info', 'UserAddress converted successfully', { 
+          method: 'SDK v15+ compatible',
+          address: userAddress,
+          originalType: userAddressObj.constructor.name
+        });
+      } catch (error) {
+        log('warn', 'Error converting userAddress, using fallback', { error: error.message });
         userAddress = String(userAddressObj);
       }
-      log('info', 'UserAddress converted successfully', { 
-        method: 'SDK v15+ compatible',
-        address: userAddress,
-        originalType: userAddressObj.constructor.name
+      
+      const warpInfo = await fetchWarpInfo(warpId, req, userAddress);
+      const action = warpInfo.actions[0];
+      
+      // Log WARP type and ensure compatibility
+      log('info', 'WARP execution details', {
+        warpId,
+        actionType: action.type,
+        actionInputs: action.inputs?.length || 0,
+        userAddressType: typeof userAddress,
+        userAddress: userAddress,
+        supportedTypes: ['contract', 'transfer', 'query', 'collect']
       });
-    } catch (error) {
-      log('warn', 'Error converting userAddress, using fallback', { error: error.message });
-      userAddress = String(userAddressObj);
-    }
-    
-    const warpInfo = await fetchWarpInfo(warpId, req, userAddress);
-    const action = warpInfo.actions[0];
-    
-    // Log WARP type and ensure compatibility
-    log('info', 'WARP execution details', {
-      warpId,
-      actionType: action.type,
-      actionInputs: action.inputs?.length || 0,
-      userAddressType: typeof userAddress,
-      userAddress: userAddress,
-      supportedTypes: ['contract', 'transfer', 'query', 'collect']
-    });
-    
-    const executorConfig = getWarpConfigFromRequest(req, userAddress);
-    const warpActionExecutor = new WarpActionExecutor(executorConfig);
-    let response;
-    if (action.type === 'contract' || action.type === 'transfer') {
-      log('info', 'Executing contract/transfer WARP', { warpId, actionType: action.type });
-      response = await handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent, simulate, verbose);
-    } else if (action.type === 'query') {
-      log('info', 'Executing query WARP', { warpId, actionType: action.type });
-      response = await handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose);
-    } else if (action.type === 'collect') {
-      log('info', 'Executing collect WARP', { warpId, actionType: action.type });
-      response = await handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose);
-    } else {
-      log('warn', `Unhandled action type`, { warpId, actionType: action.type });
-      return res.status(400).json({ error: `Unsupported WARP action type: ${action.type}` });
-    }
-    // If handler returns a response object ( not sent yet), filter fields and send
-    if (response && typeof response === 'object' && !response.__sent) {
-      try {
-        const filtered = filterResponseFields(response, fields);
-        // Use safe serialization to prevent circular reference errors
-        const safeResponse = safeStringify(filtered);
-        return res.json(safeResponse);
-      } catch (serializeError) {
-        log('error', `Failed to serialize response`, { 
-          warpId, 
-          error: serializeError.message,
-          originalResponse: safeStringify(response)
-        });
-        return res.status(500).json({ 
-          error: 'Internal server error: Failed to serialize response',
-          warpId 
-        });
+      
+      const executorConfig = getWarpConfigFromRequest(req, userAddress);
+      const warpActionExecutor = new WarpActionExecutor(executorConfig);
+      let response;
+      if (action.type === 'contract' || action.type === 'transfer') {
+        log('info', 'Executing contract/transfer WARP', { warpId, actionType: action.type });
+        response = await handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent, simulate, verbose);
+      } else if (action.type === 'query') {
+        log('info', 'Executing query WARP', { warpId, actionType: action.type });
+        response = await handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose);
+      } else if (action.type === 'collect') {
+        log('info', 'Executing collect WARP', { warpId, actionType: action.type });
+        response = await handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose);
+      } else {
+        log('warn', `Unhandled action type`, { warpId, actionType: action.type });
+        throw new Error(`Unsupported WARP action type: ${action.type}`);
       }
+      
+      return response;
+    })();
+    
+    // Store the promise in active requests
+    activeRequests.set(requestKey, { promise: executionPromise });
+    
+    try {
+      const response = await executionPromise;
+      
+      // Remove from active requests and cache the result
+      activeRequests.delete(requestKey);
+      activeRequests.set(requestKey, response);
+      
+      // If handler returns a response object (not sent yet), filter fields and send
+      if (response && typeof response === 'object' && !response.__sent) {
+        try {
+          const filtered = filterResponseFields(response, fields);
+          // Use safe serialization to prevent circular reference errors
+          const safeResponse = safeStringify(filtered);
+          return res.json(safeResponse);
+        } catch (serializeError) {
+          log('error', `Failed to serialize response`, { 
+            warpId, 
+            error: serializeError.message,
+            originalResponse: safeStringify(response)
+          });
+          return res.status(500).json({ 
+            error: 'Internal server error: Failed to serialize response',
+            warpId 
+          });
+        }
+      }
+      // Otherwise, handler already sent response
+    } catch (error) {
+      // Remove from active requests on error
+      activeRequests.delete(requestKey);
+      throw error;
     }
-    // Otherwise, handler already sent response
   } catch (error) {
     // Sanitize error message to prevent PEM data from being included in logs or responses
     const sanitizedMessage = error.message ? 
@@ -1253,9 +1307,38 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     // 4. Get execution results from the confirmed transaction
     let execResult;
     try {
-      // Get transaction details from network for execution results
-      const txOnNetwork = await provider.getTransactionInfo(txHash);
-      execResult = await warpActionExecutor.getTransactionExecutionResults(warpInfo, 1, txOnNetwork);
+      // For SDK v15+, we need to get transaction details differently
+      // The getTransactionInfo method doesn't exist, so we'll use the API directly
+      const txDetailsUrl = `https://api.multiversx.com/transactions/${txHash}`;
+      const txDetailsResponse = await rateLimitedApiCall(txDetailsUrl, {
+        timeout: 10000,
+        headers: { 'User-Agent': 'WARPS-MakeX-Integration/1.0' }
+      });
+      
+      if (!txDetailsResponse.ok) {
+        throw new Error(`Failed to fetch transaction details: ${txDetailsResponse.statusText}`);
+      }
+      
+      const txOnNetwork = await txDetailsResponse.json();
+      
+      // Try to get execution results using the WARP executor
+      try {
+        execResult = await warpActionExecutor.getTransactionExecutionResults(warpInfo, 1, txOnNetwork);
+      } catch (execError) {
+        log('warn', `WARP executor failed to parse results, using basic success`, { 
+          warpId, 
+          txHash, 
+          error: execError.message 
+        });
+        
+        // If WARP executor fails, create a basic success result
+        execResult = {
+          success: true,
+          results: [],
+          messages: ['Transaction succeeded'],
+          next: null
+        };
+      }
     } catch (execError) {
       log('warn', `Failed to get execution results, but transaction succeeded`, { 
         warpId, 
@@ -1273,6 +1356,30 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     }
     
     log('info', `WARP execution completed`, { warpId, execResult });
+    
+    // Validate that the execution was truly successful
+    if (!execResult || !execResult.success) {
+      log('error', `Transaction execution failed despite blockchain success`, { 
+        warpId, 
+        txHash, 
+        execResult 
+      });
+      
+      const response = {
+        warpId,
+        warpHash: warpInfo.meta?.hash,
+        finalTxHash: txHash,
+        finalStatus: "fail",
+        message: "Transaction succeeded on blockchain but execution failed",
+        results: [],
+        messages: ["Transaction succeeded on blockchain but execution failed"],
+        next: null,
+        usageFeeHash: req.usageFeeHash || 'N/A'
+      };
+      
+      response.__sent = false;
+      return response;
+    }
     
     // Create a safe response object without circular references
     const response = {
