@@ -10,17 +10,6 @@ import fetch from 'node-fetch';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 
-// IMPORTANT: MultiversX SDK v15+ Compatibility Fix
-// The error "Cannot read properties of undefined (reading 'tokenTransfers')" was caused by
-// breaking changes in the MultiversX SDK v15+ where the transaction creation API changed.
-// This code now includes fallback methods to handle different API signatures and provides
-// detailed logging for debugging future SDK compatibility issues.
-//
-// Additional fixes implemented:
-// - Fixed userAddress.bech32() method calls (SDK v15+ compatibility)
-// - Added proper async/await handling for transaction creation methods
-// - Implemented manual transaction creation as fallback
-// - Added comprehensive validation and error handling
 
 // Load environment variables
 dotenv.config();
