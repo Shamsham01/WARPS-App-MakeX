@@ -42,9 +42,9 @@ if (!SECURE_TOKEN) {
 app.use(helmet());
 app.use(bodyParser.json());
 
-// Request timeout middleware (30 seconds)
+// Request timeout middleware (120 seconds for long-running transactions)
 app.use((req, res, next) => {
-  const timeout = 30000; // 30 seconds
+  const timeout = 120000; // 2 minutes
   req.setTimeout(timeout, () => {
     if (!res.headersSent) {
       log('warn', 'Request timeout', { 
@@ -908,7 +908,12 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     const { warpId, inputs, chain, cacheStrategy, cacheTTL, simulate, verbose, fields } = req.body;
     if (!warpId) throw new Error("Missing warpId in request body");
     
-    log('info', `Processing WARP execution request`, { warpId });
+    log('info', `Processing WARP execution request`, { 
+      warpId, 
+      inputs: inputs,
+      inputsType: typeof inputs,
+      timestamp: new Date().toISOString()
+    });
     const pemContent = getPemContent(req);
     const signer = UserSigner.fromPem(pemContent);
     const userAddressObj = signer.getAddress();
@@ -971,6 +976,14 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
         const filtered = filterResponseFields(response, fields);
         // Use safe serialization to prevent circular reference errors
         const safeResponse = safeStringify(filtered);
+        
+        log('info', `Sending successful response`, { 
+          warpId, 
+          finalStatus: response.finalStatus,
+          finalTxHash: response.finalTxHash,
+          responseSize: JSON.stringify(safeResponse).length
+        });
+        
         return res.json(safeResponse);
       } catch (serializeError) {
         log('error', `Failed to serialize response`, { 
@@ -979,6 +992,7 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
           originalResponse: safeStringify(response)
         });
         return res.status(500).json({ 
+          success: false,
           error: 'Internal server error: Failed to serialize response',
           warpId 
         });
@@ -1003,9 +1017,13 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     
     // Check if response has already been sent
     if (!res.headersSent) {
-      return res.status(400).json({ error: sanitizedMessage });
+      return res.status(500).json({ 
+        success: false,
+        error: sanitizedMessage,
+        warpId: req.body?.warpId
+      });
     } else {
-      log('warn', `Response already sent, cannot send error response`, { warpId });
+      log('warn', `Response already sent, cannot send error response`, { warpId: req.body?.warpId });
     }
   }
 });
