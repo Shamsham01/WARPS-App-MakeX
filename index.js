@@ -55,17 +55,26 @@ function log(level, message, data = {}) {
   if (data.pemContent) data.pemContent = '[REDACTED]';
   
   // Helper to convert BigInt and other non-serializable values
+  // JSON.stringify replacer function - receives (key, value) pairs
   const replacer = (key, value) => {
+    // Convert BigInt to string
     if (typeof value === 'bigint') {
       return value.toString();
     }
-    // Handle BigInt in nested objects
-    if (value && typeof value === 'object') {
+    // Handle objects that might contain BigInt values
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const sanitized = {};
       for (const k in value) {
-        if (typeof value[k] === 'bigint') {
-          value[k] = value[k].toString();
+        if (Object.prototype.hasOwnProperty.call(value, k)) {
+          const v = value[k];
+          if (typeof v === 'bigint') {
+            sanitized[k] = v.toString();
+          } else {
+            sanitized[k] = v;
+          }
         }
       }
+      return sanitized;
     }
     return value;
   };
