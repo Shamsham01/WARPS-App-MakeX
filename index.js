@@ -66,6 +66,77 @@ function log(level, message, data = {}) {
 // Note: WarpClient instances are created per-request with user wallet configuration
 // The MultiversX adapter handles wallet operations through the configured provider
 
+// Helper: Create a wallet provider wrapper for MultiversX adapter
+// The adapter expects a provider that can sign transactions, not just query the network
+// Based on MultiversX SDK patterns, we create a provider-like object
+function createMultiversXWalletProvider(pemContent, networkProvider) {
+  const signer = UserSigner.fromPem(pemContent);
+  
+  // Create a provider object that matches what the adapter expects
+  // The adapter likely checks for specific methods or properties
+  const walletProvider = {
+    // Core signing method - adapter likely checks for this
+    signTransactions: async (transactions) => {
+      if (!Array.isArray(transactions)) {
+        transactions = [transactions];
+      }
+      const signedTxs = [];
+      for (const tx of transactions) {
+        // Ensure transaction has nonce if not set
+        if (tx.nonce === undefined || tx.nonce === null) {
+          const account = await networkProvider.getAccount(tx.sender);
+          tx.nonce = account.nonce;
+        }
+        // Sign the transaction
+        const signature = await signer.sign(new TransactionComputer().computeBytesForSigning(tx));
+        tx.signature = signature;
+        signedTxs.push(tx);
+      }
+      return signedTxs;
+    },
+    
+    // Send transaction method
+    sendTransaction: async (transaction) => {
+      // If not signed, sign it first
+      if (!transaction.signature) {
+        if (transaction.nonce === undefined || transaction.nonce === null) {
+          const account = await networkProvider.getAccount(transaction.sender);
+          transaction.nonce = account.nonce;
+        }
+        transaction.signature = await signer.sign(new TransactionComputer().computeBytesForSigning(transaction));
+      }
+      return await networkProvider.sendTransaction(transaction);
+    },
+    
+    // Get account info
+    getAccount: async (address) => {
+      return await networkProvider.getAccount(address);
+    },
+    
+    // Get address
+    getAddress: () => {
+      return signer.getAddress();
+    },
+    
+    // Expose signer (adapter might check for this)
+    signer: signer,
+    
+    // Expose network provider
+    networkProvider: networkProvider,
+    
+    // Add a type identifier in case adapter checks for it
+    __type: 'MultiversXWalletProvider'
+  };
+  
+  // Set constructor name for better debugging
+  Object.defineProperty(walletProvider, 'constructor', {
+    value: { name: 'MultiversXWalletProvider' },
+    writable: false
+  });
+  
+  return walletProvider;
+}
+
 // Constants for usage fee
 const FIXED_USD_FEE = 0.03; // $0.03 fixed fee
 const REWARD_TOKEN = "REWARD-cf6eac";
@@ -710,18 +781,28 @@ function getWarpClientConfig(req, userAddress, pemContent) {
   }
   
   // V3 configuration structure
+  // The MultiversX adapter expects a wallet provider that can sign transactions
   const config = {
     env: env,
     currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
     user: {
       wallets: {
         multiversx: {
-          address: walletAddress,
-          provider: provider // Use the existing ProxyNetworkProvider
+          address: walletAddress
         }
       }
     }
   };
+  
+  // Create wallet provider if pemContent is available
+  // The adapter needs a provider that implements signTransactions and sendTransaction
+  if (pemContent) {
+    const walletProvider = createMultiversXWalletProvider(pemContent, provider);
+    config.user.wallets.multiversx.provider = walletProvider;
+    
+    // Also try setting signer directly in case the adapter checks for it
+    config.user.wallets.multiversx.signer = UserSigner.fromPem(pemContent);
+  }
   
   return config;
 }
