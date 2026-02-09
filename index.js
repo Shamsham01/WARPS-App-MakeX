@@ -649,13 +649,30 @@ app.post('/authorization', (req, res) => {
 
 // Helper: Validate WARP structure
 function validateWarp(warp, warpId) {
-  if (!warp || !Array.isArray(warp.actions) || warp.actions.length === 0) {
-    throw new Error(`Invalid WARP structure for ${warpId}: actions is missing or empty`);
+  // Enhanced validation with better error messages
+  if (!warp) {
+    throw new Error(`Invalid WARP structure for ${warpId}: warp object is null or undefined`);
+  }
+  
+  if (!Array.isArray(warp.actions)) {
+    log('error', `WARP structure validation failed`, {
+      warpId,
+      warpType: typeof warp,
+      warpKeys: Object.keys(warp),
+      hasActions: 'actions' in warp,
+      actionsType: typeof warp.actions,
+      warpString: JSON.stringify(warp).substring(0, 500)
+    });
+    throw new Error(`Invalid WARP structure for ${warpId}: actions is missing or not an array. Received: ${typeof warp.actions}`);
+  }
+  
+  if (warp.actions.length === 0) {
+    throw new Error(`Invalid WARP structure for ${warpId}: actions array is empty`);
   }
   
   const action = warp.actions[0];
   if (!action || (action.type !== 'contract' && action.type !== 'collect' && action.type !== 'query')) {
-    throw new Error(`WARP ${warpId} must have a valid action type (contract, collect, or query)`);
+    throw new Error(`WARP ${warpId} must have a valid action type (contract, collect, or query). Found: ${action?.type || 'undefined'}`);
   }
   
   return action;
@@ -731,11 +748,30 @@ async function fetchWarpInfo(warpId, req, userAddress, pemContent) {
   
   try {
     log('info', `Resolving WARP`, { warpId });
-    // V3: Use detectWarp method
-    const warp = await client.detectWarp(warpId);
-    if (!warp) {
+    // V3: Use detectWarp method - handle different response formats
+    let warpResult = await client.detectWarp(warpId);
+    if (!warpResult) {
       throw new Error(`Could not resolve ${warpId}: WARP not found`);
     }
+    
+    // Handle different response formats from V3 SDK
+    let warp;
+    if (warpResult.warp && Array.isArray(warpResult.warp.actions)) {
+      // Wrapped in result object: { match: true, warp: {...} }
+      warp = warpResult.warp;
+    } else if (Array.isArray(warpResult.actions)) {
+      // Direct warp object
+      warp = warpResult;
+    } else {
+      log('error', `Unexpected WARP response format in fetchWarpInfo`, {
+        warpId,
+        resultType: typeof warpResult,
+        resultKeys: Object.keys(warpResult || {}),
+        resultString: JSON.stringify(warpResult).substring(0, 500)
+      });
+      throw new Error(`Could not parse WARP structure for ${warpId}. Unexpected format.`);
+    }
+    
     log('info', `Resolved WARP hash`, { warpId, hash: warp.meta?.hash || 'unknown' });
     validateWarp(warp, warpId);
     return warp;
@@ -853,10 +889,43 @@ app.get('/warpRPC', checkToken, async (req, res) => {
     const client = new WarpClient(config, {
       chains: getAllMultiversxAdapters()
     });
-    const warp = await client.detectWarp(warpId);
-    if (!warp) {
+    
+    // V3: detectWarp might return the warp directly or wrapped in an object
+    let warpResult = await client.detectWarp(warpId);
+    
+    // Handle different response formats from V3 SDK
+    if (!warpResult) {
       throw new Error(`Could not resolve ${warpId}: WARP not found`);
     }
+    
+    // V3 detectWarp might return the warp directly or in a result object
+    let warp;
+    if (warpResult.warp && Array.isArray(warpResult.warp.actions)) {
+      // Wrapped in result object: { match: true, warp: {...} }
+      warp = warpResult.warp;
+    } else if (Array.isArray(warpResult.actions)) {
+      // Direct warp object
+      warp = warpResult;
+    } else {
+      // Unknown format - log for debugging
+      log('error', `Unexpected WARP response format`, {
+        warpId,
+        resultType: typeof warpResult,
+        resultKeys: Object.keys(warpResult || {}),
+        resultString: JSON.stringify(warpResult).substring(0, 500)
+      });
+      throw new Error(`Could not parse WARP structure for ${warpId}. Unexpected format.`);
+    }
+    
+    // Log the warp structure for debugging
+    log('info', `WARP structure received`, { 
+      warpId,
+      hasActions: Array.isArray(warp.actions),
+      actionsLength: warp.actions?.length || 0,
+      warpKeys: Object.keys(warp),
+      protocol: warp.protocol
+    });
+    
     validateWarp(warp, warpId);
     const action = warp.actions[0];
 
