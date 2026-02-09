@@ -66,75 +66,61 @@ function log(level, message, data = {}) {
 // Note: WarpClient instances are created per-request with user wallet configuration
 // The MultiversX adapter handles wallet operations through the configured provider
 
-// Helper: Create a wallet provider wrapper for MultiversX adapter
-// The adapter expects a provider that can sign transactions, not just query the network
-// Based on MultiversX SDK patterns, we create a provider-like object
+// Helper: Create a wallet provider class for MultiversX adapter
+// The adapter expects a provider that can sign transactions
+class MultiversXWalletProvider {
+  constructor(pemContent, networkProvider) {
+    this.signer = UserSigner.fromPem(pemContent);
+    this.networkProvider = networkProvider;
+  }
+  
+  // Sign one or more transactions
+  async signTransactions(transactions) {
+    if (!Array.isArray(transactions)) {
+      transactions = [transactions];
+    }
+    const signedTxs = [];
+    for (const tx of transactions) {
+      // Ensure transaction has nonce if not set
+      if (tx.nonce === undefined || tx.nonce === null) {
+        const account = await this.networkProvider.getAccount(tx.sender);
+        tx.nonce = account.nonce;
+      }
+      // Sign the transaction
+      const signature = await this.signer.sign(new TransactionComputer().computeBytesForSigning(tx));
+      tx.signature = signature;
+      signedTxs.push(tx);
+    }
+    return signedTxs;
+  }
+  
+  // Send a single transaction
+  async sendTransaction(transaction) {
+    // If not signed, sign it first
+    if (!transaction.signature) {
+      if (transaction.nonce === undefined || transaction.nonce === null) {
+        const account = await this.networkProvider.getAccount(transaction.sender);
+        transaction.nonce = account.nonce;
+      }
+      transaction.signature = await this.signer.sign(new TransactionComputer().computeBytesForSigning(transaction));
+    }
+    return await this.networkProvider.sendTransaction(transaction);
+  }
+  
+  // Get account info
+  async getAccount(address) {
+    return await this.networkProvider.getAccount(address);
+  }
+  
+  // Get address from signer
+  getAddress() {
+    return this.signer.getAddress();
+  }
+}
+
+// Helper function to create wallet provider instance
 function createMultiversXWalletProvider(pemContent, networkProvider) {
-  const signer = UserSigner.fromPem(pemContent);
-  
-  // Create a provider object that matches what the adapter expects
-  // The adapter likely checks for specific methods or properties
-  const walletProvider = {
-    // Core signing method - adapter likely checks for this
-    signTransactions: async (transactions) => {
-      if (!Array.isArray(transactions)) {
-        transactions = [transactions];
-      }
-      const signedTxs = [];
-      for (const tx of transactions) {
-        // Ensure transaction has nonce if not set
-        if (tx.nonce === undefined || tx.nonce === null) {
-          const account = await networkProvider.getAccount(tx.sender);
-          tx.nonce = account.nonce;
-        }
-        // Sign the transaction
-        const signature = await signer.sign(new TransactionComputer().computeBytesForSigning(tx));
-        tx.signature = signature;
-        signedTxs.push(tx);
-      }
-      return signedTxs;
-    },
-    
-    // Send transaction method
-    sendTransaction: async (transaction) => {
-      // If not signed, sign it first
-      if (!transaction.signature) {
-        if (transaction.nonce === undefined || transaction.nonce === null) {
-          const account = await networkProvider.getAccount(transaction.sender);
-          transaction.nonce = account.nonce;
-        }
-        transaction.signature = await signer.sign(new TransactionComputer().computeBytesForSigning(transaction));
-      }
-      return await networkProvider.sendTransaction(transaction);
-    },
-    
-    // Get account info
-    getAccount: async (address) => {
-      return await networkProvider.getAccount(address);
-    },
-    
-    // Get address
-    getAddress: () => {
-      return signer.getAddress();
-    },
-    
-    // Expose signer (adapter might check for this)
-    signer: signer,
-    
-    // Expose network provider
-    networkProvider: networkProvider,
-    
-    // Add a type identifier in case adapter checks for it
-    __type: 'MultiversXWalletProvider'
-  };
-  
-  // Set constructor name for better debugging
-  Object.defineProperty(walletProvider, 'constructor', {
-    value: { name: 'MultiversXWalletProvider' },
-    writable: false
-  });
-  
-  return walletProvider;
+  return new MultiversXWalletProvider(pemContent, networkProvider);
 }
 
 // Constants for usage fee
