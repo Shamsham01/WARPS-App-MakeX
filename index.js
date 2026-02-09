@@ -54,27 +54,12 @@ function log(level, message, data = {}) {
   if (data.walletPem) data.walletPem = '[REDACTED]';
   if (data.pemContent) data.pemContent = '[REDACTED]';
   
-  // Helper to convert BigInt and other non-serializable values
-  // JSON.stringify replacer function - receives (key, value) pairs
+  // Helper to convert BigInt to string for JSON serialization
+  // JSON.stringify replacer is called recursively for each value
   const replacer = (key, value) => {
-    // Convert BigInt to string
+    // Convert BigInt to string - JSON.stringify will call this for each BigInt value
     if (typeof value === 'bigint') {
       return value.toString();
-    }
-    // Handle objects that might contain BigInt values
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      const sanitized = {};
-      for (const k in value) {
-        if (Object.prototype.hasOwnProperty.call(value, k)) {
-          const v = value[k];
-          if (typeof v === 'bigint') {
-            sanitized[k] = v.toString();
-          } else {
-            sanitized[k] = v;
-          }
-        }
-      }
-      return sanitized;
     }
     return value;
   };
