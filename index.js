@@ -1114,14 +1114,16 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
     // If handler returns a response object (not sent yet), filter fields and send
     if (response && typeof response === 'object' && !response.__sent) {
       try {
-        const filtered = filterResponseFields(response, fields);
+        // Remove internal flags before sending
+        const { __sent, ...cleanResponse } = response;
+        const filtered = filterResponseFields(cleanResponse, fields);
         // Use safe serialization to prevent circular reference errors
         const safeResponse = safeStringify(filtered);
         
         log('info', `Sending successful response`, { 
           warpId, 
-          finalStatus: response.finalStatus,
-          finalTxHash: response.finalTxHash,
+          finalStatus: cleanResponse.finalStatus,
+          finalTxHash: cleanResponse.finalTxHash,
           responseSize: JSON.stringify(safeResponse).length
         });
         
