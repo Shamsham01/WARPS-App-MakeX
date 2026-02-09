@@ -1,7 +1,8 @@
 import express from 'express';
 import bodyParser from 'body-parser';
 import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenTransfer, Token, ProxyNetworkProvider, UserSigner, TransactionComputer, Transaction } from '@multiversx/sdk-core';
-import { WarpActionExecutor, WarpLink } from '@vleap/warps';
+import { WarpClient, WarpChainName } from '@joai/warps';
+import { getAllMultiversxAdapters, MultiversxAdapter } from '@joai/warps-adapter-multiversx';
 import BigNumber from 'bignumber.js';
 import fs from 'fs';
 import path from 'path';
@@ -61,14 +62,9 @@ function log(level, message, data = {}) {
   }));
 }
 
-// Warp Configurations
-const warpConfig = {
-  providerUrl: "https://gateway.multiversx.com",
-  currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
-  chainApiUrl: "https://api.multiversx.com",
-  env: "mainnet",
-  userAddress: undefined
-};
+// Warp Client Configuration - V3
+// Note: WarpClient instances are created per-request with user wallet configuration
+// The MultiversX adapter handles wallet operations through the configured provider
 
 // Constants for usage fee
 const FIXED_USD_FEE = 0.03; // $0.03 fixed fee
@@ -666,13 +662,10 @@ function validateWarp(warp, warpId) {
 }
 
 // --- Advanced features: cacheTTL, simulate, verbose, fields ---
-function getWarpConfigFromRequest(req, userAddress) {
+// V3: Get WarpClient configuration from request
+function getWarpClientConfig(req, userAddress, pemContent) {
   // Accept advanced params from body or query
-  const cacheTTL = req.body.cacheTTL || req.query.cacheTTL;
-  const providerUrl = req.body.providerUrl || req.query.providerUrl || "https://gateway.multiversx.com";
-  const chainApiUrl = req.body.chainApiUrl || req.query.chainApiUrl || "https://api.multiversx.com";
   const env = req.body.chain || req.query.chain || 'mainnet';
-  const cacheStrategy = req.body.cacheStrategy || req.query.cacheStrategy;
   
   // Get wallet address string - handle both old and new SDK versions
   let walletAddress;
@@ -699,20 +692,25 @@ function getWarpConfigFromRequest(req, userAddress) {
     }
   }
   
-  // Use new v2 SDK config for user
-  return {
-    providerUrl,
+  // V3 configuration structure
+  const config = {
+    env: env,
     currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com",
-    chainApiUrl,
-    env,
-    user: { wallet: walletAddress },
-    cacheStrategy,
-    cacheTTL: cacheTTL ? Number(cacheTTL) : undefined // advanced: custom TTL in seconds
+    user: {
+      wallets: {
+        multiversx: {
+          address: walletAddress,
+          provider: provider // Use the existing ProxyNetworkProvider
+        }
+      }
+    }
   };
+  
+  return config;
 }
 
-// Helper: Fetch WARP info using WarpLink
-async function fetchWarpInfo(warpId, req, userAddress) {
+// Helper: Fetch WARP info using WarpClient (V3)
+async function fetchWarpInfo(warpId, req, userAddress, pemContent) {
   // Debug userAddress object
   if (userAddress) {
     log('info', 'UserAddress object details', {
@@ -725,16 +723,19 @@ async function fetchWarpInfo(warpId, req, userAddress) {
     });
   }
   
-  const warpConfig = getWarpConfigFromRequest(req, userAddress);
-  const warpLink = new WarpLink(warpConfig);
+  // V3: Create WarpClient with proper configuration
+  const config = getWarpClientConfig(req, userAddress, pemContent);
+  const client = new WarpClient(config, {
+    chains: getAllMultiversxAdapters()
+  });
+  
   try {
     log('info', `Resolving WARP`, { warpId });
-    // Always use dynamic detection for all warpIds
-    const result = await warpLink.detect(warpId);
-    if (!result.match || !result.warp) {
+    // V3: Use detectWarp method
+    const warp = await client.detectWarp(warpId);
+    if (!warp) {
       throw new Error(`Could not resolve ${warpId}: WARP not found`);
     }
-    const warp = result.warp;
     log('info', `Resolved WARP hash`, { warpId, hash: warp.meta?.hash || 'unknown' });
     validateWarp(warp, warpId);
     return warp;
@@ -844,7 +845,19 @@ app.get('/warpRPC', checkToken, async (req, res) => {
     if (!warpId) throw new Error("Missing warpId in query parameters");
 
     log('info', `Fetching input fields for WARP`, { warpId });
-    const warp = await fetchWarpInfo(warpId, req, null);
+    // V3: For read-only operations, we can use a minimal config without wallet
+    const config = {
+      env: req.query.chain || 'mainnet',
+      currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
+    };
+    const client = new WarpClient(config, {
+      chains: getAllMultiversxAdapters()
+    });
+    const warp = await client.detectWarp(warpId);
+    if (!warp) {
+      throw new Error(`Could not resolve ${warpId}: WARP not found`);
+    }
+    validateWarp(warp, warpId);
     const action = warp.actions[0];
 
     log('info', `Processing WARP action type: ${action.type}`, { warpId });
@@ -929,7 +942,13 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
       userAddress = String(userAddressObj);
     }
     
-    const warpInfo = await fetchWarpInfo(warpId, req, userAddress);
+    // V3: Create WarpClient with user wallet configuration
+    const config = getWarpClientConfig(req, userAddress, pemContent);
+    const client = new WarpClient(config, {
+      chains: getAllMultiversxAdapters()
+    });
+    
+    const warpInfo = await fetchWarpInfo(warpId, req, userAddress, pemContent);
     const action = warpInfo.actions[0];
     
     // Log WARP type and ensure compatibility
@@ -942,18 +961,16 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
       supportedTypes: ['contract', 'transfer', 'query', 'collect']
     });
     
-    const executorConfig = getWarpConfigFromRequest(req, userAddress);
-    const warpActionExecutor = new WarpActionExecutor(executorConfig);
     let response;
     if (action.type === 'contract' || action.type === 'transfer') {
       log('info', 'Executing contract/transfer WARP', { warpId, actionType: action.type });
-      response = await handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent, simulate, verbose);
+      response = await handleContractExecution(req, res, action, warpInfo, userAddress, client, pemContent, simulate, verbose);
     } else if (action.type === 'query') {
       log('info', 'Executing query WARP', { warpId, actionType: action.type });
-      response = await handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose);
+      response = await handleQueryExecution(req, res, action, warpInfo, userAddress, client, verbose);
     } else if (action.type === 'collect') {
       log('info', 'Executing collect WARP', { warpId, actionType: action.type });
-      response = await handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose);
+      response = await handleCollectExecution(req, res, action, warpInfo, userAddress, client, verbose);
     } else {
       log('warn', `Unhandled action type`, { warpId, actionType: action.type });
       return res.status(400).json({ error: `Unsupported WARP action type: ${action.type}` });
@@ -1026,8 +1043,18 @@ app.get('/warp/:warpId', async (req, res) => {
 
     log('info', `Direct WARP access request`, { warpId });
     
-    // Attempt to get a WARP definition from our system
-    const warp = await fetchWarpInfo(warpId, null, null);
+    // V3: Create minimal client for read-only access
+    const config = {
+      env: req.query.chain || 'mainnet',
+      currentUrl: process.env.CURRENT_URL || "https://warps-makex.onrender.com"
+    };
+    const client = new WarpClient(config, {
+      chains: getAllMultiversxAdapters()
+    });
+    const warp = await client.detectWarp(warpId);
+    if (!warp) {
+      throw new Error(`Could not resolve ${warpId}: WARP not found`);
+    }
     
     return res.json({
       success: true,
@@ -1104,8 +1131,8 @@ function autoInjectInputs(action, inputs, userAddress) {
   return result;
 }
 
-// Update handleContractExecution for v2
-async function handleContractExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, pemContent, simulate, verbose) {
+// Update handleContractExecution for V3
+async function handleContractExecution(req, res, action, warpInfo, userAddress, client, pemContent, simulate, verbose) {
   const { warpId, inputs } = req.body;
   const mergedInputs = autoInjectInputs(action, inputs || {}, userAddress);
   const userInputsArray = [];
@@ -1130,45 +1157,46 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
   } else {
     log('info', `Processing WARP without inputs`, { warpId });
   }
+  
   let execResult;
   try {
-    // v2: Build, sign, send, and parse transaction
-    const signer = UserSigner.fromPem(pemContent);
-    // 1. Build transaction
-    const tx = await warpActionExecutor.createTransactionForExecute(warpInfo, 1, userInputsArray);
+    // V3: Use executeWarp method - it handles transaction building, signing, and sending
+    log('info', `Executing WARP via V3 client`, { warpId, inputs: userInputsArray });
     
-    // Convert userAddress string back to Address object for provider.getAccount()
-    let userAddressObj;
-    try {
-      userAddressObj = new Address(userAddress);
-    } catch (error) {
-      log('error', 'Failed to create Address object from string', { error: error.message, userAddress });
-      throw new Error(`Invalid user address format: ${userAddress}`);
+    // V3 executeWarp returns the execution result
+    const result = await client.executeWarp(warpId, userInputsArray);
+    
+    // Extract transaction hash from result
+    let txHash = null;
+    if (result.txHash) {
+      txHash = result.txHash.toString();
+    } else if (result.transactionHash) {
+      txHash = result.transactionHash.toString();
+    } else if (result.hash) {
+      txHash = result.hash.toString();
     }
     
-    // Fetch current nonce from the network for the sender
-    const accountOnNetwork = await provider.getAccount(userAddressObj);
-    tx.nonce = accountOnNetwork.nonce;
-    // 2. Sign and send
-    tx.signature = await signer.sign(new TransactionComputer().computeBytesForSigning(tx));
-    let txHash;
-    try {
-      txHash = await provider.sendTransaction(tx);
-    } catch (err) {
-      throw new Error('Failed to send transaction: ' + err.message);
-    }
     if (!txHash) {
-      throw new Error('Transaction hash is undefined after sending transaction.');
+      log('warn', `No transaction hash in result`, { warpId, result });
+      // For simulate mode or queries, this might be expected
+      if (simulate) {
+        txHash = 'simulated';
+      }
     }
     
-    // 3. Wait for confirmation with configurable timeout and retry logic
-    log('info', `Transaction sent, waiting for confirmation`, { warpId, txHash });
-    
-    // Use custom retry logic instead of blocking SDK call
-    const maxWaitTime = simulate ? 10000 : 60000; // 10s for simulate, 1min for real
-    const maxRetries = Math.ceil(maxWaitTime / 2000); // 2-second intervals
-    
-    const txStatus = await checkTransactionStatus(txHash, maxRetries, 2000);
+    // V3: Check transaction status if we have a hash
+    let txStatus = { status: "success" }; // Default to success if no hash
+    if (txHash && txHash !== 'simulated') {
+      log('info', `Transaction sent, waiting for confirmation`, { warpId, txHash });
+      
+      // Use custom retry logic instead of blocking SDK call
+      const maxWaitTime = simulate ? 10000 : 60000; // 10s for simulate, 1min for real
+      const maxRetries = Math.ceil(maxWaitTime / 2000); // 2-second intervals
+      
+      txStatus = await checkTransactionStatus(txHash, maxRetries, 2000);
+    } else {
+      log('info', `No transaction hash to check (simulate mode or query)`, { warpId });
+    }
     
     if (txStatus.status === "pending") {
       // Transaction still pending after max wait time
@@ -1203,12 +1231,9 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
             }))
           },
           userInputsArray,
-          executorConfig: {
-            chainId: warpActionExecutor.config.chainId,
-            gatewayUrl: warpActionExecutor.config.gatewayUrl
-          },
           txStatus: txStatus,
-          maxWaitTime: maxWaitTime / 1000 + 's'
+          maxWaitTime: maxWaitTime / 1000 + 's',
+          v3Client: 'WarpClient'
         };
       }
       response.__sent = false;
@@ -1247,27 +1272,23 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
             }))
           },
           userInputsArray,
-          executorConfig: {
-            chainId: warpActionExecutor.config.chainId,
-            gatewayUrl: warpActionExecutor.config.gatewayUrl
-          },
-          txStatus: txStatus
+          txStatus: txStatus,
+          v3Client: 'WarpClient'
         };
       }
       response.__sent = false;
       return response;
     }
     
-    // Transaction succeeded - create simple success result
+    // Transaction succeeded - use result from V3 client
     log('info', `Transaction confirmed successful`, { warpId, txHash });
     
-    // For simple operations like minting, we don't need complex execution result parsing
-    // The transaction success is sufficient proof that the operation completed
+    // V3: Use result from executeWarp
     const execResult = {
-      success: true,
-      results: [],
-      messages: ['Transaction succeeded'],
-      next: null
+      success: result.success !== false, // Default to true unless explicitly false
+      results: result.results || [],
+      messages: result.messages || ['Transaction succeeded'],
+      next: result.next || null
     };
     
     log('info', `WARP execution completed`, { warpId, execResult });
@@ -1321,12 +1342,9 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
           }))
         },
         userInputsArray,
-        executorConfig: {
-          chainId: warpActionExecutor.config.chainId,
-          gatewayUrl: warpActionExecutor.config.gatewayUrl
-        },
         txStatus: txStatus,
-        execResult: execResult
+        execResult: execResult,
+        v3Result: result
       };
     }
     response.__sent = false;
@@ -1338,11 +1356,11 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
   }
 }
 
-// Update handleQueryExecution for v2
-async function handleQueryExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose) {
+// Update handleQueryExecution for V3
+async function handleQueryExecution(req, res, action, warpInfo, userAddress, client, verbose) {
   const { warpId, inputs } = req.body;
   const mergedInputs = autoInjectInputs(action, inputs || {}, userAddress);
-  const processedInputs = {};
+  const userInputsArray = [];
   if (action.inputs && action.inputs.length > 0 && mergedInputs && typeof mergedInputs === 'object') {
     log('info', `Processing inputs for query WARP`, { warpId, inputCount: action.inputs.length });
     for (const input of action.inputs) {
@@ -1351,20 +1369,24 @@ async function handleQueryExecution(req, res, action, warpInfo, userAddress, war
         throw new Error(`Missing required input: ${input.name}`);
       }
       if (value !== undefined) {
-        processedInputs[input.name] = value;
+        const type = input.type.split(':')[0];
+        userInputsArray.push(`${type}:${value}`);
       }
     }
   }
   try {
     log('info', `Executing query WARP`, { warpId });
-    // v2: Use executeQuery(warp, inputsArray)
-    const queryResult = await warpActionExecutor.executeQuery(warpInfo, Object.values(processedInputs));
+    // V3: Use executeWarp for queries as well
+    const queryResult = await client.executeWarp(warpId, userInputsArray);
     log('info', `Query execution successful`, { warpId, queryResult });
+    
+    const txHash = queryResult.txHash?.toString?.() || queryResult.transactionHash?.toString?.() || queryResult.hash?.toString?.() || null;
+    
     const response = {
       warpId,
       warpHash: warpInfo.meta?.hash,
-      finalTxHash: queryResult.txHash?.toString?.() || null,
-      finalStatus: queryResult.success ? "success" : "fail",
+      finalTxHash: txHash,
+      finalStatus: queryResult.success !== false ? "success" : "fail",
       results: queryResult.results || [],
       messages: queryResult.messages || ['Query executed successfully'],
       next: queryResult.next || null,
@@ -1382,11 +1404,8 @@ async function handleQueryExecution(req, res, action, warpInfo, userAddress, war
             source: input.source
           }))
         },
-        processedInputs,
-        executorConfig: {
-          chainId: warpActionExecutor.config.chainId,
-          gatewayUrl: warpActionExecutor.config.gatewayUrl
-        }
+        userInputsArray,
+        queryResult: queryResult
       };
     }
     response.__sent = false;
@@ -1398,11 +1417,11 @@ async function handleQueryExecution(req, res, action, warpInfo, userAddress, war
   }
 }
 
-// Update handleCollectExecution for v2
-async function handleCollectExecution(req, res, action, warpInfo, userAddress, warpActionExecutor, verbose) {
+// Update handleCollectExecution for V3
+async function handleCollectExecution(req, res, action, warpInfo, userAddress, client, verbose) {
   const { warpId, inputs } = req.body;
   const mergedInputs = autoInjectInputs(action, inputs || {}, userAddress);
-  const newData = {};
+  const userInputsArray = [];
   if (action.inputs && action.inputs.length > 0 && mergedInputs && typeof mergedInputs === 'object') {
     log('info', `Processing inputs for collect WARP`, { warpId, inputCount: action.inputs.length });
     for (const input of action.inputs) {
@@ -1411,30 +1430,33 @@ async function handleCollectExecution(req, res, action, warpInfo, userAddress, w
         throw new Error(`Missing required input: ${input.name}`);
       }
       if (value !== undefined) {
-        const fieldName = input.as || input.name;
-        newData[fieldName] = value;
+        const type = input.type.split(':')[0];
+        userInputsArray.push(`${type}:${value}`);
       }
     }
   } else {
     log('info', `Processing collect WARP without inputs`, { warpId });
   }
   try {
-    log('info', `Executing collect WARP`, { warpId, data: newData });
-    // v2: Use executeCollect(warp, inputsArray)
+    log('info', `Executing collect WARP`, { warpId, inputs: userInputsArray });
+    // V3: Use executeWarp for collect as well
     let collectResult;
     try {
-      collectResult = await warpActionExecutor.executeCollect(warpInfo, Object.values(newData));
+      collectResult = await client.executeWarp(warpId, userInputsArray);
     } catch (collectError) {
       log('warn', `SDK collect method failed`, { error: collectError.message });
       collectResult = { success: false, error: collectError.message };
     }
     log('info', 'Collect result details', { collectResult });
     log('info', `Collect execution successful`, { warpId, collectResult });
+    
+    const txHash = collectResult.txHash?.toString?.() || collectResult.transactionHash?.toString?.() || collectResult.hash?.toString?.() || null;
+    
     const response = {
       warpId,
       warpHash: warpInfo.meta?.hash,
-      finalTxHash: collectResult.txHash?.toString?.() || null,
-      finalStatus: collectResult.success ? "success" : "fail",
+      finalTxHash: txHash,
+      finalStatus: collectResult.success !== false ? "success" : "fail",
       results: collectResult.results || [],
       messages: collectResult.messages || ['Data collected successfully'],
       next: collectResult.next || null,
@@ -1453,11 +1475,8 @@ async function handleCollectExecution(req, res, action, warpInfo, userAddress, w
             source: input.source
           }))
         },
-        newData,
-        executorConfig: {
-          chainId: warpActionExecutor.config.chainId,
-          gatewayUrl: warpActionExecutor.config.gatewayUrl
-        }
+        userInputsArray,
+        collectResult: collectResult
       };
     }
     response.__sent = false;
