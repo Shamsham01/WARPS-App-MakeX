@@ -1297,20 +1297,72 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
   
   let execResult;
   try {
-    // V3: Use executeWarp method - it handles transaction building, signing, and sending
+    // V3: Use executeWarp method - it returns transactions that need to be signed and sent
     log('info', `Executing WARP via V3 client`, { warpId, inputs: userInputsArray });
     
-    // V3 executeWarp returns the execution result
+    // V3 executeWarp returns transactions in result.txs that need to be signed and sent
     const result = await client.executeWarp(warpId, userInputsArray);
     
-    // Extract transaction hash from result
+    // V3: Handle transactions - sign and send them
+    // According to V3 docs: result.txs contains transactions, result.chain contains chain info
     let txHash = null;
-    if (result.txHash) {
+    if (result.txs && Array.isArray(result.txs) && result.txs.length > 0 && result.chain) {
+      log('info', `Signing and sending ${result.txs.length} transaction(s)`, { 
+        warpId, 
+        chain: result.chain.name,
+        chainDisplayName: result.chain.displayName
+      });
+      
+      try {
+        // Get wallet for the chain
+        const wallet = client.getWallet(result.chain.name);
+        if (!wallet) {
+          throw new Error(`No wallet available for chain: ${result.chain.name}. Check wallet configuration.`);
+        }
+        
+        log('info', `Wallet obtained for chain`, { 
+          warpId, 
+          chain: result.chain.name,
+          walletType: wallet.constructor?.name || typeof wallet
+        });
+        
+        // Sign transactions
+        const signedTxs = await wallet.signTransactions(result.txs);
+        log('info', `Transactions signed successfully`, { warpId, count: signedTxs.length });
+        
+        // Send transactions and get hashes
+        const hashes = await Promise.all(
+          signedTxs.map(tx => wallet.sendTransaction(tx))
+        );
+        
+        // Use the first transaction hash (or combine if multiple)
+        txHash = hashes[0]?.toString() || (hashes.length > 0 ? hashes.map(h => h.toString()).join(',') : null);
+        
+        log('info', `Transactions sent successfully`, { 
+          warpId, 
+          txHash, 
+          hashCount: hashes.length,
+          hashes: hashes.map(h => h.toString())
+        });
+      } catch (walletError) {
+        log('error', `Error signing/sending transactions`, { 
+          warpId, 
+          error: walletError.message,
+          chain: result.chain.name,
+          stack: walletError.stack
+        });
+        throw new Error(`Failed to sign and send transactions: ${walletError.message}`);
+      }
+    } else if (result.txHash) {
+      // Fallback: check if hash is already in result (for queries/collect)
       txHash = result.txHash.toString();
+      log('info', `Transaction hash found in result`, { warpId, txHash });
     } else if (result.transactionHash) {
       txHash = result.transactionHash.toString();
+      log('info', `Transaction hash found in result (transactionHash)`, { warpId, txHash });
     } else if (result.hash) {
       txHash = result.hash.toString();
+      log('info', `Transaction hash found in result (hash)`, { warpId, txHash });
     }
     
     if (!txHash) {
@@ -1320,6 +1372,13 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
       // For simulate mode or queries, this might be expected
       if (simulate) {
         txHash = 'simulated';
+        log('info', `Simulate mode - no real transaction`, { warpId });
+      } else if (!result.txs || result.txs.length === 0) {
+        // No transactions to execute (might be a query or collect)
+        log('info', `No transactions to execute (query/collect operation)`, { warpId });
+        txHash = null; // This is OK for queries/collect
+      } else {
+        throw new Error('Transactions were returned but could not be sent. Check wallet configuration.');
       }
     }
     
