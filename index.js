@@ -54,12 +54,39 @@ function log(level, message, data = {}) {
   if (data.walletPem) data.walletPem = '[REDACTED]';
   if (data.pemContent) data.pemContent = '[REDACTED]';
   
-  console.log(JSON.stringify({
-    timestamp: new Date().toISOString(),
-    level,
-    message,
-    ...data
-  }));
+  // Helper to convert BigInt and other non-serializable values
+  const replacer = (key, value) => {
+    if (typeof value === 'bigint') {
+      return value.toString();
+    }
+    // Handle BigInt in nested objects
+    if (value && typeof value === 'object') {
+      for (const k in value) {
+        if (typeof value[k] === 'bigint') {
+          value[k] = value[k].toString();
+        }
+      }
+    }
+    return value;
+  };
+  
+  try {
+    console.log(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level,
+      message,
+      ...data
+    }, replacer));
+  } catch (error) {
+    // Fallback: try to serialize with safeStringify if JSON.stringify fails
+    console.log(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level,
+      message,
+      error: 'Failed to serialize log data',
+      originalError: error.message
+    }));
+  }
 }
 
 // Warp Client Configuration - V3
@@ -823,6 +850,37 @@ function filterResponseFields(response, fields) {
   return filtered;
 }
 
+// Helper: Sanitize objects for logging (convert BigInt to string, handle circular refs)
+function sanitizeForLogging(obj, maxDepth = 3) {
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj === 'bigint') return obj.toString();
+  if (typeof obj !== 'object') return obj;
+  if (maxDepth <= 0) return '[Max Depth]';
+  
+  if (Array.isArray(obj)) {
+    return obj.map(item => sanitizeForLogging(item, maxDepth - 1));
+  }
+  
+  const sanitized = {};
+  for (const key in obj) {
+    if (Object.prototype.hasOwnProperty.call(obj, key)) {
+      try {
+        const value = obj[key];
+        if (typeof value === 'bigint') {
+          sanitized[key] = value.toString();
+        } else if (value && typeof value === 'object') {
+          sanitized[key] = sanitizeForLogging(value, maxDepth - 1);
+        } else {
+          sanitized[key] = value;
+        }
+      } catch (e) {
+        sanitized[key] = '[Error serializing]';
+      }
+    }
+  }
+  return sanitized;
+}
+
 // Utility function to safely serialize objects and prevent circular reference errors
 function safeStringify(obj, maxDepth = 3) {
   const seen = new WeakSet();
@@ -1260,7 +1318,9 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
     }
     
     if (!txHash) {
-      log('warn', `No transaction hash in result`, { warpId, result });
+      // Sanitize result before logging to avoid BigInt serialization issues
+      const sanitizedResult = sanitizeForLogging(result);
+      log('warn', `No transaction hash in result`, { warpId, result: sanitizedResult });
       // For simulate mode or queries, this might be expected
       if (simulate) {
         txHash = 'simulated';
