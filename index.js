@@ -4,12 +4,10 @@ import { Address, TransactionsFactoryConfig, TransferTransactionsFactory, TokenT
 import { WarpClient, WarpChainName } from '@joai/warps';
 import { getAllMultiversxAdapters, MultiversxAdapter } from '@joai/warps-adapter-multiversx';
 import BigNumber from 'bignumber.js';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import fetch from 'node-fetch';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
+import { createClient } from '@supabase/supabase-js';
 
 
 // Load environment variables
@@ -20,7 +18,20 @@ const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { cl
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const SECURE_TOKEN = process.env.SECURE_TOKEN;
+let SECURE_TOKEN = process.env.SECURE_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables');
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false
+  }
+});
 
 // Verify security-critical environment variables
 if (!SECURE_TOKEN) {
@@ -95,9 +106,11 @@ function log(level, message, data = {}) {
 const FIXED_USD_FEE = 0.03; // $0.03 fixed fee
 const REWARD_TOKEN = "REWARD-cf6eac";
 const TREASURY_WALLET = "erd1t2r97zcjg8uvf0e9nk4psj2kvg27mph9kq5xls6xtnyg2aemp8hszcmn8f";
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const whitelistFilePath = path.join(__dirname, 'whitelist.json');
+const WHITELIST_TABLE = 'makex_usage_fee_whitelist';
+const WHITELIST_STATUS = {
+  VALID: 'valid',
+  EXPIRED: 'expired'
+};
 
 // In-memory store for tracking pending transactions
 const pendingUsageFeeTransactions = new Map();
@@ -168,28 +181,60 @@ const convertAmountToBlockchainValue = (amount, decimals) => {
   return new BigNumber(amount).multipliedBy(factor).toFixed(0);
 };
 
-// Helper: Load whitelist from file
-const loadWhitelist = () => {
-  try {
-    if (!fs.existsSync(whitelistFilePath)) {
-      log('warn', 'Whitelist file not found, creating empty whitelist');
-      fs.writeFileSync(whitelistFilePath, JSON.stringify([], null, 2));
-      return [];
-    }
-    const data = fs.readFileSync(whitelistFilePath);
-    const whitelist = JSON.parse(data);
-    log('info', `Loaded whitelist with ${whitelist.length} entries`);
-    return whitelist;
-  } catch (error) {
-    log('error', 'Error loading whitelist', { error: error.message });
-    return []; // Return empty array as fallback
+// Helper: Compute status from whitelist_end timestamp
+const deriveWhitelistStatus = (whitelistEnd) => {
+  const whitelistEndDate = new Date(whitelistEnd);
+  if (Number.isNaN(whitelistEndDate.getTime())) {
+    return WHITELIST_STATUS.EXPIRED;
   }
+  return whitelistEndDate.getTime() > Date.now() ? WHITELIST_STATUS.VALID : WHITELIST_STATUS.EXPIRED;
 };
 
-// Helper: Check if wallet is whitelisted
-const isWhitelisted = (walletAddress) => {
-  const whitelist = loadWhitelist();
-  return whitelist.some(entry => entry.walletAddress === walletAddress);
+// Helper: Load whitelist entry from Supabase and ensure status is synchronized
+const getWhitelistEligibility = async (walletAddress) => {
+  const { data: entry, error } = await supabase
+    .from(WHITELIST_TABLE)
+    .select('id, wallet_address, name, email, whitelist_start, whitelist_end, status')
+    .eq('wallet_address', walletAddress)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Failed to load whitelist entry: ${error.message}`);
+  }
+
+  if (!entry) {
+    return { skipUsageFee: false, reason: 'not_whitelisted' };
+  }
+
+  const computedStatus = deriveWhitelistStatus(entry.whitelist_end);
+  let currentEntry = entry;
+
+  if (entry.status !== computedStatus) {
+    const { data: updatedEntry, error: updateError } = await supabase
+      .from(WHITELIST_TABLE)
+      .update({ status: computedStatus })
+      .eq('id', entry.id)
+      .select('id, wallet_address, name, email, whitelist_start, whitelist_end, status')
+      .single();
+
+    if (updateError) {
+      throw new Error(`Failed to update whitelist status: ${updateError.message}`);
+    }
+
+    currentEntry = updatedEntry;
+    log('info', 'Whitelist status updated from whitelistEnd', {
+      walletAddress,
+      previousStatus: entry.status,
+      updatedStatus: computedStatus,
+      whitelistEnd: entry.whitelist_end
+    });
+  }
+
+  return {
+    skipUsageFee: currentEntry.status === WHITELIST_STATUS.VALID,
+    reason: currentEntry.status === WHITELIST_STATUS.VALID ? 'valid' : 'expired',
+    entry: currentEntry
+  };
 };
 
 // Helper: Fetch REWARD token price from MultiversX API
@@ -644,10 +689,18 @@ const handleUsageFee = async (req, res, next) => {
   try {
     const pemContent = getPemContent(req);
     const walletAddress = UserSigner.fromPem(pemContent).getAddress().toString();
+    const whitelistEligibility = await getWhitelistEligibility(walletAddress);
 
-    if (isWhitelisted(walletAddress)) {
-      log('info', `Skipping usage fee for whitelisted wallet`, { walletAddress });
+    if (whitelistEligibility.skipUsageFee) {
+      log('info', `Skipping usage fee for whitelisted wallet`, {
+        walletAddress,
+        status: whitelistEligibility.reason
+      });
       return next();
+    }
+
+    if (whitelistEligibility.reason === 'expired') {
+      log('info', 'Whitelist entry expired, charging usage fee', { walletAddress });
     }
 
     const txHash = await sendUsageFee(pemContent, walletAddress);
