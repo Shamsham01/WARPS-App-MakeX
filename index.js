@@ -8,6 +8,18 @@ import fetch from 'node-fetch';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
+import {
+  checkTransactionStatus,
+  fetchAccountEsdtBalanceWei,
+  buildInsufficientRewardResponse,
+  insufficientRewardBalance,
+  isLikelyInsufficientRewardFailure,
+  USAGE_FEE_TOPUP_USER_MESSAGE,
+  sanitizeObjectForLog,
+  redactPemFromString,
+  buildAuthorizationSuccessResponse,
+  buildUnauthorizedResponse,
+} from './makexStandard.mjs';
 
 
 // Load environment variables
@@ -61,29 +73,22 @@ app.use((req, res, next) => {
 
 // Simple structured logging helper
 function log(level, message, data = {}) {
-  // Ensure PEM content is never logged
-  if (data.walletPem) data.walletPem = '[REDACTED]';
-  if (data.pemContent) data.pemContent = '[REDACTED]';
-  
-  // Helper to convert BigInt to string for JSON serialization
-  // JSON.stringify replacer is called recursively for each value
+  const sanitized = sanitizeObjectForLog(data);
   const replacer = (key, value) => {
-    // Convert BigInt to string - JSON.stringify will call this for each BigInt value
     if (typeof value === 'bigint') {
       return value.toString();
     }
     return value;
   };
-  
+
   try {
     console.log(JSON.stringify({
       timestamp: new Date().toISOString(),
       level,
       message,
-      ...data
+      ...sanitized,
     }, replacer));
   } catch (error) {
-    // Fallback: try to serialize with safeStringify if JSON.stringify fails
     console.log(JSON.stringify({
       timestamp: new Date().toISOString(),
       level,
@@ -135,11 +140,20 @@ async function rateLimitedApiCall(url, options = {}) {
   return fetch(url, options);
 }
 
+const mvxFetch = (url, options = {}) =>
+  rateLimitedApiCall(url, {
+    ...options,
+    headers: {
+      'User-Agent': 'WARPS-MakeX-Integration/1.0',
+      ...(options.headers || {}),
+    },
+  });
+
 // Middleware: Token check
 const checkToken = (req, res, next) => {
   const token = req.headers.authorization;
   if (token === `Bearer ${SECURE_TOKEN}`) next();
-  else res.status(401).json({ error: 'Unauthorized' });
+  else res.status(401).json(buildUnauthorizedResponse());
 };
 
 // Helper: Get PEM and derive address
@@ -284,186 +298,6 @@ const calculateDynamicUsageFee = async () => {
   return convertAmountToBlockchainValue(rewardAmount, decimals);
 };
 
-// Helper: Check transaction status with improved error detection and rate limiting
-async function checkTransactionStatus(txHash, maxRetries = 30, retryInterval = 2000) {
-  let consecutiveErrors = 0;
-  const MAX_CONSECUTIVE_ERRORS = 3;
-  
-  // Rate limiting: respect 2tx/second limit
-  const rateLimitDelay = 500; // 500ms between requests = 2 requests per second
-  
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      // Only log first, last, and every 5th attempt to reduce noise
-      if (i === 0 || i === maxRetries - 1 || i % 5 === 0) {
-        log('info', `Checking transaction status`, { txHash, attempt: i + 1, maxRetries });
-      }
-      
-      // Rate limiting delay
-      if (i > 0) {
-        await new Promise(resolve => setTimeout(resolve, rateLimitDelay));
-      }
-      
-      const txStatusUrl = `https://api.multiversx.com/transactions/${txHash}`;
-      const response = await rateLimitedApiCall(txStatusUrl, { 
-        timeout: 10000,
-        headers: { 'User-Agent': 'WARPS-MakeX-Integration/1.0' }
-      });
-      
-      if (!response.ok) {
-        if (response.status === 404) {
-          // Transaction not yet visible, retry after interval
-          await new Promise(resolve => setTimeout(resolve, retryInterval));
-          continue;
-        }
-        
-        // For other HTTP errors
-        consecutiveErrors++;
-        log('warn', `HTTP error checking transaction`, { 
-          txHash, 
-          statusCode: response.status, 
-          attempt: i + 1,
-          consecutiveErrors
-        });
-        
-        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-          throw new Error(`Multiple consecutive HTTP errors: ${response.status}`);
-        }
-        
-        await new Promise(resolve => setTimeout(resolve, retryInterval));
-        continue;
-      }
-      
-      // Reset consecutive errors counter on successful response
-      consecutiveErrors = 0;
-      
-      const txStatus = await response.json();
-      
-      // Check for failed transactions first
-      if (txStatus.status === "fail" || txStatus.status === "invalid") {
-        // Extract error details from operations array
-        let errorMessage = 'Transaction failed';
-        if (txStatus.operations && txStatus.operations.length > 0) {
-          const errorOp = txStatus.operations.find(op => op.action === 'signalError' || op.type === 'error');
-          if (errorOp && errorOp.message) {
-            errorMessage = errorOp.message;
-          } else if (errorOp && errorOp.data) {
-            // Decode base64 error message
-            try {
-              errorMessage = Buffer.from(errorOp.data, 'base64').toString('utf8');
-            } catch (e) {
-              errorMessage = errorOp.data;
-            }
-          }
-        }
-        
-        log('warn', `Transaction failed`, { 
-          txHash, 
-          status: txStatus.status,
-          errorMessage,
-          operations: txStatus.operations?.length || 0
-        });
-        
-        return { 
-          status: "fail", 
-          txHash, 
-          details: errorMessage
-        };
-      }
-      
-      // Check for successful transactions
-      if (txStatus.status === "success" || txStatus.status === "executed") {
-        log('info', `Transaction completed successfully`, { txHash });
-        
-        // Additional validation for smart contract calls
-        if (txStatus.results) {
-          // Check for any error indicators in the results
-          const hasErrors = txStatus.results.some(result => 
-            result.returnMessage && result.returnMessage.toLowerCase().includes('error')
-          );
-          
-          if (hasErrors) {
-            log('warn', `Transaction has error messages in results`, { 
-              txHash, 
-              errors: txStatus.results.filter(r => r.returnMessage && r.returnMessage.toLowerCase().includes('error'))
-                .map(r => r.returnMessage)
-            });
-            return { status: "fail", txHash, details: "Smart contract execution error" };
-          }
-        }
-        
-        return { status: "success", txHash };
-      }
-      
-      // Handle pending status
-      if (txStatus.status === "pending") {
-        // Still pending, retry after interval
-        await new Promise(resolve => setTimeout(resolve, retryInterval));
-        continue;
-      }
-      
-      // Unknown status
-      log('warn', `Unknown transaction status`, { txHash, status: txStatus.status });
-      await new Promise(resolve => setTimeout(resolve, retryInterval));
-      
-    } catch (error) {
-      consecutiveErrors++;
-      log('error', `Error checking transaction`, { 
-        txHash, 
-        error: error.message, 
-        attempt: i + 1,
-        consecutiveErrors 
-      });
-      
-      // If we have multiple consecutive errors, try backup API
-      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-        log('error', `Too many consecutive errors checking transaction`, { 
-          txHash, 
-          consecutiveErrors,
-          error: error.message
-        });
-        
-        // Try a secondary API endpoint as backup
-        try {
-          const backupApiUrl = 'https://gateway.multiversx.com/transaction/';
-          log('info', `Trying backup API for transaction status`, { txHash, backupApiUrl });
-          
-          const backupResponse = await rateLimitedApiCall(`${backupApiUrl}${txHash}`, { 
-            timeout: 10000,
-            headers: { 'User-Agent': 'WARPS-MakeX-Integration/1.0' }
-          });
-          
-          if (backupResponse.ok) {
-            const backupTxStatus = await backupResponse.json();
-            
-            if (backupTxStatus.status === "success") {
-              log('info', `Transaction confirmed successful via backup API`, { txHash });
-              return { status: "success", txHash };
-            } else if (backupTxStatus.status === "fail" || backupTxStatus.status === "invalid") {
-              log('warn', `Transaction confirmed failed via backup API`, { txHash });
-              return { status: "fail", txHash, details: backupTxStatus.error || 'Failed (from backup API)' };
-            }
-          }
-        } catch (backupError) {
-          log('error', `Backup API also failed`, { txHash, error: backupError.message });
-          // Continue with main flow after logging the backup attempt failure
-        }
-      }
-      
-      // Continue retrying even after fetch errors
-      await new Promise(resolve => setTimeout(resolve, retryInterval));
-    }
-  }
-  
-  // Max retries reached without definitive status
-  log('warn', `Transaction status undetermined after max retries`, { 
-    txHash, 
-    maxRetries, 
-    totalSeconds: maxRetries * retryInterval / 1000 
-  });
-  return { status: "pending", txHash };
-}
-
 // Helper: Send usage fee transaction
 const sendUsageFee = async (pemContent, walletAddress) => {
   // Check if there's already a pending transaction for this wallet
@@ -471,19 +305,16 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   if (pendingTx) {
     try {
       // Check if the pending transaction has completed
-      const status = await checkTransactionStatus(pendingTx.txHash, 5, 2000); // Reduced retries for usage fee check
-      
-      // If transaction succeeded, return the existing transaction hash
+      const status = await checkTransactionStatus(pendingTx.txHash, 15, 2000, mvxFetch);
+
       if (status.status === "success") {
-        pendingUsageFeeTransactions.delete(walletAddress); // Clean up the record
+        pendingUsageFeeTransactions.delete(walletAddress);
         return pendingTx.txHash;
       }
-      
-      // If transaction failed, continue with creating a new one
+
       if (status.status === "fail") {
-        pendingUsageFeeTransactions.delete(walletAddress); // Clean up the failed transaction
-      } else if (status.status === "pending") {
-        // Transaction is still pending, return the existing hash
+        pendingUsageFeeTransactions.delete(walletAddress);
+      } else {
         return pendingTx.txHash;
       }
     } catch (error) {
@@ -501,6 +332,17 @@ const sendUsageFee = async (pemContent, walletAddress) => {
 
   // Calculate dynamic fee
   const dynamicFeeAmount = await calculateDynamicUsageFee();
+
+  const rewardBal = await fetchAccountEsdtBalanceWei(senderAddress.toString(), REWARD_TOKEN, mvxFetch);
+  if (insufficientRewardBalance(rewardBal, dynamicFeeAmount)) {
+    const err = new Error(USAGE_FEE_TOPUP_USER_MESSAGE);
+    err.code = 'INSUFFICIENT_REWARD_BALANCE';
+    err.insufficientReward = true;
+    err.walletAddress = senderAddress.toString();
+    err.balanceWei = rewardBal;
+    err.requiredWei = dynamicFeeAmount;
+    throw err;
+  }
 
   // Validate REWARD_TOKEN format
   if (!REWARD_TOKEN || typeof REWARD_TOKEN !== 'string') {
@@ -672,13 +514,20 @@ const sendUsageFee = async (pemContent, walletAddress) => {
   });
 
   // Initial check with reduced retries
-  const status = await checkTransactionStatus(txHash.toString(), 5, 2000);
-  
+  const status = await checkTransactionStatus(txHash.toString(), 15, 2000, mvxFetch);
+
   if (status.status === "success") {
     pendingUsageFeeTransactions.delete(walletAddress); // Clean up on success
   } else if (status.status === "fail") {
-    pendingUsageFeeTransactions.delete(walletAddress); // Clean up on failure
-    throw new Error('Usage fee transaction failed. Ensure sufficient REWARD tokens are available.');
+    pendingUsageFeeTransactions.delete(walletAddress);
+    const chainDetail = status.details || '';
+    const err = new Error(isLikelyInsufficientRewardFailure(chainDetail) ? USAGE_FEE_TOPUP_USER_MESSAGE : chainDetail || USAGE_FEE_TOPUP_USER_MESSAGE);
+    err.code = isLikelyInsufficientRewardFailure(chainDetail) ? 'INSUFFICIENT_REWARD_BALANCE' : 'USAGE_FEE_TX_FAILED';
+    err.insufficientReward = isLikelyInsufficientRewardFailure(chainDetail);
+    err.walletAddress = senderAddress.toString();
+    err.txHashUsageFee = txHash.toString();
+    err.chainDetail = chainDetail;
+    throw err;
   }
   
   return txHash.toString();
@@ -686,9 +535,10 @@ const sendUsageFee = async (pemContent, walletAddress) => {
 
 // Middleware: Handle usage fee
 const handleUsageFee = async (req, res, next) => {
+  let walletAddress;
   try {
     const pemContent = getPemContent(req);
-    const walletAddress = UserSigner.fromPem(pemContent).getAddress().toString();
+    walletAddress = UserSigner.fromPem(pemContent).getAddress().toString();
     const whitelistEligibility = await getWhitelistEligibility(walletAddress);
 
     if (whitelistEligibility.skipUsageFee) {
@@ -708,7 +558,35 @@ const handleUsageFee = async (req, res, next) => {
     next();
   } catch (error) {
     log('error', `Error processing usage fee`, { error: error.message });
-    res.status(400).json({ error: error.message });
+
+    const insufficientReward =
+      error.insufficientReward === true ||
+      error.code === 'INSUFFICIENT_REWARD_BALANCE' ||
+      isLikelyInsufficientRewardFailure(error.message) ||
+      isLikelyInsufficientRewardFailure(error.chainDetail);
+
+    if (insufficientReward) {
+      return res.status(422).json(
+        buildInsufficientRewardResponse({
+          walletAddress: error.walletAddress || walletAddress,
+          balanceWei: error.balanceWei,
+          requiredWei: error.requiredWei,
+          tokenIdentifier: REWARD_TOKEN,
+          txHash: error.txHashUsageFee || null,
+          chainDetail: error.chainDetail || null,
+        })
+      );
+    }
+
+    res.status(error.code === 'USAGE_FEE_TX_FAILED' ? 502 : 400).json({
+      status: 'error',
+      message: error.message || 'Usage fee could not be processed',
+      data: {
+        ...(error.chainDetail ? { chainDetail: error.chainDetail } : {}),
+        ...(error.txHashUsageFee ? { txHash: error.txHashUsageFee } : {}),
+        timestamp: new Date().toISOString(),
+      },
+    });
   }
 };
 
@@ -717,11 +595,15 @@ app.post('/authorization', (req, res) => {
   try {
     const token = req.headers.authorization;
     if (token === `Bearer ${SECURE_TOKEN}`) {
-      return res.json({ message: "Authorization successful" });
+      return res.status(200).json(buildAuthorizationSuccessResponse());
     }
-    return res.status(401).json({ error: "Unauthorized" });
+    return res.status(401).json(buildUnauthorizedResponse());
   } catch (error) {
-    return res.status(500).json({ error: error.message });
+    return res.status(500).json({
+      status: 'error',
+      message: redactPemFromString(error.message) || 'Internal server error',
+      data: { timestamp: new Date().toISOString() },
+    });
   }
 });
 
@@ -1269,7 +1151,7 @@ app.get('/transaction/:txHash/status', async (req, res) => {
     log('info', `Transaction status check request`, { txHash });
     
     // Use the existing retry logic with reasonable limits for status checks
-    const status = await checkTransactionStatus(txHash, 15, 2000); // 15 retries = 30 seconds
+    const status = await checkTransactionStatus(txHash, 15, 2000, mvxFetch); // 15 retries = ~30 seconds
     
     return res.json({
       success: true,
@@ -1435,21 +1317,20 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
       }
     }
     
-    // V3: Check transaction status if we have a hash
+    let maxWaitTime = 60000;
     let txStatus = { status: "success" }; // Default to success if no hash
     if (txHash && txHash !== 'simulated') {
       log('info', `Transaction sent, waiting for confirmation`, { warpId, txHash });
       
-      // Use custom retry logic instead of blocking SDK call
-      const maxWaitTime = simulate ? 10000 : 60000; // 10s for simulate, 1min for real
+      maxWaitTime = simulate ? 10000 : 60000; // 10s for simulate, 1min for real
       const maxRetries = Math.ceil(maxWaitTime / 2000); // 2-second intervals
       
-      txStatus = await checkTransactionStatus(txHash, maxRetries, 2000);
+      txStatus = await checkTransactionStatus(txHash, maxRetries, 2000, mvxFetch);
     } else {
       log('info', `No transaction hash to check (simulate mode or query)`, { warpId });
     }
     
-    if (txStatus.status === "pending") {
+    if (txStatus.status !== "success" && txStatus.status !== "fail") {
       // Transaction still pending after max wait time
       log('warn', `Transaction still pending after max wait time`, { 
         warpId, 
