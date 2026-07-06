@@ -15,6 +15,7 @@ import { createClient } from '@supabase/supabase-js';
 import {
   buildInsufficientRewardResponse,
   buildInsufficientUsdcResponse,
+  buildMakeComErrorResponse,
   checkTransactionStatus,
   DEFAULT_REWARD_TOKEN_ID,
   DEFAULT_USDC_TOKEN_ID,
@@ -568,16 +569,16 @@ export function createUsageFeeMiddleware({
         return res.status(422).json(buildInsufficientFeeResponse(error));
       }
 
-      return res.status(error.code === 'USAGE_FEE_TX_FAILED' ? 502 : 400).json({
-        status: 'error',
-        code: error.code || 'USAGE_FEE_FAILED',
-        message: redactPemFromString(error.message) || USAGE_FEE_TOPUP_USER_MESSAGE,
-        data: {
-          ...(error.chainDetail ? { chainDetail: error.chainDetail } : {}),
-          ...(error.txHashUsageFee ? { txHash: error.txHashUsageFee } : {}),
-          timestamp: new Date().toISOString(),
-        },
-      });
+      return res.status(error.code === 'USAGE_FEE_TX_FAILED' ? 502 : 400).json(
+        buildMakeComErrorResponse({
+          code: error.code || 'USAGE_FEE_FAILED',
+          message: redactPemFromString(error.message) || USAGE_FEE_TOPUP_USER_MESSAGE,
+          data: {
+            ...(error.chainDetail ? { chainDetail: error.chainDetail } : {}),
+            ...(error.txHashUsageFee ? { txHash: error.txHashUsageFee } : {}),
+          },
+        }),
+      );
     }
   };
 }

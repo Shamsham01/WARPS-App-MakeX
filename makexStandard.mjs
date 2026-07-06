@@ -22,6 +22,32 @@ export function usageFeeTopupMessage(tokenIdentifier) {
   return `Your wallet does not hold enough ${tokenIdentifier} to pay the usage fee. Top up on the same wallet you connect to this integration, then retry.`;
 }
 
+/**
+ * Standard Make.com error envelope. Custom apps should map:
+ * response.error.message = "[{{ifempty(body.error.code; statusCode)}}] {{ifempty(body.error.message; body.message)}}"
+ */
+export function buildMakeComErrorResponse({ code, message, data = {} }) {
+  const normalizedMessage = String(message ?? 'Request failed');
+  const normalizedData = {
+    ...data,
+    timestamp: data.timestamp ?? new Date().toISOString(),
+  };
+  if (!normalizedData.troubleshooting) {
+    normalizedData.troubleshooting = normalizedMessage;
+  }
+
+  return {
+    status: 'error',
+    code,
+    message: normalizedMessage,
+    error: {
+      code,
+      message: normalizedMessage,
+    },
+    data: normalizedData,
+  };
+}
+
 export const TRANSACTION_FAILED_CODE = 'TRANSACTION_FAILED';
 
 export const TRANSACTION_INCONCLUSIVE_CODE = 'TRANSACTION_STATUS_INCONCLUSIVE';
@@ -190,12 +216,11 @@ export function buildInsufficientEGLDGasResponse({
     data.operationContext = sanitizeObjectForLog(operationContext);
   }
 
-  return {
-    status: 'error',
+  return buildMakeComErrorResponse({
     code: INSUFFICIENT_EGLD_GAS_CODE,
     message: EGLD_GAS_TOPUP_USER_MESSAGE,
     data,
-  };
+  });
 }
 
 export function buildInsufficientTokenBalanceResponse({
@@ -222,12 +247,11 @@ export function buildInsufficientTokenBalanceResponse({
   if (requiredWei != null) data.requiredWei = String(requiredWei);
   if (decimalsHint != null) data.decimals = decimalsHint;
   if (usageFeeHash != null) data.usageFeeHash = usageFeeHash;
-  return {
-    status: 'error',
+  return buildMakeComErrorResponse({
     code: INSUFFICIENT_TOKEN_BALANCE_CODE,
     message: message || tip,
     data,
-  };
+  });
 }
 
 export function isLikelyInsufficientEgldGasFailure(text) {
@@ -254,12 +278,11 @@ export function buildAuthorizationSuccessResponse({ walletAddress = null } = {})
 }
 
 export function buildUnauthorizedResponse() {
-  return {
-    status: 'error',
+  return buildMakeComErrorResponse({
     code: UNAUTHORIZED_CODE,
     message: 'Unauthorized',
-    data: { timestamp: new Date().toISOString() },
-  };
+    data: {},
+  });
 }
 
 /**
@@ -290,12 +313,11 @@ export function buildInsufficientUsdcResponse({
   if (txHash != null) data.txHash = txHash;
   if (chainDetail) data.chainDetail = String(chainDetail);
 
-  return {
-    status: 'error',
+  return buildMakeComErrorResponse({
     code: INSUFFICIENT_USDC_CODE,
     message: USAGE_FEE_TOPUP_USDC_MESSAGE,
     data,
-  };
+  });
 }
 
 export function buildInsufficientRewardResponse({
@@ -322,12 +344,11 @@ export function buildInsufficientRewardResponse({
   if (txHash != null) data.txHash = txHash;
   if (chainDetail) data.chainDetail = String(chainDetail);
 
-  return {
-    status: 'error',
+  return buildMakeComErrorResponse({
     code: INSUFFICIENT_REWARD_CODE,
     message: USAGE_FEE_TOPUP_USER_MESSAGE,
     data,
-  };
+  });
 }
 
 export function buildTransactionFailureResponse({
@@ -342,15 +363,14 @@ export function buildTransactionFailureResponse({
     timestamp: new Date().toISOString(),
   };
   if (usageFeeHash != null) data.usageFeeHash = usageFeeHash;
-  return {
-    status: 'error',
+  return buildMakeComErrorResponse({
     code,
     message:
       code === TRANSACTION_INCONCLUSIVE_CODE
         ? 'The transaction was sent but a final success status could not be confirmed in time. Verify the transaction hash in the MultiversX explorer before retrying.'
         : 'MultiversX reported that the transaction did not complete successfully.',
     data,
-  };
+  });
 }
 
 export async function fetchAccountEsdtBalanceWei(bech32Address, tokenIdentifier, fetchImpl = globalThis.fetch) {
