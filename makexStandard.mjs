@@ -4,12 +4,23 @@
  */
 
 export const DEFAULT_REWARD_TOKEN_ID = 'REWARD-cf6eac';
+export const DEFAULT_USDC_TOKEN_ID = 'USDC-c76f1f';
 
 export const INSUFFICIENT_REWARD_CODE = 'INSUFFICIENT_REWARD_BALANCE';
+export const INSUFFICIENT_USDC_CODE = 'INSUFFICIENT_USDC_BALANCE';
 
 /** User-facing copy — keep identical across all MakeX apps for Make.com parsers. */
 export const USAGE_FEE_TOPUP_USER_MESSAGE =
   'Your wallet does not hold enough REWARD to pay the usage fee. Top up REWARD (REWARD-cf6eac) on the same wallet you connect to this integration, then retry.';
+
+export const USAGE_FEE_TOPUP_USDC_MESSAGE =
+  'Your wallet does not hold enough USDC to pay the usage fee. Top up USDC (USDC-c76f1f) on the same wallet you connect to this integration, then retry.';
+
+export function usageFeeTopupMessage(tokenIdentifier) {
+  if (tokenIdentifier === DEFAULT_USDC_TOKEN_ID) return USAGE_FEE_TOPUP_USDC_MESSAGE;
+  if (tokenIdentifier === DEFAULT_REWARD_TOKEN_ID) return USAGE_FEE_TOPUP_USER_MESSAGE;
+  return `Your wallet does not hold enough ${tokenIdentifier} to pay the usage fee. Top up on the same wallet you connect to this integration, then retry.`;
+}
 
 export const TRANSACTION_FAILED_CODE = 'TRANSACTION_FAILED';
 
@@ -66,6 +77,62 @@ export function safeJsonStringifyForLog(value, space = 0) {
   } catch {
     return '"[SERIALIZE_ERROR]"';
   }
+}
+
+/** Field types and PEM presence without logging secret material. */
+export function describeRequestBodyForLog(body) {
+  if (body == null) {
+    return { bodyType: body === null ? 'null' : 'undefined', keys: [] };
+  }
+  if (typeof body !== 'object' || Array.isArray(body)) {
+    return { bodyType: Array.isArray(body) ? 'array' : typeof body, sanitizedPreview: sanitizeObjectForLog(body) };
+  }
+  const keys = Object.keys(body);
+  const fieldTypes = {};
+  for (const k of keys) {
+    const v = body[k];
+    if (v == null) fieldTypes[k] = 'null';
+    else if (Array.isArray(v)) fieldTypes[k] = `array(${v.length})`;
+    else fieldTypes[k] = typeof v;
+  }
+  const walletPem = body.walletPem;
+  const pemStr = typeof walletPem === 'string' ? walletPem : '';
+  return {
+    keys,
+    fieldTypes,
+    walletPemPresent: pemStr.length > 0,
+    walletPemLength: pemStr.length || null,
+    walletPemHasBeginMarker: pemStr.includes('-----BEGIN'),
+    sanitizedBody: sanitizeObjectForLog(body),
+  };
+}
+
+export function describeRequestHeadersForLog(headers = {}) {
+  const ua = headers['user-agent'] || headers['User-Agent'] || '';
+  const uaLower = String(ua).toLowerCase();
+  return {
+    contentType: headers['content-type'] || headers['Content-Type'] || null,
+    contentLength: headers['content-length'] || headers['Content-Length'] || null,
+    authorizationPresent: Boolean(headers.authorization || headers.Authorization),
+    userAgent: ua || null,
+    likelyMakeClient: uaLower.includes('make') || uaLower.includes('integromat'),
+    xForwardedFor: headers['x-forwarded-for'] || headers['X-Forwarded-For'] || null,
+    cfRay: headers['cf-ray'] || headers['CF-Ray'] || null,
+  };
+}
+
+/** Structured, PEM-safe log line for debugging Make.com vs other clients. */
+export function logIncomingApiRequest(req, label) {
+  const payload = {
+    label,
+    timestamp: new Date().toISOString(),
+    method: req?.method,
+    path: req?.path,
+    originalUrl: req?.originalUrl,
+    headers: describeRequestHeadersForLog(req?.headers),
+    body: describeRequestBodyForLog(req?.body),
+  };
+  console.log(`${label}.incoming`, safeJsonStringifyForLog(payload));
 }
 
 export function weiStringToEgldDisplay(weiStr, fractionDigits = 6) {
@@ -199,6 +266,38 @@ export function buildUnauthorizedResponse() {
  * @param {object} opts
  * @returns {{ status: string, code: string, message: string, data: object }}
  */
+export function buildInsufficientUsdcResponse({
+  walletAddress,
+  balanceWei = null,
+  requiredWei = null,
+  tokenIdentifier = DEFAULT_USDC_TOKEN_ID,
+  usageFeeHash = null,
+  txHash = null,
+  chainDetail = null,
+  decimals = null,
+} = {}) {
+  const data = {
+    insufficientUsdc: true,
+    tokenIdentifier,
+    troubleshooting: USAGE_FEE_TOPUP_USDC_MESSAGE,
+    timestamp: new Date().toISOString(),
+  };
+  if (walletAddress != null) data.walletAddress = String(walletAddress);
+  if (balanceWei != null) data.balanceWei = String(balanceWei);
+  if (requiredWei != null) data.requiredWei = String(requiredWei);
+  if (decimals != null) data.decimals = decimals;
+  if (usageFeeHash != null) data.usageFeeHash = usageFeeHash;
+  if (txHash != null) data.txHash = txHash;
+  if (chainDetail) data.chainDetail = String(chainDetail);
+
+  return {
+    status: 'error',
+    code: INSUFFICIENT_USDC_CODE,
+    message: USAGE_FEE_TOPUP_USDC_MESSAGE,
+    data,
+  };
+}
+
 export function buildInsufficientRewardResponse({
   walletAddress,
   balanceWei = null,
@@ -269,12 +368,16 @@ export async function fetchAccountEsdtBalanceWei(bech32Address, tokenIdentifier,
   return String(raw);
 }
 
-export function insufficientRewardBalance(balanceWeiStr, requiredWeiStr) {
+export function insufficientTokenBalance(balanceWeiStr, requiredWeiStr) {
   try {
     return BigInt(balanceWeiStr) < BigInt(requiredWeiStr);
   } catch {
     return true;
   }
+}
+
+export function insufficientRewardBalance(balanceWeiStr, requiredWeiStr) {
+  return insufficientTokenBalance(balanceWeiStr, requiredWeiStr);
 }
 
 export function isLikelyInsufficientRewardFailure(text) {
@@ -402,4 +505,4 @@ export async function checkTransactionStatus(txHash, maxRetries = 20, retryInter
 
   return { txHash: hash, status: 'timeout', details: `Timed out after ${maxRetries} attempts` };
 }
-
+

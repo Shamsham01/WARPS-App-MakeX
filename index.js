@@ -7,19 +7,15 @@ import BigNumber from 'bignumber.js';
 import fetch from 'node-fetch';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
-import { createClient } from '@supabase/supabase-js';
 import {
   checkTransactionStatus,
   fetchAccountEsdtBalanceWei,
-  buildInsufficientRewardResponse,
-  insufficientRewardBalance,
-  isLikelyInsufficientRewardFailure,
-  USAGE_FEE_TOPUP_USER_MESSAGE,
   sanitizeObjectForLog,
   redactPemFromString,
   buildAuthorizationSuccessResponse,
   buildUnauthorizedResponse,
 } from './makexStandard.mjs';
+import { createUsageFeeMiddleware } from './usageFeeEngine.mjs';
 
 
 // Load environment variables
@@ -31,19 +27,11 @@ const provider = new ProxyNetworkProvider("https://gateway.multiversx.com", { cl
 const app = express();
 const PORT = process.env.PORT || 10000;
 let SECURE_TOKEN = process.env.SECURE_TOKEN;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const MAKEX_APP_ID = process.env.MAKEX_APP_ID || 'makex-warps';
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables');
 }
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: {
-    persistSession: false,
-    autoRefreshToken: false
-  }
-});
 
 // Verify security-critical environment variables
 if (!SECURE_TOKEN) {
@@ -107,21 +95,6 @@ function log(level, message, data = {}) {
 // and reads the private key from config.user.wallets[chainName].privateKey
 // We don't need a custom provider class - we just need to set the config correctly
 
-// Constants for usage fee
-const FIXED_USD_FEE = 0.03; // $0.03 fixed fee
-const REWARD_TOKEN = "REWARD-cf6eac";
-const TREASURY_WALLET = "erd1t2r97zcjg8uvf0e9nk4psj2kvg27mph9kq5xls6xtnyg2aemp8hszcmn8f";
-const WHITELIST_TABLE = 'makex_usage_fee_whitelist';
-const WHITELIST_STATUS = {
-  VALID: 'valid',
-  EXPIRED: 'expired'
-};
-
-// In-memory store for tracking pending transactions
-const pendingUsageFeeTransactions = new Map();
-
-// Removed active requests tracking for debugging
-
 // Rate limiter for API calls (2 requests per second max)
 let lastApiCall = 0;
 const API_RATE_LIMIT = 500; // 500ms between calls = 2 per second
@@ -148,6 +121,14 @@ const mvxFetch = (url, options = {}) =>
       ...(options.headers || {}),
     },
   });
+
+const handleUsageFee = createUsageFeeMiddleware({
+  appId: MAKEX_APP_ID,
+  log,
+  provider,
+  mvxFetch,
+  clientName: 'WARPS-MakeX-Integration',
+});
 
 // Middleware: Token check
 const checkToken = (req, res, next) => {
@@ -193,401 +174,6 @@ const getTokenDecimals = async (tokenTicker) => {
 const convertAmountToBlockchainValue = (amount, decimals) => {
   const factor = new BigNumber(10).pow(decimals);
   return new BigNumber(amount).multipliedBy(factor).toFixed(0);
-};
-
-// Helper: Compute status from whitelist_end timestamp
-const deriveWhitelistStatus = (whitelistEnd) => {
-  const whitelistEndDate = new Date(whitelistEnd);
-  if (Number.isNaN(whitelistEndDate.getTime())) {
-    return WHITELIST_STATUS.EXPIRED;
-  }
-  return whitelistEndDate.getTime() > Date.now() ? WHITELIST_STATUS.VALID : WHITELIST_STATUS.EXPIRED;
-};
-
-// Helper: Load whitelist entry from Supabase and ensure status is synchronized
-const getWhitelistEligibility = async (walletAddress) => {
-  const { data: entry, error } = await supabase
-    .from(WHITELIST_TABLE)
-    .select('id, wallet_address, name, email, whitelist_start, whitelist_end, status')
-    .eq('wallet_address', walletAddress)
-    .maybeSingle();
-
-  if (error) {
-    throw new Error(`Failed to load whitelist entry: ${error.message}`);
-  }
-
-  if (!entry) {
-    return { skipUsageFee: false, reason: 'not_whitelisted' };
-  }
-
-  const computedStatus = deriveWhitelistStatus(entry.whitelist_end);
-  let currentEntry = entry;
-
-  if (entry.status !== computedStatus) {
-    const { data: updatedEntry, error: updateError } = await supabase
-      .from(WHITELIST_TABLE)
-      .update({ status: computedStatus })
-      .eq('id', entry.id)
-      .select('id, wallet_address, name, email, whitelist_start, whitelist_end, status')
-      .single();
-
-    if (updateError) {
-      throw new Error(`Failed to update whitelist status: ${updateError.message}`);
-    }
-
-    currentEntry = updatedEntry;
-    log('info', 'Whitelist status updated from whitelistEnd', {
-      walletAddress,
-      previousStatus: entry.status,
-      updatedStatus: computedStatus,
-      whitelistEnd: entry.whitelist_end
-    });
-  }
-
-  return {
-    skipUsageFee: currentEntry.status === WHITELIST_STATUS.VALID,
-    reason: currentEntry.status === WHITELIST_STATUS.VALID ? 'valid' : 'expired',
-    entry: currentEntry
-  };
-};
-
-// Helper: Fetch REWARD token price from MultiversX API
-const getRewardPrice = async () => {
-  try {
-    const tokenResponse = await rateLimitedApiCall(`https://api.multiversx.com/tokens?search=${REWARD_TOKEN}`, { 
-      timeout: 10000 // Add timeout for API calls
-    });
-    if (!tokenResponse.ok) {
-      throw new Error(`Failed to fetch token info: ${tokenResponse.statusText}`);
-    }
-    
-    const tokenData = await tokenResponse.json();
-    if (!tokenData || !tokenData.length || !tokenData[0].price) {
-      throw new Error('Token price not available');
-    }
-    
-    const tokenPrice = new BigNumber(tokenData[0].price);
-    
-    if (tokenPrice.isZero() || !tokenPrice.isFinite()) {
-      throw new Error('Invalid token price from API');
-    }
-    
-    log('info', `Retrieved REWARD token price`, { price: tokenPrice.toString() });
-    return tokenPrice.toNumber();
-  } catch (error) {
-    log('error', `Error fetching REWARD price`, { error: error.message });
-    throw error;
-  }
-};
-
-// Helper: Calculate dynamic usage fee based on REWARD price
-const calculateDynamicUsageFee = async () => {
-  const rewardPrice = await getRewardPrice();
-  
-  if (rewardPrice <= 0) {
-    throw new Error('Invalid REWARD token price');
-  }
-
-  const rewardAmount = new BigNumber(FIXED_USD_FEE).dividedBy(rewardPrice);
-  const decimals = await getTokenDecimals(REWARD_TOKEN);
-  
-  if (!rewardAmount.isFinite() || rewardAmount.isZero()) {
-    throw new Error('Invalid usage fee calculation');
-  }
-
-  return convertAmountToBlockchainValue(rewardAmount, decimals);
-};
-
-// Helper: Send usage fee transaction
-const sendUsageFee = async (pemContent, walletAddress) => {
-  // Check if there's already a pending transaction for this wallet
-  const pendingTx = pendingUsageFeeTransactions.get(walletAddress);
-  if (pendingTx) {
-    try {
-      // Check if the pending transaction has completed
-      const status = await checkTransactionStatus(pendingTx.txHash, 15, 2000, mvxFetch);
-
-      if (status.status === "success") {
-        pendingUsageFeeTransactions.delete(walletAddress);
-        return pendingTx.txHash;
-      }
-
-      if (status.status === "fail") {
-        pendingUsageFeeTransactions.delete(walletAddress);
-      } else {
-        return pendingTx.txHash;
-      }
-    } catch (error) {
-      // If the transaction check fails for any reason, clear it and try again
-      pendingUsageFeeTransactions.delete(walletAddress);
-    }
-  }
-
-  const signer = UserSigner.fromPem(pemContent);
-  const senderAddress = signer.getAddress();
-  const receiverAddress = new Address(TREASURY_WALLET);
-
-  const accountOnNetwork = await provider.getAccount(senderAddress);
-  const nonce = accountOnNetwork.nonce;
-
-  // Calculate dynamic fee
-  const dynamicFeeAmount = await calculateDynamicUsageFee();
-
-  const rewardBal = await fetchAccountEsdtBalanceWei(senderAddress.toString(), REWARD_TOKEN, mvxFetch);
-  if (insufficientRewardBalance(rewardBal, dynamicFeeAmount)) {
-    const err = new Error(USAGE_FEE_TOPUP_USER_MESSAGE);
-    err.code = 'INSUFFICIENT_REWARD_BALANCE';
-    err.insufficientReward = true;
-    err.walletAddress = senderAddress.toString();
-    err.balanceWei = rewardBal;
-    err.requiredWei = dynamicFeeAmount;
-    throw err;
-  }
-
-  // Validate REWARD_TOKEN format
-  if (!REWARD_TOKEN || typeof REWARD_TOKEN !== 'string') {
-    throw new Error(`Invalid REWARD_TOKEN: ${REWARD_TOKEN}`);
-  }
-  
-  // Log token validation
-  log('info', 'REWARD_TOKEN validation', {
-    token: REWARD_TOKEN,
-    length: REWARD_TOKEN.length,
-    isValid: REWARD_TOKEN.length > 0
-  });
-
-  // Updated for MultiversX SDK v15+ - use the new transaction creation API
-  const factoryConfig = new TransactionsFactoryConfig({ chainID: "1" });
-  const factory = new TransferTransactionsFactory({ config: factoryConfig });
-
-  // Create the transaction using the updated API for SDK v15+
-  let tx;
-  
-  // First, let's log what methods are available on the factory
-  const availableMethods = Object.getOwnPropertyNames(Object.getPrototypeOf(factory))
-    .filter(name => name.startsWith('createTransaction'));
-  
-  log('info', 'Available transaction creation methods', { 
-    availableMethods,
-    factoryType: factory.constructor.name,
-    sdkVersion: 'v15+',
-    factoryKeys: Object.keys(factory),
-    factoryPrototypeKeys: Object.getOwnPropertyNames(Object.getPrototypeOf(factory))
-  });
-  
-  // Test if the factory is working by checking its basic properties
-  if (!factory || typeof factory !== 'object') {
-    throw new Error(`Factory is not a valid object: ${typeof factory}`);
-  }
-  
-  log('info', 'Factory validation passed', {
-    factoryExists: !!factory,
-    factoryType: typeof factory,
-    factoryConstructor: factory.constructor.name
-  });
-  
-  // Since all SDK methods are failing consistently, go directly to manual transaction creation
-  log('info', 'SDK methods are not working, using manual transaction creation', {
-    reason: 'All factory methods fail with SDK v15+ compatibility issues'
-  });
-  
-  // Create transaction manually - this is the working method
-  try {
-    log('info', 'Creating manual ESDT transfer transaction', { 
-      sender: senderAddress.toString(),
-      receiver: receiverAddress.toString(),
-      token: REWARD_TOKEN,
-      amount: dynamicFeeAmount,
-      sdkVersion: 'v15+'
-    });
-    
-    // IMPORTANT: Based on the correct example, the entire REWARD-cf6eac should be converted to hex
-    // Correct format: ESDTTransfer@5245574152442d636636656163@04690c7e4f
-    // Where 5245574152442d636636656163 = REWARD-cf6eac in hex
-    let tokenIdentifierHex;
-    
-    if (REWARD_TOKEN === 'REWARD-cf6eac') {
-      // Use the known correct hex encoding for REWARD-cf6eac
-      tokenIdentifierHex = '5245574152442d636636656163';
-      log('info', 'Using known correct hex encoding for REWARD-cf6eac', { 
-        originalToken: REWARD_TOKEN,
-        correctHex: tokenIdentifierHex
-      });
-    } else {
-      // For other tokens, convert to hex
-      tokenIdentifierHex = Buffer.from(REWARD_TOKEN, 'utf8').toString('hex');
-      log('info', 'Converted token identifier to hex', { 
-        originalToken: REWARD_TOKEN, 
-        tokenHex: tokenIdentifierHex 
-      });
-    }
-    
-    // Ensure the amount hex has an even number of characters
-    let amountHex = BigInt(dynamicFeeAmount).toString(16);
-    if (amountHex.length % 2 !== 0) {
-      // Pad with leading zero to make it even
-      amountHex = '0' + amountHex;
-      log('info', 'Padded amount hex to ensure even length', { 
-        originalHex: BigInt(dynamicFeeAmount).toString(16),
-        paddedHex: amountHex 
-      });
-    }
-    
-    log('info', 'Manual transaction encoding details', {
-      originalToken: REWARD_TOKEN,
-      tokenHex: tokenIdentifierHex,
-      amount: dynamicFeeAmount,
-      amountHex: amountHex,
-      amountHexLength: amountHex.length,
-      isEvenLength: amountHex.length % 2 === 0
-    });
-    
-    tx = new Transaction({
-      sender: senderAddress,
-      receiver: receiverAddress,
-      value: BigInt(0), // ESDT transfers have 0 EGLD value
-      data: `ESDTTransfer@${tokenIdentifierHex}@${amountHex}`,
-      gasLimit: BigInt(500000),
-      chainID: "1"
-    });
-    
-    log('info', 'Manual transaction creation successful');
-    
-  } catch (error) {
-    log('error', 'Manual transaction creation failed', { 
-      error: error.message,
-      sdkVersion: 'v15+',
-      factoryType: factory.constructor.name,
-      availableMethods
-    });
-    
-    // Provide detailed error information
-    throw new Error(`Failed to create transaction: Manual creation failed. Error: ${error.message}. Please check MultiversX SDK v15+ compatibility.`);
-  }
-
-  // Verify transaction was created successfully
-  if (!tx) {
-    throw new Error('Transaction creation failed: SDK returned undefined transaction object');
-  }
-
-  // Final validation: ensure the transaction has the required properties
-  if (!tx.sender || !tx.receiver) {
-    log('error', 'Transaction validation failed - missing required properties', {
-      hasSender: !!tx.sender,
-      hasReceiver: !!tx.receiver,
-      transactionType: tx.constructor.name,
-      transactionKeys: Object.keys(tx)
-    });
-    throw new Error('Transaction creation failed: Transaction object missing required properties (sender, receiver)');
-  }
-
-  // Log successful transaction creation
-  log('info', 'Transaction creation successful', {
-    method: 'Manual transaction creation',
-    transactionType: tx.constructor.name,
-    hasSender: !!tx.sender,
-    hasReceiver: !!tx.receiver,
-    hasValue: !!tx.value,
-    hasData: !!tx.data,
-    hasNonce: !!tx.nonce,
-    hasGasLimit: !!tx.gasLimit
-  });
-
-  tx.nonce = nonce;
-  tx.gasLimit = BigInt(500000);
-
-  tx.signature = await signer.sign(new TransactionComputer().computeBytesForSigning(tx));
-  let txHash;
-  try {
-    txHash = await provider.sendTransaction(tx);
-  } catch (err) {
-    throw new Error('Failed to send transaction: ' + err.message);
-  }
-  if (!txHash) {
-    throw new Error('Transaction hash is undefined after sending transaction.');
-  }
-  
-  // Store the pending transaction with timestamp
-  pendingUsageFeeTransactions.set(walletAddress, {
-    txHash: txHash.toString(),
-    timestamp: Date.now()
-  });
-
-  // Initial check with reduced retries
-  const status = await checkTransactionStatus(txHash.toString(), 15, 2000, mvxFetch);
-
-  if (status.status === "success") {
-    pendingUsageFeeTransactions.delete(walletAddress); // Clean up on success
-  } else if (status.status === "fail") {
-    pendingUsageFeeTransactions.delete(walletAddress);
-    const chainDetail = status.details || '';
-    const err = new Error(isLikelyInsufficientRewardFailure(chainDetail) ? USAGE_FEE_TOPUP_USER_MESSAGE : chainDetail || USAGE_FEE_TOPUP_USER_MESSAGE);
-    err.code = isLikelyInsufficientRewardFailure(chainDetail) ? 'INSUFFICIENT_REWARD_BALANCE' : 'USAGE_FEE_TX_FAILED';
-    err.insufficientReward = isLikelyInsufficientRewardFailure(chainDetail);
-    err.walletAddress = senderAddress.toString();
-    err.txHashUsageFee = txHash.toString();
-    err.chainDetail = chainDetail;
-    throw err;
-  }
-  
-  return txHash.toString();
-};
-
-// Middleware: Handle usage fee
-const handleUsageFee = async (req, res, next) => {
-  let walletAddress;
-  try {
-    const pemContent = getPemContent(req);
-    walletAddress = UserSigner.fromPem(pemContent).getAddress().toString();
-    const whitelistEligibility = await getWhitelistEligibility(walletAddress);
-
-    if (whitelistEligibility.skipUsageFee) {
-      log('info', `Skipping usage fee for whitelisted wallet`, {
-        walletAddress,
-        status: whitelistEligibility.reason
-      });
-      return next();
-    }
-
-    if (whitelistEligibility.reason === 'expired') {
-      log('info', 'Whitelist entry expired, charging usage fee', { walletAddress });
-    }
-
-    const txHash = await sendUsageFee(pemContent, walletAddress);
-    req.usageFeeHash = txHash;
-    next();
-  } catch (error) {
-    log('error', `Error processing usage fee`, { error: error.message });
-
-    const insufficientReward =
-      error.insufficientReward === true ||
-      error.code === 'INSUFFICIENT_REWARD_BALANCE' ||
-      isLikelyInsufficientRewardFailure(error.message) ||
-      isLikelyInsufficientRewardFailure(error.chainDetail);
-
-    if (insufficientReward) {
-      return res.status(422).json(
-        buildInsufficientRewardResponse({
-          walletAddress: error.walletAddress || walletAddress,
-          balanceWei: error.balanceWei,
-          requiredWei: error.requiredWei,
-          tokenIdentifier: REWARD_TOKEN,
-          txHash: error.txHashUsageFee || null,
-          chainDetail: error.chainDetail || null,
-        })
-      );
-    }
-
-    res.status(error.code === 'USAGE_FEE_TX_FAILED' ? 502 : 400).json({
-      status: 'error',
-      message: error.message || 'Usage fee could not be processed',
-      data: {
-        ...(error.chainDetail ? { chainDetail: error.chainDetail } : {}),
-        ...(error.txHashUsageFee ? { txHash: error.txHashUsageFee } : {}),
-        timestamp: new Date().toISOString(),
-      },
-    });
-  }
 };
 
 // Authorization Endpoint for Make.com
