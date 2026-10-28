@@ -324,6 +324,35 @@ export function createMemoryStore() {
       });
     },
 
+    claimBusiness({ id, owner, ttlMs = 120000, now = Date.now() }) {
+      return lock(() => {
+        const operation = [...operations.values()].find((row) => row.id === id);
+        if (!operation) return { ok: false, reason: 'not_found' };
+        if (operation.state === 'OPERATION_CONFIRMED') {
+          return { ok: true, claimed: false, reason: 'confirmed', operation: clone(operation) };
+        }
+        const expires = Date.parse(operation.claim_expires_at || 0);
+        const held = operation.state === 'OPERATION_IN_PROGRESS'
+          && operation.claim_owner
+          && operation.claim_owner !== owner
+          && expires > now;
+        if (held) {
+          return {
+            ok: true,
+            claimed: false,
+            reason: 'in_progress',
+            retryAfterMs: Math.max(1, expires - now),
+            operation: clone(operation),
+          };
+        }
+        operation.state = 'OPERATION_IN_PROGRESS';
+        operation.claim_owner = owner;
+        operation.claim_expires_at = new Date(now + ttlMs).toISOString();
+        operation.updated_at = new Date().toISOString();
+        return { ok: true, claimed: true, operation: clone(operation) };
+      });
+    },
+
     getOperation(id) {
       return lock(() => {
         const operation = [...operations.values()].find((row) => row.id === id);

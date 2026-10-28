@@ -17,6 +17,7 @@ import {
 } from './makexStandard.mjs';
 import { createUsageFeeMiddleware } from './usageFeeEngine.mjs';
 import { nextStablePurpose, sendPreparedTransaction } from './tx/preparedSend.mjs';
+import { presentWarpResponse, warpResponseLogMessage } from './warpResponse.mjs';
 
 
 // Load environment variables
@@ -372,16 +373,6 @@ function mapToMakeType(apiType) {
   }
 }
 
-// --- Advanced: filter response fields ---
-function filterResponseFields(response, fields) {
-  if (!fields || !Array.isArray(fields) || fields.length === 0) return response;
-  const filtered = {};
-  for (const key of fields) {
-    if (key in response) filtered[key] = response[key];
-  }
-  return filtered;
-}
-
 // Helper: Sanitize objects for logging (convert BigInt to string, handle circular refs)
 function sanitizeForLogging(obj, maxDepth = 3) {
   if (obj === null || obj === undefined) return obj;
@@ -654,11 +645,11 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
       try {
         // Remove internal flags before sending
         const { __sent, ...cleanResponse } = response;
-        const filtered = filterResponseFields(cleanResponse, fields);
+        const filtered = presentWarpResponse(res, cleanResponse, fields);
         // Use safe serialization to prevent circular reference errors
         const safeResponse = safeStringify(filtered);
         
-        log('info', `Sending successful response`, { 
+        log('info', warpResponseLogMessage(cleanResponse), { 
           warpId, 
           finalStatus: cleanResponse.finalStatus,
           finalTxHash: cleanResponse.finalTxHash,

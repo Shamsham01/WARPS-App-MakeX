@@ -58,7 +58,9 @@ Add an optional module parameter named `idempotencyKey`. Leave it empty to dedup
 
 If no key is sent, the API uses `request:` plus the canonical request fingerprint. A retry of the same request does not charge again. Two different explicit keys still create two payments, even when the amount and recipient match. A random `ephemeral:` key is no longer used.
 
-An HTTP 200 body is stored as `OPERATION_CONFIRMED` only when it is a business success. Bodies with `status` of `error`, `fail`, `failed`, `partial`, or `inconclusive` are stored as `OPERATION_FAILED`. The confirmed fee is kept and a retry does not charge it again. A failed ledger write on a successful result returns HTTP 503 instead of hanging the request.
+An HTTP 200 body is stored as `OPERATION_CONFIRMED` only when it is a finished business success. `status` or `finalStatus` of `pending`, `processing`, or `in_progress` is stored as `OPERATION_PENDING`. A retry runs the handler again and does not replay that incomplete body. `error`, `fail`, `failed`, `partial`, and `inconclusive` are stored as `OPERATION_FAILED`. The confirmed fee is kept either way, and a retry does not charge it again. A failed ledger write on a successful result returns HTTP 503 instead of hanging the request.
+
+Before the handler runs, the operation row is claimed. A second request with the same idempotency key receives HTTP 503 `OPERATION_IN_PROGRESS` until the first request stores a result or the claim expires. This prevents two concurrent X posts or direct messages. It cannot promise exactly-once delivery if the process stops after X accepts the call and before the result is stored. Leave the idempotency key empty to dedupe an identical retry. Set a new key to repeat an identical post on purpose. Field filters cannot hide a failure: the unfiltered outcome is classified before the filtered body is returned.
 
 ### Make.com errors
 
@@ -66,12 +68,13 @@ Retryable failures use HTTP 503 or 504 and `data.retryable: true`. Examples: `NO
 
 ## Deployment
 
-The migration `20261028220000_makex_tx_coordinator.sql` is already applied on production project `yalewhpzptgtfzwpzhjm`. Do not run it again. A later schema change must be a new migration file.
+The migration `20261028220000_makex_tx_coordinator.sql` is already applied on production project `yalewhpzptgtfzwpzhjm`. Do not run it again. Before deploying this revision, apply only `20261028233000_makex_operation_claim.sql` in the Supabase SQL editor.
 
 1. Confirm Render `SUPABASE_URL` contains `yalewhpzptgtfzwpzhjm`.
 2. Confirm `select public.makex_tx_health();` returns `{"ok": true, "version": 1, "store": "supabase"}` when called with the service role.
-3. Deploy one MakeX service after review. Do not deploy all six at once.
-4. Watch for `[TX_COORDINATOR] schema ready` in the Render log. Payments fail closed with `COORDINATOR_SCHEMA_MISSING` if the migration is absent. They do not fall back to the in-memory nonce cache.
+3. Apply `20261028233000_makex_operation_claim.sql` once. Do not rerun the earlier coordinator migration.
+4. Deploy one MakeX service after review. Do not deploy all six at once.
+5. Watch for `[TX_COORDINATOR] schema ready` in the Render log. Payments fail closed with `COORDINATOR_SCHEMA_MISSING` if the migration is absent. They do not fall back to the in-memory nonce cache.
 
 `MAKEX_CHAIN_ID` must stay `1` in production. It is the authority partition and the fee transaction chain id. Do not point it at devnet while the wallet still signs mainnet transactions.
 

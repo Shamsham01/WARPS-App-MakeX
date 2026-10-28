@@ -3,6 +3,7 @@
  * Copy unchanged into each Render service folder (same pattern as makexStandard.mjs).
  */
 
+import { randomUUID } from 'node:crypto';
 import {
   Address,
   ProxyNetworkProvider,
@@ -106,7 +107,11 @@ const FEE_SETTLED_STATES = new Set([
   'OPERATION_SUBMITTED',
   'OPERATION_CONFIRMED',
   'OPERATION_FAILED',
+  'OPERATION_PENDING',
 ]);
+
+const FAILED_BUSINESS_MARKERS = new Set(['error', 'fail', 'failed', 'partial', 'inconclusive']);
+const PENDING_BUSINESS_MARKERS = new Set(['pending', 'processing', 'in_progress', 'in-progress', 'submitted']);
 
 export function resetUsageFeeStateForTests() {
   profileCache = { appId: null, profile: null, fetchedAt: 0 };
@@ -341,6 +346,7 @@ async function insertLedgerEntry(supabase, entry, log = defaultLog) {
 }
 
 function feeIsSettled(operation) {
+  if (operation?.fee_tx_hash || operation?.skipped_whitelist) return true;
   return FEE_SETTLED_STATES.has(operation?.state);
 }
 
@@ -490,16 +496,35 @@ async function sendUsageFee({
   return { txHash: outcome.txHash, amountWei: dynamicFeeAmount, reservationId: outcome.reservationId, replayed: false };
 }
 
-export function isConfirmedBusinessSuccess(status, body) {
-  if (!Number.isInteger(status) || status < 200 || status >= 400) return false;
-  if (body == null || typeof body !== 'object' || Array.isArray(body)) return true;
+function businessMarkers(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return [];
+  return [body.status, body.finalStatus, body.transactionStatus, body.data?.transactionStatus]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((value) => value.toLowerCase());
+}
+
+/**
+ * confirmed: safe to replay on the next identical request.
+ * failed: terminal business failure; the fee stays settled and the handler may run again.
+ * pending: still in progress; do not replay it as a completed result.
+ */
+export function classifyBusinessOutcome(status, body) {
+  const markers = businessMarkers(body);
+  const pending = markers.some((marker) => PENDING_BUSINESS_MARKERS.has(marker));
+  if (!Number.isInteger(status) || status < 200 || status >= 400) {
+    return pending ? 'pending' : 'failed';
+  }
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) return 'confirmed';
+  if (pending) return 'pending';
+  if (markers.some((marker) => FAILED_BUSINESS_MARKERS.has(marker))) return 'failed';
+  if (body.success === false) return 'failed';
   const state = typeof body.status === 'string' ? body.status.toLowerCase() : '';
-  const finalState = typeof body.finalStatus === 'string' ? body.finalStatus.toLowerCase() : '';
-  if (['error', 'fail', 'failed', 'partial', 'inconclusive'].includes(state)) return false;
-  if (['error', 'fail', 'failed', 'partial', 'inconclusive', 'pending'].includes(finalState)) return false;
-  if (body.success === false) return false;
-  if (typeof body.error === 'string' && body.error && state !== 'success') return false;
-  return true;
+  if (typeof body.error === 'string' && body.error && state !== 'success') return 'failed';
+  return 'confirmed';
+}
+
+export function isConfirmedBusinessSuccess(status, body) {
+  return classifyBusinessOutcome(status, body) === 'confirmed';
 }
 
 function primaryHashFromBody(body, operation) {
@@ -533,38 +558,62 @@ function ledgerFailureBody(operation, req) {
   });
 }
 
+function operationPatchForOutcome(outcome, status, responseBody, ledgerBody, operation) {
+  if (outcome === 'confirmed') {
+    return {
+      state: 'OPERATION_CONFIRMED',
+      result_json: responseBody,
+      http_status: status,
+      primary_tx_hash: primaryHashFromBody(ledgerBody, operation),
+      error_class: null,
+      error_detail: null,
+    };
+  }
+  if (outcome === 'pending') {
+    return {
+      state: 'OPERATION_PENDING',
+      result_json: null,
+      http_status: status,
+      error_class: 'business_pending',
+      error_detail: businessErrorDetail(ledgerBody),
+    };
+  }
+  return {
+    state: 'OPERATION_FAILED',
+    result_json: null,
+    http_status: status,
+    error_class: 'business_response',
+    error_detail: businessErrorDetail(ledgerBody),
+  };
+}
+
 function continueAfterFee(req, res, next, operation) {
   if (!res.makexJsonWrapped) {
     const originalJson = res.json.bind(res);
     res.json = (body) => {
       const status = res.statusCode || 200;
-      if (!operation?.id || status >= 400) return originalJson(body);
-      const confirmed = isConfirmedBusinessSuccess(status, body);
-      const patch = confirmed
-        ? {
-            state: 'OPERATION_CONFIRMED',
-            result_json: body,
-            http_status: status,
-            primary_tx_hash: primaryHashFromBody(body, operation),
-          }
-        : {
-            state: 'OPERATION_FAILED',
-            error_class: 'business_response',
-            error_detail: businessErrorDetail(body),
-            http_status: status,
-          };
+      if (!operation?.id) return originalJson(body);
+      const ledgerBody = res.makexBusinessOutcome || body;
+      const outcome = classifyBusinessOutcome(status, ledgerBody);
+      const patch = operationPatchForOutcome(outcome, status, body, ledgerBody, operation);
+      const releaseUnstoredSuccess = () => req.makexCoordinator.store.updateOperation({
+        id: operation.id,
+        expectedState: 'OPERATION_IN_PROGRESS',
+        patch: { state: operation.fee_tx_hash || operation.skipped_whitelist ? 'FEE_CONFIRMED' : 'RECEIVED' },
+      }).catch(() => {});
       return Promise.resolve()
         .then(() => req.makexCoordinator.store.updateOperation({ id: operation.id, patch }))
-        .then((updated) => {
-          if (!updated?.ok) {
-            if (!confirmed) return originalJson(body);
+        .then(async (updated) => {
+          if (!updated?.ok && outcome === 'confirmed') {
+            await releaseUnstoredSuccess();
             res.status(503);
             return originalJson(ledgerFailureBody(operation, req));
           }
           return originalJson(body);
         })
-        .catch(() => {
-          if (!confirmed) return originalJson(body);
+        .catch(async () => {
+          if (outcome !== 'confirmed') return originalJson(body);
+          await releaseUnstoredSuccess();
           res.status(503);
           return originalJson(ledgerFailureBody(operation, req));
         });
@@ -572,6 +621,66 @@ function continueAfterFee(req, res, next, operation) {
     res.makexJsonWrapped = true;
   }
   return next();
+}
+
+function replayConfirmed(res, operation) {
+  if (operation?.result_json) {
+    return res.status(operation.http_status || 200).json(operation.result_json);
+  }
+  return res.status(200).json({
+    status: 'success',
+    success: true,
+    replayed: true,
+    message: 'Operation already confirmed.',
+    usageFeeHash: operation?.fee_tx_hash,
+    txHash: operation?.primary_tx_hash,
+    result: { txHash: operation?.primary_tx_hash, status: 'success' },
+  });
+}
+
+async function releaseBusinessClaim(store, operation) {
+  if (!operation?.id) return;
+  const settled = operation.fee_tx_hash || operation.skipped_whitelist;
+  await store.updateOperation({
+    id: operation.id,
+    expectedState: 'OPERATION_IN_PROGRESS',
+    patch: { state: settled ? 'FEE_CONFIRMED' : 'RECEIVED' },
+  });
+}
+
+async function runBusiness(req, res, next, operation) {
+  const owner = `${req.makexCoordinator?.instanceId || 'local'}:${randomUUID()}`;
+  const claim = await req.makexCoordinator.store.claimBusiness({
+    id: operation.id,
+    owner,
+    ttlMs: 120000,
+  });
+  if (!claim?.ok) {
+    throw new TxCoordinationError('LEDGER_WRITE_FAILED', 'Could not claim the operation before running it.', {
+      retryable: true,
+      httpStatus: 503,
+      operationId: operation.id,
+    });
+  }
+  if (!claim.claimed) {
+    if (claim.reason === 'confirmed') return replayConfirmed(res, claim.operation);
+    return res.status(503).json(buildMakeComErrorResponse({
+      code: 'OPERATION_IN_PROGRESS',
+      message: 'This operation is already running. Retry the same idempotency key after it finishes. That retry does not start a second external action while the claim is held. Exactly-once delivery cannot be guaranteed if the process stops after the external call and before the result is stored. Send a new idempotency key to repeat an identical action on purpose.',
+      data: {
+        retryable: true,
+        operationId: operation.id,
+        retryAfterMs: claim.retryAfterMs || 1000,
+      },
+    }));
+  }
+  req.makexOperation = claim.operation;
+  try {
+    return await continueAfterFee(req, res, next, claim.operation);
+  } catch (error) {
+    await releaseBusinessClaim(req.makexCoordinator.store, claim.operation).catch(() => {});
+    throw error;
+  }
 }
 
 function buildInsufficientFeeResponse(error) {
@@ -709,18 +818,7 @@ export function createUsageFeeMiddleware({
       req.makexIdempotencyEphemeral = idempotency.ephemeral;
 
       if (operation.state === 'OPERATION_CONFIRMED') {
-        if (operation.result_json) {
-          return res.status(operation.http_status || 200).json(operation.result_json);
-        }
-        return res.status(200).json({
-          status: 'success',
-          success: true,
-          replayed: true,
-          message: 'Operation already confirmed.',
-          usageFeeHash: operation.fee_tx_hash,
-          txHash: operation.primary_tx_hash,
-          result: { txHash: operation.primary_tx_hash, status: 'success' },
-        });
+        return replayConfirmed(res, operation);
       }
 
       if (operation.state === 'INCONCLUSIVE' || operation.state === 'NEEDS_RECONCILIATION' || operation.state === 'FEE_SUBMITTED' || operation.state === 'FEE_PREPARED') {
@@ -763,7 +861,7 @@ export function createUsageFeeMiddleware({
         operation = settled.operation;
         req.makexOperation = operation;
         req.usageFeeHash = resumed.txHash;
-        return continueAfterFee(req, res, next, operation);
+        return runBusiness(req, res, next, operation);
       }
 
       const profile = await loadAppProfile(appId, supabase);
@@ -794,7 +892,7 @@ export function createUsageFeeMiddleware({
             operationId: operation.id,
           });
           req.makexOperation = skipped.operation;
-          return continueAfterFee(req, res, next, skipped.operation);
+          return runBusiness(req, res, next, skipped.operation);
         }
         if (whitelistEligibility.reason === 'expired') {
           log('info', 'Whitelist entry expired, charging usage fee', { walletAddress, appId, operationId: operation.id });
@@ -877,7 +975,7 @@ export function createUsageFeeMiddleware({
         });
       }
 
-      return continueAfterFee(req, res, next, operation);
+      return runBusiness(req, res, next, operation);
     } catch (error) {
       log('error', 'Error processing usage fee', {
         error: redactPemFromString(error.message),

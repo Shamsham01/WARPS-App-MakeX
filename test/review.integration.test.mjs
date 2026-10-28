@@ -8,6 +8,7 @@ import { sendPreparedTransaction, nextStablePurpose } from '../tx/preparedSend.m
 import { sendAppTransaction } from '../tx/appSend.mjs';
 import { readIdempotencyKey } from '../tx/fingerprint.mjs';
 import {
+  classifyBusinessOutcome,
   createUsageFeeMiddleware,
   isConfirmedBusinessSuccess,
   resetUsageFeeStateForTests,
@@ -125,9 +126,16 @@ test('business success is not inferred from HTTP 200 alone', () => {
   assert.equal(isConfirmedBusinessSuccess(200, { message: 'Rewards distribution completed.' }), true);
   assert.equal(isConfirmedBusinessSuccess(200, { status: 'error', error: 'Herotag registration failed' }), false);
   assert.equal(isConfirmedBusinessSuccess(200, { status: 'partial' }), false);
+  assert.equal(isConfirmedBusinessSuccess(200, { status: 'pending' }), false);
+  assert.equal(isConfirmedBusinessSuccess(200, { status: 'processing' }), false);
   assert.equal(isConfirmedBusinessSuccess(200, { finalStatus: 'fail', message: 'Transaction failed' }), false);
   assert.equal(isConfirmedBusinessSuccess(200, { finalStatus: 'pending' }), false);
   assert.equal(isConfirmedBusinessSuccess(200, { finalStatus: 'success', finalTxHash: 'abc' }), true);
+  assert.equal(classifyBusinessOutcome(200, { status: 'pending' }), 'pending');
+  assert.equal(classifyBusinessOutcome(200, { status: 'processing' }), 'pending');
+  assert.equal(classifyBusinessOutcome(200, { finalStatus: 'pending' }), 'pending');
+  assert.equal(classifyBusinessOutcome(422, { status: 'error', data: { transactionStatus: 'pending' } }), 'pending');
+  assert.equal(classifyBusinessOutcome(200, { status: 'partial' }), 'failed');
   assert.equal(isConfirmedBusinessSuccess(200, { success: false }), false);
   assert.equal(isConfirmedBusinessSuccess(422, { status: 'error' }), false);
   assert.equal(isConfirmedBusinessSuccess(504, { status: 'error', retryable: true }), false);
@@ -405,4 +413,140 @@ test('sendPreparedTransaction rejects a confirmed chain failure instead of retur
     }),
     (error) => error.code === 'TRANSACTION_FAILED' && Boolean(error.txHash) && error.httpStatus === 422,
   );
+});
+
+test('a pending response is not completed and a retry finishes it without a second fee', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(12);
+  const coordinator = makeCoordinator(chain, store);
+  const middleware = feeMiddleware(coordinator);
+  const body = { idempotencyKey: 'still-pending', recipient: 'erd1dest', amount: 1 };
+  let runs = 0;
+  const first = await invoke(middleware, {
+    body,
+    onNext: async (_req, res) => {
+      runs += 1;
+      await res.json({ status: 'pending', message: 'Transaction still pending' });
+    },
+  });
+  assert.equal(first.res.body.status, 'pending');
+  assert.equal((await store.getOperation(first.req.makexOperation.id)).state, 'OPERATION_PENDING');
+  assert.equal(first.res.body.replayed, undefined);
+  const second = await invoke(middleware, {
+    body,
+    onNext: async (_req, res) => {
+      runs += 1;
+      await res.json({ status: 'processing' });
+    },
+  });
+  assert.equal(runs, 2);
+  assert.equal(chain.sent.length, 1);
+  assert.equal((await store.getOperation(first.req.makexOperation.id)).state, 'OPERATION_PENDING');
+  const third = await invoke(middleware, {
+    body,
+    onNext: async (_req, res) => {
+      runs += 1;
+      await res.json({ status: 'success', result: { txHash: 'finished' } });
+    },
+  });
+  assert.equal(runs, 3);
+  assert.equal(chain.sent.length, 1);
+  assert.equal((await store.getOperation(first.req.makexOperation.id)).state, 'OPERATION_CONFIRMED');
+  const replay = await invoke(middleware, {
+    body,
+    onNext: async () => {
+      runs += 1;
+    },
+  });
+  assert.equal(runs, 3);
+  assert.equal(replay.nextCalled, false);
+  assert.equal(replay.res.body.result.txHash, 'finished');
+});
+
+test('a filtered failure outcome is classified before fields are removed', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(14);
+  const coordinator = makeCoordinator(chain, store);
+  const middleware = feeMiddleware(coordinator);
+  const response = await invoke(middleware, {
+    body: { idempotencyKey: 'filtered-fail', recipient: 'erd1dest', amount: 1 },
+    onNext: async (_req, res) => {
+      const clean = { finalStatus: 'fail', finalTxHash: 'warp-fail', message: 'Transaction failed' };
+      res.makexBusinessOutcome = clean;
+      await res.json({ finalTxHash: clean.finalTxHash });
+    },
+  });
+  assert.deepEqual(response.res.body, { finalTxHash: 'warp-fail' });
+  assert.equal((await store.getOperation(response.req.makexOperation.id)).state, 'OPERATION_FAILED');
+  const partial = await invoke(middleware, {
+    body: { idempotencyKey: 'filtered-partial', recipient: 'erd1dest', amount: 2 },
+    onNext: async (_req, res) => {
+      res.makexBusinessOutcome = { finalStatus: 'partial', finalTxHash: 'warp-partial' };
+      await res.json({ finalTxHash: 'warp-partial' });
+    },
+  });
+  assert.equal((await store.getOperation(partial.req.makexOperation.id)).state, 'OPERATION_FAILED');
+});
+
+test('concurrent requests with one idempotency key run the business action once', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(16);
+  const coordinator = makeCoordinator(chain, store);
+  const middleware = feeMiddleware(coordinator);
+  let started = 0;
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const body = { idempotencyKey: 'one-post', text: 'hello' };
+  const first = invoke(middleware, {
+    body,
+    onNext: async (_req, res) => {
+      started += 1;
+      await gate;
+      await res.json({ status: 'success', id: 'tweet-1' });
+    },
+  });
+  while (started < 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const second = await invoke(middleware, {
+    body,
+    onNext: async (_req, res) => {
+      started += 1;
+      await res.json({ status: 'success', id: 'tweet-2' });
+    },
+  });
+  assert.equal(started, 1);
+  assert.equal(second.res.statusCode, 503);
+  assert.equal(second.res.body.code, 'OPERATION_IN_PROGRESS');
+  assert.equal(second.nextCalled, false);
+  assert.equal(chain.sent.length, 1);
+  release();
+  const finished = await first;
+  assert.equal(finished.res.body.id, 'tweet-1');
+  assert.equal(started, 1);
+  assert.equal((await store.getOperation(finished.req.makexOperation.id)).state, 'OPERATION_CONFIRMED');
+});
+
+test('an expired business claim can be taken by the retry', async () => {
+  const store = createMemoryStore();
+  const begun = await store.beginOperation({
+    idempotencyKey: 'expired-claim',
+    requestFingerprint: 'fingerprint',
+    appId: 'makex-transfers',
+    network: '1',
+    walletAddress: WALLET,
+  });
+  await store.updateOperation({
+    id: begun.operation.id,
+    patch: { state: 'FEE_CONFIRMED', fee_tx_hash: 'fee-hash' },
+  });
+  const first = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-a', ttlMs: 60000 });
+  const busy = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-b', ttlMs: 60000 });
+  assert.equal(first.claimed, true);
+  assert.equal(busy.reason, 'in_progress');
+  const later = Date.now() + 120000;
+  const reclaimed = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-b', ttlMs: 60000, now: later });
+  assert.equal(reclaimed.claimed, true);
 });

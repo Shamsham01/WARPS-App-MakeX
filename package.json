@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test ./test/coordinator.test.mjs ./test/review.integration.test.mjs ./test/sdk.sign.test.mjs ./test/sql.rpc.test.mjs"
+    "test": "node --test ./test/coordinator.test.mjs ./test/review.integration.test.mjs ./test/sdk.sign.test.mjs ./test/sql.rpc.test.mjs ./test/warp.response.test.mjs"
   },
   "dependencies": {
     "@joai/warps": "^3.1.0",

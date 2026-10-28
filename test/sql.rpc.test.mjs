@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const migration = path.join(root, 'supabase', 'migrations', '20261028220000_makex_tx_coordinator.sql');
+const migrationsDir = path.join(root, 'supabase', 'migrations');
 const container = `makex-tx-rpc-${process.pid}`;
 
 function docker(args, input) {
@@ -55,7 +55,9 @@ test('coordinator RPC functions enforce idempotency, one unresolved nonce, and s
         if not exists (select 1 from pg_roles where rolname = 'service_role') then create role service_role nologin bypassrls; end if;
       end $$;
     `);
-    psql(readFileSync(migration, 'utf8'));
+    for (const file of readdirSync(migrationsDir).filter((name) => name.endsWith('.sql')).sort()) {
+      psql(readFileSync(path.join(migrationsDir, file), 'utf8'));
+    }
 
     const health = query(`select public.makex_tx_health();`);
     assert.equal(health.ok, true);
@@ -134,6 +136,39 @@ test('coordinator RPC functions enforce idempotency, one unresolved nonce, and s
     assert.equal(recorded.ok, true);
     assert.equal(recorded.operation.state, 'OPERATION_CONFIRMED');
     assert.equal(recorded.operation.fee_tx_hash, 'abc123');
+
+    const claimable = query(`
+      select public.makex_tx_begin_operation('claim-key', 'fingerprint-a', 'makex-transfers', '1', 'erd1wallet');
+    `);
+    const claimId = claimable.operation.id;
+    query(`
+      select public.makex_tx_update_operation(
+        '${claimId}'::uuid,
+        '{"state":"FEE_CONFIRMED","fee_tx_hash":"fee-hash"}'::jsonb,
+        null
+      );
+    `);
+    const firstClaim = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-a', 60000);`);
+    assert.equal(firstClaim.claimed, true);
+    assert.equal(firstClaim.operation.state, 'OPERATION_IN_PROGRESS');
+    const secondClaim = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-b', 60000);`);
+    assert.equal(secondClaim.claimed, false);
+    assert.equal(secondClaim.reason, 'in_progress');
+    psql(`update public.makex_operations set claim_expires_at = now() - interval '1 minute' where id = '${claimId}';`);
+    const reclaimed = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-b', 60000);`);
+    assert.equal(reclaimed.claimed, true);
+    const pending = query(`
+      select public.makex_tx_update_operation(
+        '${claimId}'::uuid,
+        '{"state":"OPERATION_PENDING","error_class":"business_pending"}'::jsonb,
+        'OPERATION_IN_PROGRESS'
+      );
+    `);
+    assert.equal(pending.ok, true);
+    assert.equal(pending.operation.state, 'OPERATION_PENDING');
+    const confirmedClaim = query(`select public.makex_tx_claim_business('${operationId}'::uuid, 'owner-c', 60000);`);
+    assert.equal(confirmedClaim.claimed, false);
+    assert.equal(confirmedClaim.reason, 'confirmed');
 
     const anonDenied = spawnSync(
       'docker',
