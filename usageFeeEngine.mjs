@@ -3,6 +3,7 @@
  * Copy unchanged into each Render service folder (same pattern as makexStandard.mjs).
  */
 
+import { randomUUID } from 'node:crypto';
 import {
   Address,
   ProxyNetworkProvider,
@@ -12,11 +13,14 @@ import {
 } from '@multiversx/sdk-core';
 import BigNumber from 'bignumber.js';
 import { createClient } from '@supabase/supabase-js';
+import { createProductionCoordinator } from './tx/coordinator.mjs';
+import { TxCoordinationError } from './tx/errors.mjs';
+import { fingerprintRequest, readIdempotencyKey } from './tx/fingerprint.mjs';
+import { requireOperationUpdate } from './tx/ledgerWrite.mjs';
 import {
   buildInsufficientRewardResponse,
   buildInsufficientUsdcResponse,
   buildMakeComErrorResponse,
-  checkTransactionStatus,
   DEFAULT_REWARD_TOKEN_ID,
   DEFAULT_USDC_TOKEN_ID,
   fetchAccountEsdtBalanceWei,
@@ -96,7 +100,22 @@ const TOKEN_ID_BY_SYMBOL = {
 };
 
 let profileCache = { appId: null, profile: null, fetchedAt: 0 };
-const pendingUsageFeeTransactions = new Map();
+
+const FEE_SETTLED_STATES = new Set([
+  'FEE_CONFIRMED',
+  'OPERATION_PREPARED',
+  'OPERATION_SUBMITTED',
+  'OPERATION_CONFIRMED',
+  'OPERATION_FAILED',
+  'OPERATION_PENDING',
+]);
+
+const FAILED_BUSINESS_MARKERS = new Set(['error', 'fail', 'failed', 'partial', 'inconclusive']);
+const PENDING_BUSINESS_MARKERS = new Set(['pending', 'processing', 'in_progress', 'in-progress', 'submitted']);
+
+export function resetUsageFeeStateForTests() {
+  profileCache = { appId: null, profile: null, fetchedAt: 0 };
+}
 
 function getSupabase() {
   const url = process.env.SUPABASE_URL;
@@ -311,13 +330,36 @@ function buildEsdtTransferData(tokenIdentifier, amountWei) {
   return `ESDTTransfer@${tokenIdentifierHex}@${amountHex}`;
 }
 
-async function insertLedgerEntry(supabase, entry) {
-  if (!supabase) return;
-  try {
-    await supabase.from(LEDGER_TABLE).insert(entry);
-  } catch {
-    // Non-blocking audit logging
+async function insertLedgerEntry(supabase, entry, log = defaultLog) {
+  if (!supabase) return { ok: true, skipped: true };
+  const result = await supabase.from(LEDGER_TABLE).insert(entry);
+  if (result?.error) {
+    log('error', 'Usage fee ledger insert failed', {
+      error: result.error.message,
+      txHash: entry.tx_hash,
+      appId: entry.app_id,
+      walletAddress: entry.wallet_address,
+    });
+    return { ok: false, error: result.error };
   }
+  return { ok: true };
+}
+
+function feeIsSettled(operation) {
+  if (operation?.fee_tx_hash || operation?.skipped_whitelist) return true;
+  return FEE_SETTLED_STATES.has(operation?.state);
+}
+
+function throwInsufficientFee({ tokenIdentifier, walletAddress, balanceWei, requiredWei }) {
+  const err = new Error(usageFeeTopupMessage(tokenIdentifier));
+  err.code =
+    tokenIdentifier === DEFAULT_USDC_TOKEN_ID ? 'INSUFFICIENT_USDC_BALANCE' : 'INSUFFICIENT_REWARD_BALANCE';
+  err.insufficientFeeBalance = true;
+  err.tokenIdentifier = tokenIdentifier;
+  err.walletAddress = walletAddress;
+  err.balanceWei = balanceWei;
+  err.requiredWei = requiredWei;
+  return err;
 }
 
 async function sendUsageFee({
@@ -325,83 +367,101 @@ async function sendUsageFee({
   walletAddress,
   tokenIdentifier,
   usdFee,
-  provider,
   treasuryWallet,
   mvxFetch,
+  coordinator,
+  operation,
+  appId,
+  network,
+  signFeeTransaction,
 }) {
-  const pendingTx = pendingUsageFeeTransactions.get(walletAddress);
-  if (pendingTx) {
-    const status = await checkTransactionStatus(pendingTx.txHash, 15, 2000, mvxFetch);
-    if (status.status === 'success') {
-      pendingUsageFeeTransactions.delete(walletAddress);
-      return { txHash: pendingTx.txHash, amountWei: pendingTx.amountWei };
-    }
-    if (status.status !== 'pending' && status.status !== 'timeout' && status.status !== 'unknown') {
-      pendingUsageFeeTransactions.delete(walletAddress);
-    } else {
-      return { txHash: pendingTx.txHash, amountWei: pendingTx.amountWei };
+  const latest = operation?.id
+    ? await coordinator.store.getLatestReservation({ operationId: operation.id, purpose: 'fee' })
+    : null;
+  if (latest?.state === 'CONFIRMED' && latest.tx_hash) {
+    return {
+      txHash: latest.tx_hash,
+      amountWei: operation.fee_amount_wei,
+      reservationId: latest.id,
+      replayed: true,
+    };
+  }
+
+  const dynamicFeeAmount = operation?.fee_amount_wei && latest && latest.state !== 'REJECTED' && latest.state !== 'FAILED'
+    ? operation.fee_amount_wei
+    : await calculateDynamicUsageFee(usdFee, tokenIdentifier, mvxFetch);
+
+  const balanceWei = await fetchAccountEsdtBalanceWei(walletAddress, tokenIdentifier, mvxFetch);
+  if (!latest || latest.state === 'REJECTED' || latest.state === 'FAILED') {
+    if (insufficientTokenBalance(balanceWei, dynamicFeeAmount)) {
+      throw throwInsufficientFee({
+        tokenIdentifier,
+        walletAddress,
+        balanceWei,
+        requiredWei: dynamicFeeAmount,
+      });
     }
   }
 
-  const signer = UserSigner.fromPem(pemContent);
-  const senderAddress = signer.getAddress();
+  const senderAddress = new Address(walletAddress);
   const receiverAddress = new Address(treasuryWallet);
-  const accountOnNetwork = await provider.getAccount(senderAddress);
-  const dynamicFeeAmount = await calculateDynamicUsageFee(usdFee, tokenIdentifier, mvxFetch);
-
-  const balanceWei = await fetchAccountEsdtBalanceWei(
-    senderAddress.toString(),
-    tokenIdentifier,
-    mvxFetch,
-  );
-
-  if (insufficientTokenBalance(balanceWei, dynamicFeeAmount)) {
-    const err = new Error(usageFeeTopupMessage(tokenIdentifier));
-    err.code =
-      tokenIdentifier === DEFAULT_USDC_TOKEN_ID
-        ? 'INSUFFICIENT_USDC_BALANCE'
-        : 'INSUFFICIENT_REWARD_BALANCE';
-    err.insufficientFeeBalance = true;
-    err.tokenIdentifier = tokenIdentifier;
-    err.walletAddress = senderAddress.toString();
-    err.balanceWei = balanceWei;
-    err.requiredWei = dynamicFeeAmount;
-    throw err;
-  }
-
-  const tx = new Transaction({
-    sender: senderAddress,
-    receiver: receiverAddress,
-    value: BigInt(0),
-    data: buildEsdtTransferData(tokenIdentifier, dynamicFeeAmount),
-    gasLimit: BigInt(500000),
-    chainID: '1',
+  const outcome = await coordinator.submitAndConfirm({
+    senderAddress: walletAddress,
+    purpose: 'fee',
+    operationId: operation?.id || null,
+    appId,
+    payloadFingerprint: operation?.request_fingerprint || null,
+    buildTx(nonce) {
+      const tx = new Transaction({
+        sender: senderAddress,
+        receiver: receiverAddress,
+        value: BigInt(0),
+        data: buildEsdtTransferData(tokenIdentifier, dynamicFeeAmount),
+        gasLimit: BigInt(500000),
+        chainID: network,
+      });
+      tx.nonce = BigInt(nonce);
+      return tx;
+    },
+    signTx: async (tx) => {
+      if (signFeeTransaction) {
+        await signFeeTransaction(tx, pemContent);
+        return tx;
+      }
+      const signer = UserSigner.fromPem(pemContent);
+      tx.signature = await signer.sign(new TransactionComputer().computeBytesForSigning(tx));
+      return tx;
+    },
+    onSigned: async (reservation) => {
+      if (!operation?.id) return;
+      await requireOperationUpdate(coordinator.store, {
+        id: operation.id,
+        phase: 'before_broadcast',
+        patch: {
+          state: 'FEE_PREPARED',
+          fee_reservation_id: reservation.id,
+          fee_tx_hash: reservation.tx_hash,
+          fee_amount_wei: String(dynamicFeeAmount),
+          fee_token_identifier: tokenIdentifier,
+        },
+      });
+    },
+    onSubmitted: async (reservation) => {
+      if (!operation?.id) return;
+      await requireOperationUpdate(coordinator.store, {
+        id: operation.id,
+        phase: 'after_broadcast',
+        patch: {
+          state: 'FEE_SUBMITTED',
+          fee_reservation_id: reservation.id,
+          fee_tx_hash: reservation.tx_hash,
+        },
+      });
+    },
   });
 
-  tx.nonce = accountOnNetwork.nonce;
-  tx.signature = await signer.sign(new TransactionComputer().computeBytesForSigning(tx));
-
-  let txHash;
-  try {
-    txHash = await provider.sendTransaction(tx);
-  } catch (err) {
-    throw new Error(`Failed to send transaction: ${err.message}`);
-  }
-  if (!txHash) throw new Error('Transaction hash is undefined after sending transaction.');
-
-  const txHashStr = txHash.toString();
-  pendingUsageFeeTransactions.set(walletAddress, {
-    txHash: txHashStr,
-    amountWei: dynamicFeeAmount,
-    timestamp: Date.now(),
-  });
-
-  const status = await checkTransactionStatus(txHashStr, 15, 2000, mvxFetch);
-  if (status.status === 'success') {
-    pendingUsageFeeTransactions.delete(walletAddress);
-  } else if (status.status === 'fail') {
-    pendingUsageFeeTransactions.delete(walletAddress);
-    const chainDetail = status.details || '';
+  if (outcome.status === 'fail') {
+    const chainDetail = outcome.details || '';
     const likelyInsufficient = isLikelyInsufficientRewardFailure(chainDetail);
     const err = new Error(
       likelyInsufficient ? usageFeeTopupMessage(tokenIdentifier) : chainDetail || usageFeeTopupMessage(tokenIdentifier),
@@ -413,13 +473,214 @@ async function sendUsageFee({
       : 'USAGE_FEE_TX_FAILED';
     err.insufficientFeeBalance = likelyInsufficient;
     err.tokenIdentifier = tokenIdentifier;
-    err.walletAddress = senderAddress.toString();
-    err.txHashUsageFee = txHashStr;
+    err.walletAddress = walletAddress;
+    err.txHashUsageFee = outcome.txHash;
     err.chainDetail = chainDetail;
     throw err;
   }
 
-  return { txHash: txHashStr, amountWei: dynamicFeeAmount };
+  if (outcome.status !== 'success') {
+    throw new TxCoordinationError(
+      'TX_INCONCLUSIVE',
+      'Usage fee transaction is not confirmed. The primary operation was not started.',
+      {
+        retryable: true,
+        httpStatus: 503,
+        txHash: outcome.txHash,
+        operationId: operation?.id || null,
+        state: outcome.state,
+      },
+    );
+  }
+
+  return { txHash: outcome.txHash, amountWei: dynamicFeeAmount, reservationId: outcome.reservationId, replayed: false };
+}
+
+function businessMarkers(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return [];
+  return [body.status, body.finalStatus, body.transactionStatus, body.data?.transactionStatus]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((value) => value.toLowerCase());
+}
+
+/**
+ * confirmed: safe to replay on the next identical request.
+ * failed: terminal business failure; the fee stays settled and the handler may run again.
+ * pending: still in progress; do not replay it as a completed result.
+ */
+export function classifyBusinessOutcome(status, body) {
+  const markers = businessMarkers(body);
+  const pending = markers.some((marker) => PENDING_BUSINESS_MARKERS.has(marker));
+  if (!Number.isInteger(status) || status < 200 || status >= 400) {
+    return pending ? 'pending' : 'failed';
+  }
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) return 'confirmed';
+  if (pending) return 'pending';
+  if (markers.some((marker) => FAILED_BUSINESS_MARKERS.has(marker))) return 'failed';
+  if (body.success === false) return 'failed';
+  const state = typeof body.status === 'string' ? body.status.toLowerCase() : '';
+  if (typeof body.error === 'string' && body.error && state !== 'success') return 'failed';
+  return 'confirmed';
+}
+
+export function isConfirmedBusinessSuccess(status, body) {
+  return classifyBusinessOutcome(status, body) === 'confirmed';
+}
+
+function primaryHashFromBody(body, operation) {
+  if (!body || typeof body !== 'object') return operation?.primary_tx_hash || null;
+  return (
+    body.txHash ||
+    body.finalTxHash ||
+    body.result?.txHash ||
+    body.data?.transactionHash ||
+    body.data?.txHash ||
+    body.transactionHash ||
+    operation?.primary_tx_hash ||
+    null
+  );
+}
+
+function businessErrorDetail(body) {
+  const detail = body?.error || body?.message || body?.status || 'business_response';
+  return redactPemFromString(typeof detail === 'string' ? detail : JSON.stringify(detail)).slice(0, 500);
+}
+
+function ledgerFailureBody(operation, req) {
+  return buildMakeComErrorResponse({
+    code: 'LEDGER_WRITE_FAILED',
+    message: 'The operation result could not be stored. Retry the same idempotency key. It will not be charged again.',
+    data: {
+      retryable: true,
+      operationId: operation.id,
+      usageFeeHash: req.usageFeeHash || null,
+    },
+  });
+}
+
+function operationPatchForOutcome(outcome, status, responseBody, ledgerBody, operation) {
+  if (outcome === 'confirmed') {
+    return {
+      state: 'OPERATION_CONFIRMED',
+      result_json: responseBody,
+      http_status: status,
+      primary_tx_hash: primaryHashFromBody(ledgerBody, operation),
+      error_class: null,
+      error_detail: null,
+    };
+  }
+  if (outcome === 'pending') {
+    return {
+      state: 'OPERATION_PENDING',
+      result_json: null,
+      http_status: status,
+      error_class: 'business_pending',
+      error_detail: businessErrorDetail(ledgerBody),
+    };
+  }
+  return {
+    state: 'OPERATION_FAILED',
+    result_json: null,
+    http_status: status,
+    error_class: 'business_response',
+    error_detail: businessErrorDetail(ledgerBody),
+  };
+}
+
+function continueAfterFee(req, res, next, operation) {
+  if (!res.makexJsonWrapped) {
+    const originalJson = res.json.bind(res);
+    res.json = (body) => {
+      const status = res.statusCode || 200;
+      if (!operation?.id) return originalJson(body);
+      const ledgerBody = res.makexBusinessOutcome || body;
+      const outcome = classifyBusinessOutcome(status, ledgerBody);
+      const patch = operationPatchForOutcome(outcome, status, body, ledgerBody, operation);
+      const releaseUnstoredSuccess = () => req.makexCoordinator.store.updateOperation({
+        id: operation.id,
+        expectedState: 'OPERATION_IN_PROGRESS',
+        patch: { state: operation.fee_tx_hash || operation.skipped_whitelist ? 'FEE_CONFIRMED' : 'RECEIVED' },
+      }).catch(() => {});
+      return Promise.resolve()
+        .then(() => req.makexCoordinator.store.updateOperation({ id: operation.id, patch }))
+        .then(async (updated) => {
+          if (!updated?.ok && outcome === 'confirmed') {
+            await releaseUnstoredSuccess();
+            res.status(503);
+            return originalJson(ledgerFailureBody(operation, req));
+          }
+          return originalJson(body);
+        })
+        .catch(async () => {
+          if (outcome !== 'confirmed') return originalJson(body);
+          await releaseUnstoredSuccess();
+          res.status(503);
+          return originalJson(ledgerFailureBody(operation, req));
+        });
+    };
+    res.makexJsonWrapped = true;
+  }
+  return next();
+}
+
+function replayConfirmed(res, operation) {
+  if (operation?.result_json) {
+    return res.status(operation.http_status || 200).json(operation.result_json);
+  }
+  return res.status(200).json({
+    status: 'success',
+    success: true,
+    replayed: true,
+    message: 'Operation already confirmed.',
+    usageFeeHash: operation?.fee_tx_hash,
+    txHash: operation?.primary_tx_hash,
+    result: { txHash: operation?.primary_tx_hash, status: 'success' },
+  });
+}
+
+async function releaseBusinessClaim(store, operation) {
+  if (!operation?.id) return;
+  const settled = operation.fee_tx_hash || operation.skipped_whitelist;
+  await store.updateOperation({
+    id: operation.id,
+    expectedState: 'OPERATION_IN_PROGRESS',
+    patch: { state: settled ? 'FEE_CONFIRMED' : 'RECEIVED' },
+  });
+}
+
+async function runBusiness(req, res, next, operation) {
+  const owner = `${req.makexCoordinator?.instanceId || 'local'}:${randomUUID()}`;
+  const claim = await req.makexCoordinator.store.claimBusiness({
+    id: operation.id,
+    owner,
+    ttlMs: 120000,
+  });
+  if (!claim?.ok) {
+    throw new TxCoordinationError('LEDGER_WRITE_FAILED', 'Could not claim the operation before running it.', {
+      retryable: true,
+      httpStatus: 503,
+      operationId: operation.id,
+    });
+  }
+  if (!claim.claimed) {
+    if (claim.reason === 'confirmed') return replayConfirmed(res, claim.operation);
+    return res.status(503).json(buildMakeComErrorResponse({
+      code: 'OPERATION_IN_PROGRESS',
+      message: 'This operation is already running. Retry the same idempotency key after it finishes. That retry does not start a second external action while the claim is held. Exactly-once delivery cannot be guaranteed if the process stops after the external call and before the result is stored. Send a new idempotency key to repeat an identical action on purpose.',
+      data: {
+        retryable: true,
+        operationId: operation.id,
+        retryAfterMs: claim.retryAfterMs || 1000,
+      },
+    }));
+  }
+  req.makexOperation = claim.operation;
+  try {
+    return await continueAfterFee(req, res, next, claim.operation);
+  } catch (error) {
+    await releaseBusinessClaim(req.makexCoordinator.store, claim.operation).catch(() => {});
+    throw error;
+  }
 }
 
 function buildInsufficientFeeResponse(error) {
@@ -452,6 +713,12 @@ export function usageFeeFields(req) {
  * @param {function} [opts.getPemContent]
  * @param {string} [opts.treasuryWallet]
  * @param {string} [opts.clientName] - ProxyNetworkProvider client name
+ * @param {function} [opts.onUsageFeeConfirmed] - Called only after a usage-fee tx is confirmed successful
+ * @param {object} [opts.coordinator] - Shared transaction coordinator. Created from Supabase when omitted.
+ * @param {object|null} [opts.supabase] - Pass null in tests to skip whitelist lookups.
+ * @param {function} [opts.deriveAddress]
+ * @param {function} [opts.signFeeTransaction]
+ * @param {string} [opts.network]
  */
 export function createUsageFeeMiddleware({
   appId = process.env.MAKEX_APP_ID,
@@ -461,12 +728,18 @@ export function createUsageFeeMiddleware({
   getPemContent = defaultGetPemContent,
   treasuryWallet = DEFAULT_TREASURY_WALLET,
   clientName = 'makex-usage-fee',
+  onUsageFeeConfirmed,
+  coordinator: coordinatorOverride,
+  supabase: supabaseOverride,
+  deriveAddress,
+  signFeeTransaction,
+  network = process.env.MAKEX_CHAIN_ID || '1',
 } = {}) {
   if (!appId) {
     throw new Error('MAKEX_APP_ID is required for usage fee middleware');
   }
 
-  const supabase = getSupabase();
+  const supabase = supabaseOverride !== undefined ? supabaseOverride : getSupabase();
   const provider =
     providerOverride ||
     new ProxyNetworkProvider('https://gateway.multiversx.com', { clientName });
@@ -491,67 +764,218 @@ export function createUsageFeeMiddleware({
     };
   }
 
+  let coordinatorRef = coordinatorOverride || null;
+  const getCoordinator = () => {
+    if (!coordinatorRef) {
+      coordinatorRef = createProductionCoordinator({
+        supabase,
+        provider,
+        fetchImpl: mvxFetch,
+        appId,
+        log,
+      });
+    }
+    return coordinatorRef;
+  };
+
   return async function handleUsageFee(req, res, next) {
     let walletAddress;
     try {
       const pemContent = getPemContent(req);
-      walletAddress = UserSigner.fromPem(pemContent).getAddress().toString();
+      const senderAddress = deriveAddress
+        ? deriveAddress(pemContent)
+        : UserSigner.fromPem(pemContent).getAddress();
+      walletAddress = typeof senderAddress === 'string' ? senderAddress : senderAddress.toString();
+      const coordinator = getCoordinator();
+      const idempotency = readIdempotencyKey(req);
+      const requestFingerprint = fingerprintRequest(req);
+      const begun = await coordinator.store.beginOperation({
+        idempotencyKey: idempotency.key,
+        requestFingerprint,
+        appId,
+        network: coordinator.config?.network || network,
+        walletAddress,
+      });
+      if (!begun.ok && begun.reason === 'fingerprint_mismatch') {
+        return res.status(409).json(
+          buildMakeComErrorResponse({
+            code: 'IDEMPOTENCY_CONFLICT',
+            message: 'This idempotency key was already used for a different operation. Use a new key for a new payment.',
+            data: { retryable: false, operationId: begun.operation?.id || null },
+          }),
+        );
+      }
+      if (!begun.ok) {
+        throw new TxCoordinationError('COORDINATOR_DB_ERROR', 'Could not record the operation before charging.', {
+          retryable: true,
+          httpStatus: 503,
+        });
+      }
+
+      let operation = begun.operation;
+      req.makexOperation = operation;
+      req.makexCoordinator = coordinator;
+      req.makexIdempotencyEphemeral = idempotency.ephemeral;
+
+      if (operation.state === 'OPERATION_CONFIRMED') {
+        return replayConfirmed(res, operation);
+      }
+
+      if (operation.state === 'INCONCLUSIVE' || operation.state === 'NEEDS_RECONCILIATION' || operation.state === 'FEE_SUBMITTED' || operation.state === 'FEE_PREPARED') {
+        const resumed = await sendUsageFee({
+          pemContent,
+          walletAddress,
+          tokenIdentifier: operation.fee_token_identifier || DEFAULT_USDC_TOKEN_ID,
+          usdFee: operation.usd_amount,
+          treasuryWallet,
+          mvxFetch,
+          coordinator,
+          operation,
+          appId,
+          network: coordinator.config?.network || network,
+          signFeeTransaction,
+        });
+        if (!resumed?.txHash) {
+          throw new TxCoordinationError('TX_INCONCLUSIVE', 'Usage fee is not confirmed. The primary operation was not started.', {
+            retryable: true,
+            httpStatus: 503,
+            operationId: operation.id,
+          });
+        }
+        const settled = await coordinator.store.updateOperation({
+          id: operation.id,
+          patch: {
+            state: 'FEE_CONFIRMED',
+            fee_tx_hash: resumed.txHash,
+            fee_reservation_id: resumed.reservationId,
+          },
+        });
+        if (!settled.ok) {
+          throw new TxCoordinationError('LEDGER_WRITE_FAILED', 'Usage fee is confirmed but the operation ledger could not be updated.', {
+            retryable: true,
+            httpStatus: 503,
+            txHash: resumed.txHash,
+            operationId: operation.id,
+          });
+        }
+        operation = settled.operation;
+        req.makexOperation = operation;
+        req.usageFeeHash = resumed.txHash;
+        return runBusiness(req, res, next, operation);
+      }
 
       const profile = await loadAppProfile(appId, supabase);
-
-      let whitelistReason = 'whitelist_disabled';
-      if (profile.whitelist_enabled) {
+      let whitelistReason = operation.whitelist_reason || 'whitelist_disabled';
+      if (!feeIsSettled(operation) && profile.whitelist_enabled) {
         const whitelistEligibility = await getWhitelistEligibility(walletAddress, supabase);
         whitelistReason = whitelistEligibility.reason;
         if (whitelistEligibility.skipUsageFee) {
+          const skipped = await coordinator.store.updateOperation({
+            id: operation.id,
+            patch: {
+              state: 'FEE_CONFIRMED',
+              skipped_whitelist: true,
+              whitelist_reason: whitelistReason,
+            },
+          });
+          if (!skipped.ok) {
+            throw new TxCoordinationError('LEDGER_WRITE_FAILED', 'Could not record the whitelist exemption.', {
+              retryable: true,
+              httpStatus: 503,
+              operationId: operation.id,
+            });
+          }
           log('info', 'Skipping usage fee for whitelisted wallet', {
             walletAddress,
             status: whitelistEligibility.reason,
             appId,
+            operationId: operation.id,
           });
-          return next();
+          req.makexOperation = skipped.operation;
+          return runBusiness(req, res, next, skipped.operation);
         }
         if (whitelistEligibility.reason === 'expired') {
-          log('info', 'Whitelist entry expired, charging usage fee', { walletAddress, appId });
+          log('info', 'Whitelist entry expired, charging usage fee', { walletAddress, appId, operationId: operation.id });
         }
       }
 
-      const prefs = await getWalletBillingPrefs(walletAddress, supabase);
-      const payment = resolvePaymentToken(profile, prefs);
+      if (!feeIsSettled(operation)) {
+        const prefs = await getWalletBillingPrefs(walletAddress, supabase);
+        const payment = resolvePaymentToken(profile, prefs);
+        const { txHash, amountWei, reservationId } = await sendUsageFee({
+          pemContent,
+          walletAddress,
+          tokenIdentifier: payment.tokenIdentifier,
+          usdFee: payment.usdFee,
+          treasuryWallet,
+          mvxFetch,
+          coordinator,
+          operation,
+          appId,
+          network: coordinator.config?.network || network,
+          signFeeTransaction,
+        });
 
-      const { txHash, amountWei } = await sendUsageFee({
-        pemContent,
-        walletAddress,
-        tokenIdentifier: payment.tokenIdentifier,
-        usdFee: payment.usdFee,
-        provider,
-        treasuryWallet,
-        mvxFetch,
-      });
+        const recorded = await coordinator.store.updateOperation({
+          id: operation.id,
+          patch: {
+            state: 'FEE_CONFIRMED',
+            fee_tx_hash: txHash,
+            fee_reservation_id: reservationId,
+            fee_amount_wei: String(amountWei),
+            fee_token: payment.feeToken,
+            fee_token_identifier: payment.tokenIdentifier,
+            usd_amount: payment.usdFee,
+            skipped_whitelist: false,
+            whitelist_reason: whitelistReason,
+          },
+        });
+        if (!recorded.ok) {
+          throw new TxCoordinationError(
+            'LEDGER_WRITE_FAILED',
+            'Usage fee was confirmed but the operation ledger could not be updated. Retry this request. It will not be charged again.',
+            { retryable: true, httpStatus: 503, txHash, operationId: operation.id },
+          );
+        }
+        operation = recorded.operation;
+        req.makexOperation = operation;
+        req.usageFeeHash = txHash;
+        log('info', 'Usage fee collected', {
+          walletAddress,
+          usageFeeHash: txHash,
+          usdFee: payment.usdFee,
+          feeToken: payment.feeToken,
+          tokenIdentifier: payment.tokenIdentifier,
+          appId,
+          operationId: operation.id,
+          nonce: null,
+        });
+        await insertLedgerEntry(supabase, {
+          wallet_address: walletAddress,
+          app_id: appId,
+          tx_hash: txHash,
+          fee_token: payment.feeToken,
+          fee_token_identifier: payment.tokenIdentifier,
+          amount_wei: String(amountWei),
+          usd_amount: payment.usdFee,
+          skipped_whitelist: false,
+          whitelist_reason: whitelistReason,
+        }, log);
+        if (onUsageFeeConfirmed) {
+          await onUsageFeeConfirmed(senderAddress);
+        }
+      } else {
+        req.usageFeeHash = operation.fee_tx_hash || undefined;
+        log('info', 'Reusing confirmed usage fee', {
+          walletAddress,
+          usageFeeHash: operation.fee_tx_hash,
+          appId,
+          operationId: operation.id,
+          state: operation.state,
+        });
+      }
 
-      req.usageFeeHash = txHash;
-      log('info', 'Usage fee collected', {
-        walletAddress,
-        usageFeeHash: txHash,
-        usdFee: payment.usdFee,
-        feeToken: payment.feeToken,
-        tokenIdentifier: payment.tokenIdentifier,
-        appId,
-      });
-
-      insertLedgerEntry(supabase, {
-        wallet_address: walletAddress,
-        app_id: appId,
-        tx_hash: txHash,
-        fee_token: payment.feeToken,
-        fee_token_identifier: payment.tokenIdentifier,
-        amount_wei: amountWei,
-        usd_amount: payment.usdFee,
-        skipped_whitelist: false,
-        whitelist_reason: whitelistReason,
-      }).catch(() => {});
-
-      return next();
+      return runBusiness(req, res, next, operation);
     } catch (error) {
       log('error', 'Error processing usage fee', {
         error: redactPemFromString(error.message),
@@ -569,13 +993,18 @@ export function createUsageFeeMiddleware({
         return res.status(422).json(buildInsufficientFeeResponse(error));
       }
 
-      return res.status(error.code === 'USAGE_FEE_TX_FAILED' ? 502 : 400).json(
+      const retryable = error.retryable === true;
+      const httpStatus = error.httpStatus || (error.code === 'USAGE_FEE_TX_FAILED' ? 502 : retryable ? 503 : 400);
+      return res.status(httpStatus).json(
         buildMakeComErrorResponse({
           code: error.code || 'USAGE_FEE_FAILED',
           message: redactPemFromString(error.message) || USAGE_FEE_TOPUP_USER_MESSAGE,
           data: {
+            retryable,
             ...(error.chainDetail ? { chainDetail: error.chainDetail } : {}),
-            ...(error.txHashUsageFee ? { txHash: error.txHashUsageFee } : {}),
+            ...(error.txHashUsageFee || error.txHash ? { txHash: error.txHashUsageFee || error.txHash } : {}),
+            ...(error.operationId ? { operationId: error.operationId } : {}),
+            ...(error.state ? { state: error.state } : {}),
           },
         }),
       );
@@ -591,4 +1020,5 @@ export {
   PREFS_TABLE,
   PROFILES_TABLE,
   LEDGER_TABLE,
+  resolvePaymentToken,
 };

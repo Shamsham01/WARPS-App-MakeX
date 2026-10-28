@@ -16,6 +16,8 @@ import {
   buildUnauthorizedResponse,
 } from './makexStandard.mjs';
 import { createUsageFeeMiddleware } from './usageFeeEngine.mjs';
+import { nextStablePurpose, sendPreparedTransaction } from './tx/preparedSend.mjs';
+import { presentWarpResponse, warpResponseLogMessage } from './warpResponse.mjs';
 
 
 // Load environment variables
@@ -129,6 +131,22 @@ const handleUsageFee = createUsageFeeMiddleware({
   mvxFetch,
   clientName: 'WARPS-MakeX-Integration',
 });
+
+async function coordinatedSend(req, signer, sender, tx, purposePrefix = 'primary') {
+  const coordinator = req.makexCoordinator;
+  if (!coordinator) {
+    throw new Error('Transaction coordinator is not ready. The usage-fee step must run before a warp is signed.');
+  }
+  const outcome = await sendPreparedTransaction({
+    coordinator,
+    signer,
+    senderAddress: sender,
+    tx,
+    operationId: req.makexOperation?.id || null,
+    purposePrefix: nextStablePurpose(req, purposePrefix),
+  });
+  return outcome.txHash;
+}
 
 // Middleware: Token check
 const checkToken = (req, res, next) => {
@@ -353,16 +371,6 @@ function mapToMakeType(apiType) {
     default:
       return "text";
   }
-}
-
-// --- Advanced: filter response fields ---
-function filterResponseFields(response, fields) {
-  if (!fields || !Array.isArray(fields) || fields.length === 0) return response;
-  const filtered = {};
-  for (const key of fields) {
-    if (key in response) filtered[key] = response[key];
-  }
-  return filtered;
 }
 
 // Helper: Sanitize objects for logging (convert BigInt to string, handle circular refs)
@@ -637,11 +645,11 @@ app.post('/executeWarp', checkToken, handleUsageFee, async (req, res) => {
       try {
         // Remove internal flags before sending
         const { __sent, ...cleanResponse } = response;
-        const filtered = filterResponseFields(cleanResponse, fields);
+        const filtered = presentWarpResponse(res, cleanResponse, fields);
         // Use safe serialization to prevent circular reference errors
         const safeResponse = safeStringify(filtered);
         
-        log('info', `Sending successful response`, { 
+        log('info', warpResponseLogMessage(cleanResponse), { 
           warpId, 
           finalStatus: cleanResponse.finalStatus,
           finalTxHash: cleanResponse.finalTxHash,
@@ -847,14 +855,19 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
           walletType: wallet.constructor?.name || typeof wallet
         });
         
-        // Sign transactions
-        const signedTxs = await wallet.signTransactions(result.txs);
-        log('info', `Transactions signed successfully`, { warpId, count: signedTxs.length });
-        
-        // Send transactions and get hashes
-        const hashes = await Promise.all(
-          signedTxs.map(tx => wallet.sendTransaction(tx))
-        );
+        // The Warp wallet keeps its own nonce cache and broadcasts in parallel.
+        // Sign each transaction with the shared coordinator so it cannot reuse the usage-fee nonce.
+        const signer = UserSigner.fromPem(pemContent);
+        const hashes = [];
+        for (let index = 0; index < result.txs.length; index += 1) {
+          const tx = result.txs[index];
+          if (!tx || typeof tx.toPlainObject !== 'function') {
+            throw new Error('Warp returned a transaction this service cannot coordinate');
+          }
+          const hash = await coordinatedSend(req, signer, userAddress, tx, `warp:${index}`);
+          hashes.push(hash);
+        }
+        log('info', `Warp transactions accepted by the coordinator`, { warpId, count: hashes.length });
         
         // Use the first transaction hash (or combine if multiple)
         txHash = hashes[0]?.toString() || (hashes.length > 0 ? hashes.map(h => h.toString()).join(',') : null);
@@ -872,6 +885,20 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
           chain: result.chain.name,
           stack: walletError.stack
         });
+        if (walletError?.code === 'TRANSACTION_FAILED') {
+          return {
+            warpId,
+            warpHash: warpInfo.meta?.hash,
+            finalTxHash: walletError.txHash || null,
+            finalStatus: 'fail',
+            message: `Transaction failed: ${walletError.message}`,
+            results: [],
+            messages: [walletError.message],
+            next: null,
+            usageFeeHash: req.usageFeeHash || 'N/A',
+            __sent: false,
+          };
+        }
         throw new Error(`Failed to sign and send transactions: ${walletError.message}`);
       }
     } else if (result.txHash) {
