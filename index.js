@@ -16,6 +16,7 @@ import {
   buildUnauthorizedResponse,
 } from './makexStandard.mjs';
 import { createUsageFeeMiddleware } from './usageFeeEngine.mjs';
+import { sendPreparedTransaction } from './tx/preparedSend.mjs';
 
 
 // Load environment variables
@@ -129,6 +130,22 @@ const handleUsageFee = createUsageFeeMiddleware({
   mvxFetch,
   clientName: 'WARPS-MakeX-Integration',
 });
+
+async function coordinatedSend(req, signer, sender, tx, purposePrefix = 'primary') {
+  const coordinator = req.makexCoordinator;
+  if (!coordinator) {
+    throw new Error('Transaction coordinator is not ready. The usage-fee step must run before a warp is signed.');
+  }
+  const outcome = await sendPreparedTransaction({
+    coordinator,
+    signer,
+    senderAddress: sender,
+    tx,
+    operationId: req.makexOperation?.id || null,
+    purposePrefix,
+  });
+  return outcome.txHash;
+}
 
 // Middleware: Token check
 const checkToken = (req, res, next) => {
@@ -847,14 +864,19 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
           walletType: wallet.constructor?.name || typeof wallet
         });
         
-        // Sign transactions
-        const signedTxs = await wallet.signTransactions(result.txs);
-        log('info', `Transactions signed successfully`, { warpId, count: signedTxs.length });
-        
-        // Send transactions and get hashes
-        const hashes = await Promise.all(
-          signedTxs.map(tx => wallet.sendTransaction(tx))
-        );
+        // The Warp wallet keeps its own nonce cache and broadcasts in parallel.
+        // Sign each transaction with the shared coordinator so it cannot reuse the usage-fee nonce.
+        const signer = UserSigner.fromPem(pemContent);
+        const hashes = [];
+        for (let index = 0; index < result.txs.length; index += 1) {
+          const tx = result.txs[index];
+          if (!tx || typeof tx.toPlainObject !== 'function') {
+            throw new Error('Warp returned a transaction this service cannot coordinate');
+          }
+          const hash = await coordinatedSend(req, signer, userAddress, tx, `warp:${index}`);
+          hashes.push(hash);
+        }
+        log('info', `Transactions signed and confirmed`, { warpId, count: hashes.length });
         
         // Use the first transaction hash (or combine if multiple)
         txHash = hashes[0]?.toString() || (hashes.length > 0 ? hashes.map(h => h.toString()).join(',') : null);

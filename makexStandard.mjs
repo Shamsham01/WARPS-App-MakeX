@@ -451,6 +451,49 @@ function extractTxFailureDetails(txData) {
 }
 
 /**
+ * Strict: only a fully successful MultiversX transaction record passes.
+ * Pending, failed, and partial smart-contract results stay non-success.
+ */
+export function interpretTransactionRecord(txData) {
+  const scResults = txData.results || txData.smartContractResults || [];
+  const anyResultPending = scResults.some((r) => (r.status || r.returnCode) === 'pending');
+
+  if (txData.status === 'pending' || txData.pendingResults === true || anyResultPending) {
+    return { status: 'pending', details: null };
+  }
+
+  if (txData.status !== 'success') {
+    return { status: 'fail', details: extractTxFailureDetails(txData) };
+  }
+
+  if (txData.receipt?.status === 'fail') {
+    return { status: 'fail', details: extractTxFailureDetails(txData) };
+  }
+
+  if (txData.logs?.events) {
+    const failEvents = txData.logs.events.filter(
+      (event) => event.identifier === 'signalError' || event.identifier === 'executeError',
+    );
+    if (failEvents.length > 0) {
+      return { status: 'fail', details: extractTxFailureDetails(txData) };
+    }
+  }
+
+  if (scResults.length > 0) {
+    const failResults = scResults.filter((r) => {
+      const s = (r.status || r.returnCode || '').toString().toLowerCase();
+      return s === 'fail' || (s !== 'success' && s !== 'ok' && s !== '0' && s !== 'completed');
+    });
+    if (failResults.length > 0) {
+      const msg = failResults[0].returnMessage || failResults[0].message || 'Smart contract execution failed';
+      return { status: 'fail', details: String(msg) };
+    }
+  }
+
+  return { status: 'success', details: null };
+}
+
+/**
  * Strict: only MultiversX API `status === "success"` passes.
  * @returns {Promise<{ txHash: string, status: 'success'|'fail'|'pending'|'unknown'|'timeout', details?: string }>}
  */
@@ -473,48 +516,13 @@ export async function checkTransactionStatus(txHash, maxRetries = 20, retryInter
         throw new Error(`MultiversX API ${response.status}: ${response.statusText} ${responseText}`.trim());
       }
 
-      const txData = await response.json();
-      const scResults = txData.results || txData.smartContractResults || [];
-      const anyResultPending = scResults.some((r) => (r.status || r.returnCode) === 'pending');
-
-      if (txData.status === 'pending' || txData.pendingResults === true || anyResultPending) {
+      const interpreted = interpretTransactionRecord(await response.json());
+      if (interpreted.status === 'pending') {
         await new Promise((r) => setTimeout(r, retryInterval));
         continue;
       }
 
-      if (txData.status !== 'success') {
-        return { txHash: hash, status: 'fail', details: extractTxFailureDetails(txData) };
-      }
-
-      if (txData.receipt?.status === 'fail') {
-        return { txHash: hash, status: 'fail', details: extractTxFailureDetails(txData) };
-      }
-
-      if (txData.logs?.events) {
-        const failEvents = txData.logs.events.filter(
-          (event) => event.identifier === 'signalError' || event.identifier === 'executeError',
-        );
-        if (failEvents.length > 0) {
-          return {
-            txHash: hash,
-            status: 'fail',
-            details: extractTxFailureDetails(txData),
-          };
-        }
-      }
-
-      if (scResults.length > 0) {
-        const failResults = scResults.filter((r) => {
-          const s = (r.status || r.returnCode || '').toString().toLowerCase();
-          return s === 'fail' || (s !== 'success' && s !== 'ok' && s !== '0' && s !== 'completed');
-        });
-        if (failResults.length > 0) {
-          const msg = failResults[0].returnMessage || failResults[0].message || 'Smart contract execution failed';
-          return { txHash: hash, status: 'fail', details: String(msg) };
-        }
-      }
-
-      return { txHash: hash, status: 'success', details: null };
+      return { txHash: hash, status: interpreted.status, details: interpreted.details };
     } catch (error) {
       if (i === maxRetries - 1) {
         return { txHash: hash, status: 'unknown', details: `Failed to check status: ${error.message}` };
