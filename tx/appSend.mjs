@@ -1,4 +1,5 @@
 import { TxCoordinationError } from './errors.mjs';
+import { requireOperationUpdate } from './ledgerWrite.mjs';
 
 /**
  * Submit one primary transaction through the shared coordinator and record it
@@ -27,8 +28,9 @@ export async function sendAppTransaction({
     },
     onSigned: async (reservation) => {
       if (!operation?.id) return;
-      await coordinator.store.updateOperation({
+      await requireOperationUpdate(coordinator.store, {
         id: operation.id,
+        phase: 'before_broadcast',
         patch: {
           state: 'OPERATION_PREPARED',
           primary_reservation_id: reservation.id,
@@ -38,8 +40,9 @@ export async function sendAppTransaction({
     },
     onSubmitted: async (reservation) => {
       if (!operation?.id) return;
-      await coordinator.store.updateOperation({
+      await requireOperationUpdate(coordinator.store, {
         id: operation.id,
+        phase: 'after_broadcast',
         patch: {
           state: 'OPERATION_SUBMITTED',
           primary_reservation_id: reservation.id,
@@ -65,11 +68,13 @@ export async function sendAppTransaction({
       patch.error_class = outcome.status;
     }
     const updated = await coordinator.store.updateOperation({ id: operation.id, patch });
-    if (!updated.ok && outcome.status === 'success') {
+    if (!updated?.ok) {
       throw new TxCoordinationError(
         'LEDGER_WRITE_FAILED',
-        'The transfer was confirmed but the operation ledger could not be updated. Retry the same idempotency key. It will not be sent again.',
-        { retryable: true, httpStatus: 503, txHash: outcome.txHash, operationId: operation.id },
+        outcome.status === 'success'
+          ? 'The transfer was confirmed but the operation ledger could not be updated. Retry the same idempotency key. It will not be sent again.'
+          : 'The transfer result could not be recorded. Retry the same idempotency key. It will not be replaced.',
+        { retryable: true, httpStatus: 503, txHash: outcome.txHash, operationId: operation.id, state: outcome.state },
       );
     }
   }

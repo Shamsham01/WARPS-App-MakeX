@@ -16,7 +16,7 @@ import {
   buildUnauthorizedResponse,
 } from './makexStandard.mjs';
 import { createUsageFeeMiddleware } from './usageFeeEngine.mjs';
-import { sendPreparedTransaction } from './tx/preparedSend.mjs';
+import { nextStablePurpose, sendPreparedTransaction } from './tx/preparedSend.mjs';
 
 
 // Load environment variables
@@ -142,7 +142,7 @@ async function coordinatedSend(req, signer, sender, tx, purposePrefix = 'primary
     senderAddress: sender,
     tx,
     operationId: req.makexOperation?.id || null,
-    purposePrefix,
+    purposePrefix: nextStablePurpose(req, purposePrefix),
   });
   return outcome.txHash;
 }
@@ -876,7 +876,7 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
           const hash = await coordinatedSend(req, signer, userAddress, tx, `warp:${index}`);
           hashes.push(hash);
         }
-        log('info', `Transactions signed and confirmed`, { warpId, count: hashes.length });
+        log('info', `Warp transactions accepted by the coordinator`, { warpId, count: hashes.length });
         
         // Use the first transaction hash (or combine if multiple)
         txHash = hashes[0]?.toString() || (hashes.length > 0 ? hashes.map(h => h.toString()).join(',') : null);
@@ -894,6 +894,20 @@ async function handleContractExecution(req, res, action, warpInfo, userAddress, 
           chain: result.chain.name,
           stack: walletError.stack
         });
+        if (walletError?.code === 'TRANSACTION_FAILED') {
+          return {
+            warpId,
+            warpHash: warpInfo.meta?.hash,
+            finalTxHash: walletError.txHash || null,
+            finalStatus: 'fail',
+            message: `Transaction failed: ${walletError.message}`,
+            results: [],
+            messages: [walletError.message],
+            next: null,
+            usageFeeHash: req.usageFeeHash || 'N/A',
+            __sent: false,
+          };
+        }
         throw new Error(`Failed to sign and send transactions: ${walletError.message}`);
       }
     } else if (result.txHash) {

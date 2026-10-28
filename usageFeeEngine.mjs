@@ -15,6 +15,7 @@ import { createClient } from '@supabase/supabase-js';
 import { createProductionCoordinator } from './tx/coordinator.mjs';
 import { TxCoordinationError } from './tx/errors.mjs';
 import { fingerprintRequest, readIdempotencyKey } from './tx/fingerprint.mjs';
+import { requireOperationUpdate } from './tx/ledgerWrite.mjs';
 import {
   buildInsufficientRewardResponse,
   buildInsufficientUsdcResponse,
@@ -427,8 +428,9 @@ async function sendUsageFee({
     },
     onSigned: async (reservation) => {
       if (!operation?.id) return;
-      await coordinator.store.updateOperation({
+      await requireOperationUpdate(coordinator.store, {
         id: operation.id,
+        phase: 'before_broadcast',
         patch: {
           state: 'FEE_PREPARED',
           fee_reservation_id: reservation.id,
@@ -440,8 +442,9 @@ async function sendUsageFee({
     },
     onSubmitted: async (reservation) => {
       if (!operation?.id) return;
-      await coordinator.store.updateOperation({
+      await requireOperationUpdate(coordinator.store, {
         id: operation.id,
+        phase: 'after_broadcast',
         patch: {
           state: 'FEE_SUBMITTED',
           fee_reservation_id: reservation.id,
@@ -487,39 +490,84 @@ async function sendUsageFee({
   return { txHash: outcome.txHash, amountWei: dynamicFeeAmount, reservationId: outcome.reservationId, replayed: false };
 }
 
+export function isConfirmedBusinessSuccess(status, body) {
+  if (!Number.isInteger(status) || status < 200 || status >= 400) return false;
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) return true;
+  const state = typeof body.status === 'string' ? body.status.toLowerCase() : '';
+  const finalState = typeof body.finalStatus === 'string' ? body.finalStatus.toLowerCase() : '';
+  if (['error', 'fail', 'failed', 'partial', 'inconclusive'].includes(state)) return false;
+  if (['error', 'fail', 'failed', 'partial', 'inconclusive', 'pending'].includes(finalState)) return false;
+  if (body.success === false) return false;
+  if (typeof body.error === 'string' && body.error && state !== 'success') return false;
+  return true;
+}
+
+function primaryHashFromBody(body, operation) {
+  if (!body || typeof body !== 'object') return operation?.primary_tx_hash || null;
+  return (
+    body.txHash ||
+    body.finalTxHash ||
+    body.result?.txHash ||
+    body.data?.transactionHash ||
+    body.data?.txHash ||
+    body.transactionHash ||
+    operation?.primary_tx_hash ||
+    null
+  );
+}
+
+function businessErrorDetail(body) {
+  const detail = body?.error || body?.message || body?.status || 'business_response';
+  return redactPemFromString(typeof detail === 'string' ? detail : JSON.stringify(detail)).slice(0, 500);
+}
+
+function ledgerFailureBody(operation, req) {
+  return buildMakeComErrorResponse({
+    code: 'LEDGER_WRITE_FAILED',
+    message: 'The operation result could not be stored. Retry the same idempotency key. It will not be charged again.',
+    data: {
+      retryable: true,
+      operationId: operation.id,
+      usageFeeHash: req.usageFeeHash || null,
+    },
+  });
+}
+
 function continueAfterFee(req, res, next, operation) {
   if (!res.makexJsonWrapped) {
     const originalJson = res.json.bind(res);
     res.json = (body) => {
       const status = res.statusCode || 200;
       if (!operation?.id || status >= 400) return originalJson(body);
-      return Promise.resolve(
-        req.makexCoordinator.store.updateOperation({
-          id: operation.id,
-          patch: {
+      const confirmed = isConfirmedBusinessSuccess(status, body);
+      const patch = confirmed
+        ? {
             state: 'OPERATION_CONFIRMED',
             result_json: body,
             http_status: status,
-            primary_tx_hash: body?.result?.txHash || body?.txHash || operation.primary_tx_hash || null,
-          },
-        }),
-      ).then((updated) => {
-        if (!updated?.ok) {
+            primary_tx_hash: primaryHashFromBody(body, operation),
+          }
+        : {
+            state: 'OPERATION_FAILED',
+            error_class: 'business_response',
+            error_detail: businessErrorDetail(body),
+            http_status: status,
+          };
+      return Promise.resolve()
+        .then(() => req.makexCoordinator.store.updateOperation({ id: operation.id, patch }))
+        .then((updated) => {
+          if (!updated?.ok) {
+            if (!confirmed) return originalJson(body);
+            res.status(503);
+            return originalJson(ledgerFailureBody(operation, req));
+          }
+          return originalJson(body);
+        })
+        .catch(() => {
+          if (!confirmed) return originalJson(body);
           res.status(503);
-          return originalJson(
-            buildMakeComErrorResponse({
-              code: 'LEDGER_WRITE_FAILED',
-              message: 'The operation was confirmed on chain but the result could not be stored. Retry the same idempotency key. It will not be charged again.',
-              data: {
-                retryable: true,
-                operationId: operation.id,
-                usageFeeHash: req.usageFeeHash || null,
-              },
-            }),
-          );
-        }
-        return originalJson(body);
-      });
+          return originalJson(ledgerFailureBody(operation, req));
+        });
     };
     res.makexJsonWrapped = true;
   }

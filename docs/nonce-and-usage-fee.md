@@ -46,11 +46,19 @@ Confirmed or included-failed transactions consume the nonce. A pre-broadcast rej
 
 ### Idempotency migration for Make.com
 
-Requests may send `idempotencyKey` in the JSON body or `x-makex-idempotency-key`. Use a value that stays the same when Make.com retries that module execution and changes when the user intentionally runs a new payment. A practical value is:
+Requests may send `idempotencyKey` in the JSON body, `x-makex-idempotency-key`, or the three headers `x-makex-scenario-id`, `x-makex-execution-id`, and `x-makex-module-id`. The key must stay the same when Make.com retries that module and must change when the user intentionally repeats an identical payment.
 
-`{{scenario.id}}:{{execution.id}}:{{module.id}}`
+Make custom-app base headers should send:
 
-Until a scenario sends a key, the API generates an `ephemeral:` key. Those requests are not deduplicated. Nonce collisions are still prevented. Existing scenarios keep working. Add the key in the custom-app communication modules when each app is updated. Do not treat two payments as duplicates merely because the amount and recipient match.
+```json
+"x-makex-idempotency-key": "{{ifempty(parameters.idempotencyKey; '')}}"
+```
+
+Add an optional module parameter named `idempotencyKey`. Leave it empty to dedupe an identical retry. Map a new value to repeat an identical payment on purpose. Make.com custom-app IML cannot read the scenario execution id, so the app cannot invent that id by itself.
+
+If no key is sent, the API uses `request:` plus the canonical request fingerprint. A retry of the same request does not charge again. Two different explicit keys still create two payments, even when the amount and recipient match. A random `ephemeral:` key is no longer used.
+
+An HTTP 200 body is stored as `OPERATION_CONFIRMED` only when it is a business success. Bodies with `status` of `error`, `fail`, `failed`, `partial`, or `inconclusive` are stored as `OPERATION_FAILED`. The confirmed fee is kept and a retry does not charge it again. A failed ledger write on a successful result returns HTTP 503 instead of hanging the request.
 
 ### Make.com errors
 
@@ -58,13 +66,12 @@ Retryable failures use HTTP 503 or 504 and `data.retryable: true`. Examples: `NO
 
 ## Deployment
 
-Apply the migration before deploying this service. Do not deploy automatically.
+The migration `20261028220000_makex_tx_coordinator.sql` is already applied on production project `yalewhpzptgtfzwpzhjm`. Do not run it again. A later schema change must be a new migration file.
 
-1. Open the Supabase project used by MakeX.
-2. Run `supabase/migrations/20261028220000_makex_tx_coordinator.sql` in the SQL editor, or with `supabase db push` against that project.
-3. Confirm `select public.makex_tx_health();` returns `{"ok": true, "version": 1, "store": "supabase"}` when called with the service role.
-4. Deploy `makex-transfers` only.
-5. Watch for `[TX_COORDINATOR] schema ready` in the Render log. Payments fail closed with `COORDINATOR_SCHEMA_MISSING` if the migration is absent. They do not fall back to the in-memory nonce cache.
+1. Confirm Render `SUPABASE_URL` contains `yalewhpzptgtfzwpzhjm`.
+2. Confirm `select public.makex_tx_health();` returns `{"ok": true, "version": 1, "store": "supabase"}` when called with the service role.
+3. Deploy one MakeX service after review. Do not deploy all six at once.
+4. Watch for `[TX_COORDINATOR] schema ready` in the Render log. Payments fail closed with `COORDINATOR_SCHEMA_MISSING` if the migration is absent. They do not fall back to the in-memory nonce cache.
 
 `MAKEX_CHAIN_ID` must stay `1` in production. It is the authority partition and the fee transaction chain id. Do not point it at devnet while the wallet still signs mainnet transactions.
 
