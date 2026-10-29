@@ -199,9 +199,26 @@ test('coordinator RPC functions enforce idempotency, one unresolved nonce, and s
     const secondClaim = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-b', 60000);`);
     assert.equal(secondClaim.claimed, false);
     assert.equal(secondClaim.reason, 'in_progress');
+    const renewed = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-a', 60000);`);
+    assert.equal(renewed.claimed, true);
+    assert.equal(psql(`select claim_owner from public.makex_operations where id = '${claimId}';`), 'owner-a');
+    psql(`update public.makex_operations set claim_expires_at = now() - interval '1 minute', result_json = null where id = '${claimId}';`);
+    const expired = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-b', 60000);`);
+    assert.equal(expired.claimed, false);
+    assert.equal(expired.reason, 'needs_reconciliation');
+    assert.equal(expired.operation.state, 'OPERATION_IN_PROGRESS');
+    assert.equal(expired.operation.error_class, 'business_claim_expired');
+    assert.equal(expired.operation.fee_tx_hash, 'fee-hash');
+    assert.equal(expired.operation.result_json, null);
+    const expiredAgain = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-c', 60000);`);
+    assert.equal(expiredAgain.claimed, false);
+    assert.equal(expiredAgain.reason, 'needs_reconciliation');
+    const sameOwnerAfterExpiry = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-a', 60000);`);
+    assert.equal(sameOwnerAfterExpiry.claimed, true);
     psql(`update public.makex_operations set claim_expires_at = now() - interval '1 minute' where id = '${claimId}';`);
-    const reclaimed = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-b', 60000);`);
-    assert.equal(reclaimed.claimed, true);
+    const crashedRetry = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-d', 60000);`);
+    assert.equal(crashedRetry.claimed, false);
+    assert.equal(crashedRetry.operation.fee_tx_hash, 'fee-hash');
     const pending = query(`
       select public.makex_tx_update_operation(
         '${claimId}'::uuid,
@@ -214,24 +231,26 @@ test('coordinator RPC functions enforce idempotency, one unresolved nonce, and s
     const confirmedClaim = query(`select public.makex_tx_claim_business('${operationId}'::uuid, 'owner-c', 60000);`);
     assert.equal(confirmedClaim.claimed, false);
     assert.equal(confirmedClaim.reason, 'confirmed');
+    const fresh = query(`
+      select public.makex_tx_begin_operation('after-crash-key', 'fingerprint-b', 'makex-transfers', '1', 'erd1wallet');
+    `);
+    assert.equal(fresh.created, true);
 
     const fenced = query(`
       select public.makex_tx_begin_operation('finish-key', 'fingerprint-a', 'makex-transfers', '1', 'erd1wallet');
     `);
     const finishId = fenced.operation.id;
     query(`select public.makex_tx_claim_business('${finishId}'::uuid, 'owner-a', 60000);`);
-    psql(`update public.makex_operations set claim_expires_at = now() - interval '1 minute' where id = '${finishId}';`);
-    query(`select public.makex_tx_claim_business('${finishId}'::uuid, 'owner-b', 60000);`);
     const stale = query(`
       select public.makex_tx_finish_business(
-        '${finishId}'::uuid, 'owner-a', '{"state":"OPERATION_CONFIRMED"}'::jsonb
+        '${finishId}'::uuid, 'owner-b', '{"state":"OPERATION_CONFIRMED"}'::jsonb
       );
     `);
     assert.equal(stale.ok, false);
     assert.equal(stale.reason, 'stale_claim');
     const finished = query(`
       select public.makex_tx_finish_business(
-        '${finishId}'::uuid, 'owner-b', '{"state":"OPERATION_CONFIRMED","http_status":200}'::jsonb
+        '${finishId}'::uuid, 'owner-a', '{"state":"OPERATION_CONFIRMED","http_status":200}'::jsonb
       );
     `);
     assert.equal(finished.ok, true);

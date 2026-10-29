@@ -604,6 +604,18 @@ function abandonedBusinessBody(operation, req) {
   });
 }
 
+function claimExpiredBody(operation, req) {
+  return buildMakeComErrorResponse({
+    code: 'BUSINESS_CLAIM_EXPIRED',
+    message: 'This operation was in progress when its claim expired. It may already have completed. Reconcile it before running it again. The usage fee will not be charged again.',
+    data: {
+      retryable: false,
+      operationId: operation?.id || null,
+      usageFeeHash: req?.usageFeeHash || operation?.fee_tx_hash || null,
+    },
+  });
+}
+
 function staleClaimBody(operation) {
   return buildMakeComErrorResponse({
     code: 'STALE_CLAIM',
@@ -802,6 +814,9 @@ async function runBusiness(req, res, next, operation, claimOptions = {}) {
   }
   if (!claim.claimed) {
     if (claim.reason === 'confirmed') return replayConfirmed(res, claim.operation);
+    if (claim.reason === 'needs_reconciliation') {
+      return res.status(503).json(claimExpiredBody(claim.operation, req));
+    }
     return res.status(503).json(buildMakeComErrorResponse({
       code: 'OPERATION_IN_PROGRESS',
       message: 'This operation is already running. Retry the same idempotency key after it finishes. That retry does not start a second external action while the claim is held. Exactly-once delivery cannot be guaranteed if the process stops after the external call and before the result is stored. Send a new idempotency key to repeat an identical action on purpose.',
@@ -1008,6 +1023,10 @@ export function createUsageFeeMiddleware({
 
       if (operation.state === 'OPERATION_CONFIRMED') {
         return replayConfirmed(res, operation);
+      }
+
+      if (operation.state === 'OPERATION_IN_PROGRESS' && operation.error_class === 'business_claim_expired') {
+        return res.status(503).json(claimExpiredBody(operation, req));
       }
 
       if (irreversibleResultMissing(operation)) {

@@ -544,7 +544,7 @@ test('concurrent requests with one idempotency key run the business action once'
   assert.equal((await store.getOperation(finished.req.makexOperation.id)).state, 'OPERATION_CONFIRMED');
 });
 
-test('an expired business claim can be taken by the retry', async () => {
+test('an expired business claim cannot be taken by a new worker', async () => {
   const store = createMemoryStore();
   const begun = await store.beginOperation({
     idempotencyKey: 'expired-claim',
@@ -557,13 +557,18 @@ test('an expired business claim can be taken by the retry', async () => {
     id: begun.operation.id,
     patch: { state: 'FEE_CONFIRMED', fee_tx_hash: 'fee-hash' },
   });
-  const first = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-a', ttlMs: 60000 });
-  const busy = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-b', ttlMs: 60000 });
+  const first = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-a', ttlMs: 60000, now: 1_000 });
+  const busy = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-b', ttlMs: 60000, now: 1_000 });
   assert.equal(first.claimed, true);
   assert.equal(busy.reason, 'in_progress');
-  const later = Date.now() + 120000;
-  const reclaimed = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-b', ttlMs: 60000, now: later });
-  assert.equal(reclaimed.claimed, true);
+  const renewed = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-a', ttlMs: 60000, now: 30_000 });
+  assert.equal(renewed.claimed, true);
+  const expired = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-b', ttlMs: 60000, now: 200_000 });
+  assert.equal(expired.claimed, false);
+  assert.equal(expired.reason, 'needs_reconciliation');
+  assert.equal(expired.operation.state, 'OPERATION_IN_PROGRESS');
+  assert.equal(expired.operation.error_class, 'business_claim_expired');
+  assert.equal(expired.operation.fee_tx_hash, 'fee-hash');
 });
 
 test('usage fee hash matches the canonical sendable transaction representation', async () => {
@@ -840,6 +845,64 @@ test('a closed response without a stored result is not executed again', async ()
   assert.equal(chain.sent.length, 1);
 });
 
+test('a crash after the external action leaves an expired claim that a retry cannot run', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(24);
+  let clock = 8_000_000;
+  const middleware = feeMiddleware(makeCoordinator(chain, store), {
+    claimTtlMs: 1_000,
+    now: () => clock,
+    scheduleClaimRenewal: () => () => {},
+  });
+  const body = { idempotencyKey: 'crashed-action', text: 'already sent' };
+  const req = { method: 'POST', path: '/post', body, headers: {}, usageFeeAlreadyProcessed: false };
+  const res = {
+    statusCode: 200,
+    body: undefined,
+    status(code) { this.statusCode = code; return this; },
+    json(payload) { this.body = payload; return this; },
+  };
+  let runs = 0;
+  await middleware(req, res, () => {
+    runs += 1;
+    return undefined;
+  });
+  clock += 10_000;
+  const second = await invoke(middleware, {
+    body,
+    path: '/post',
+    onNext: async () => { runs += 1; },
+  });
+  assert.equal(second.nextCalled, false);
+  assert.equal(second.res.statusCode, 503);
+  assert.equal(second.res.body.code, 'BUSINESS_CLAIM_EXPIRED');
+  assert.equal(second.res.body.data.retryable, false);
+  const operation = await store.getOperation(req.makexOperation.id);
+  assert.equal(operation.state, 'OPERATION_IN_PROGRESS');
+  assert.equal(operation.error_class, 'business_claim_expired');
+  assert.equal(operation.result_json ?? null, null);
+  assert.ok(operation.fee_tx_hash);
+  const third = await invoke(middleware, {
+    body,
+    path: '/post',
+    onNext: async () => { runs += 1; },
+  });
+  assert.equal(third.nextCalled, false);
+  assert.equal(third.res.body.code, 'BUSINESS_CLAIM_EXPIRED');
+  const fresh = await invoke(middleware, {
+    body: { idempotencyKey: 'intentional-new-action', text: 'already sent' },
+    path: '/post',
+    onNext: async (_req, response) => {
+      runs += 1;
+      await response.json({ status: 'success', result: { id: 'new' } });
+    },
+  });
+  assert.equal(fresh.nextCalled, true);
+  assert.equal(fresh.res.body.result.id, 'new');
+  assert.equal(runs, 2);
+  assert.equal(chain.sent.length, 2);
+});
+
 test('a stale claim owner cannot store a newer worker result', async () => {
   const store = createMemoryStore();
   const begun = await store.beginOperation({
@@ -849,24 +912,27 @@ test('a stale claim owner cannot store a newer worker result', async () => {
     chainId: '1',
     sender: WALLET,
   });
-  await store.claimBusiness({ id: begun.operation.id, owner: 'worker-a', ttlMs: 1000, now: 0 });
-  await store.claimBusiness({ id: begun.operation.id, owner: 'worker-b', ttlMs: 1000, now: 5000 });
-  const stale = await store.finishBusiness({
+  await store.claimBusiness({ id: begun.operation.id, owner: 'worker-a', ttlMs: 5000, now: 0 });
+  const intruder = await store.finishBusiness({
+    id: begun.operation.id,
+    owner: 'worker-b',
+    patch: { state: 'OPERATION_CONFIRMED' },
+    now: 1000,
+  });
+  assert.equal(intruder.ok, false);
+  assert.equal(intruder.reason, 'stale_claim');
+  const takeover = await store.claimBusiness({ id: begun.operation.id, owner: 'worker-b', ttlMs: 5000, now: 6000 });
+  assert.equal(takeover.claimed, false);
+  assert.equal(takeover.reason, 'needs_reconciliation');
+  const expiredOwner = await store.finishBusiness({
     id: begun.operation.id,
     owner: 'worker-a',
     patch: { state: 'OPERATION_CONFIRMED' },
-    now: 5000,
+    now: 6000,
   });
-  assert.equal(stale.ok, false);
-  assert.equal(stale.reason, 'stale_claim');
-  const current = await store.finishBusiness({
-    id: begun.operation.id,
-    owner: 'worker-b',
-    patch: { state: 'OPERATION_CONFIRMED', http_status: 200 },
-    now: 5000,
-  });
-  assert.equal(current.ok, true);
-  assert.equal(current.operation.state, 'OPERATION_CONFIRMED');
+  assert.equal(expiredOwner.ok, false);
+  assert.equal(expiredOwner.reason, 'claim_expired');
+  assert.equal((await store.getOperation(begun.operation.id)).state, 'OPERATION_IN_PROGRESS');
 });
 
 test('uploaded media bytes change the idempotency fingerprint', () => {
