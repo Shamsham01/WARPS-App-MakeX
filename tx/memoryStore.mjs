@@ -332,6 +332,16 @@ export function createMemoryStore() {
           return { ok: true, claimed: false, reason: 'confirmed', operation: clone(operation) };
         }
         const expires = Date.parse(operation.claim_expires_at || 0);
+        const expired = operation.state === 'OPERATION_IN_PROGRESS'
+          && operation.claim_owner
+          && operation.claim_owner !== owner
+          && (!operation.claim_expires_at || expires <= now);
+        if (expired) {
+          operation.error_class = 'business_claim_expired';
+          operation.error_detail = 'The business claim expired before its result was stored. Reconcile this operation before running it again.';
+          operation.updated_at = new Date().toISOString();
+          return { ok: true, claimed: false, reason: 'needs_reconciliation', operation: clone(operation) };
+        }
         const held = operation.state === 'OPERATION_IN_PROGRESS'
           && operation.claim_owner
           && operation.claim_owner !== owner
@@ -350,6 +360,20 @@ export function createMemoryStore() {
         operation.claim_expires_at = new Date(now + ttlMs).toISOString();
         operation.updated_at = new Date().toISOString();
         return { ok: true, claimed: true, operation: clone(operation) };
+      });
+    },
+
+    finishBusiness({ id, owner, patch, now = Date.now() }) {
+      return lock(() => {
+        const operation = [...operations.values()].find((row) => row.id === id);
+        if (!operation) return { ok: false, reason: 'not_found' };
+        const expires = Date.parse(operation.claim_expires_at || 0);
+        if (operation.state !== 'OPERATION_IN_PROGRESS' || operation.claim_owner !== owner || expires <= now) {
+          const reason = operation.claim_owner !== owner ? 'stale_claim' : 'claim_expired';
+          return { ok: false, reason, operation: clone(operation) };
+        }
+        Object.assign(operation, patch, { updated_at: new Date().toISOString() });
+        return { ok: true, operation: clone(operation) };
       });
     },
 

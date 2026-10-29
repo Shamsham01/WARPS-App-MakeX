@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import test from 'node:test';
 import { Address, Mnemonic, Transaction, UserSecretKey, UserSigner } from '@multiversx/sdk-core';
-import { identifyTransaction } from '../tx/chain.mjs';
+import { identifyTransaction, rebuildTransaction } from '../tx/chain.mjs';
 import { createTxCoordinator } from '../tx/coordinator.mjs';
 import { createMemoryStore } from '../tx/memoryStore.mjs';
 import { sendPreparedTransaction, nextStablePurpose } from '../tx/preparedSend.mjs';
 import { sendAppTransaction } from '../tx/appSend.mjs';
-import { readIdempotencyKey } from '../tx/fingerprint.mjs';
+import { fingerprintRequest, readIdempotencyKey } from '../tx/fingerprint.mjs';
 import {
   classifyBusinessOutcome,
   createUsageFeeMiddleware,
@@ -96,11 +97,15 @@ function feeMiddleware(coordinator, extra = {}) {
     },
     log: () => {},
     network: '1',
+    claimTtlMs: extra.claimTtlMs,
+    claimRenewMs: extra.claimRenewMs,
+    now: extra.now,
+    scheduleClaimRenewal: extra.scheduleClaimRenewal,
   });
 }
 
-async function invoke(middleware, { body = {}, headers = {}, onNext } = {}) {
-  const req = { method: 'POST', path: '/execute/egldTransfer', body, headers, usageFeeAlreadyProcessed: false };
+async function invoke(middleware, { body = {}, headers = {}, file, path = '/execute/egldTransfer', onNext } = {}) {
+  const req = { method: 'POST', path, body, headers, file, usageFeeAlreadyProcessed: false };
   const res = {
     statusCode: 200,
     body: undefined,
@@ -168,10 +173,10 @@ test('an HTTP 200 business error is not stored as a successful operation', async
   assert.equal(second.res.body.result.txHash, 'primary-fixed');
 });
 
-test('a failed success ledger write returns 503 and does not hang or double charge', async () => {
+test('a failed success ledger write does not run the external action again', async () => {
   const store = createMemoryStore();
-  const original = store.updateOperation.bind(store);
-  store.updateOperation = async (args) => {
+  const original = store.finishBusiness.bind(store);
+  store.finishBusiness = async (args) => {
     if (args.patch?.state === 'OPERATION_CONFIRMED') return { ok: false, reason: 'db_down' };
     return original(args);
   };
@@ -179,17 +184,27 @@ test('a failed success ledger write returns 503 and does not hang or double char
   const coordinator = makeCoordinator(chain, store);
   const middleware = feeMiddleware(coordinator);
   const body = { idempotencyKey: 'ledger-down', recipient: 'erd1dest', amount: 1 };
+  let runs = 0;
   const first = await invoke(middleware, {
     body,
     onNext: async (_req, res) => {
+      runs += 1;
       await res.json({ status: 'success', result: { txHash: 'kept' } });
     },
   });
   assert.equal(first.res.statusCode, 503);
-  assert.equal(first.res.body.code, 'LEDGER_WRITE_FAILED');
-  assert.notEqual(first.req.makexOperation.state, 'OPERATION_CONFIRMED');
-  const second = await invoke(middleware, { body });
-  assert.equal(second.nextCalled, true);
+  assert.equal(first.res.body.code, 'BUSINESS_RESULT_UNSTORED');
+  assert.equal(first.res.body.data.retryable, false);
+  assert.equal((await store.getOperation(first.req.makexOperation.id)).state, 'NEEDS_RECONCILIATION');
+  const second = await invoke(middleware, {
+    body,
+    onNext: async () => {
+      runs += 1;
+    },
+  });
+  assert.equal(second.nextCalled, false);
+  assert.equal(second.res.body.code, 'BUSINESS_RESULT_UNSTORED');
+  assert.equal(runs, 1);
   assert.equal(chain.sent.length, 1);
 });
 
@@ -529,7 +544,7 @@ test('concurrent requests with one idempotency key run the business action once'
   assert.equal((await store.getOperation(finished.req.makexOperation.id)).state, 'OPERATION_CONFIRMED');
 });
 
-test('an expired business claim can be taken by the retry', async () => {
+test('an expired business claim cannot be taken by a new worker', async () => {
   const store = createMemoryStore();
   const begun = await store.beginOperation({
     idempotencyKey: 'expired-claim',
@@ -542,11 +557,420 @@ test('an expired business claim can be taken by the retry', async () => {
     id: begun.operation.id,
     patch: { state: 'FEE_CONFIRMED', fee_tx_hash: 'fee-hash' },
   });
-  const first = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-a', ttlMs: 60000 });
-  const busy = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-b', ttlMs: 60000 });
+  const first = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-a', ttlMs: 60000, now: 1_000 });
+  const busy = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-b', ttlMs: 60000, now: 1_000 });
   assert.equal(first.claimed, true);
   assert.equal(busy.reason, 'in_progress');
-  const later = Date.now() + 120000;
-  const reclaimed = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-b', ttlMs: 60000, now: later });
-  assert.equal(reclaimed.claimed, true);
+  const renewed = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-a', ttlMs: 60000, now: 30_000 });
+  assert.equal(renewed.claimed, true);
+  const expired = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-b', ttlMs: 60000, now: 200_000 });
+  assert.equal(expired.claimed, false);
+  assert.equal(expired.reason, 'needs_reconciliation');
+  assert.equal(expired.operation.state, 'OPERATION_IN_PROGRESS');
+  assert.equal(expired.operation.error_class, 'business_claim_expired');
+  assert.equal(expired.operation.fee_tx_hash, 'fee-hash');
+});
+
+test('usage fee hash matches the canonical sendable transaction representation', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(30);
+  let submitted = null;
+  let networkHash = null;
+
+  // Model the gateway's canonical transaction representation, without broadcasting.
+  // Prior code passed a string as SDK Transaction.data, causing its protobuf hash
+  // to differ from the hash of the bytes serialized into the sendable payload.
+  chain.sendImpl = async (tx) => {
+    submitted = tx;
+    networkHash = identifyTransaction(rebuildTransaction(tx.toPlainObject())).txHash;
+    return networkHash;
+  };
+  chain.statusImpl = async (hash) => ({
+    status: hash === networkHash ? 'success' : 'not_found',
+  });
+
+  const middleware = feeMiddleware(makeCoordinator(chain, store));
+  const { req, res, nextCalled } = await invoke(middleware, {
+    body: { idempotencyKey: 'canonical-fee-hash', recipient: WALLET, amount: 1 },
+    onNext: async (_req, response) => {
+      await response.json({ status: 'success', result: { txHash: 'primary-mocked' } });
+    },
+  });
+
+  assert.equal(nextCalled, true, 'hash mismatch must not block the payment');
+  assert.equal(res.statusCode, 200);
+  assert.ok(submitted);
+  assert.ok(submitted.data instanceof Uint8Array, 'fee data must be raw UTF-8 bytes');
+  assert.match(Buffer.from(submitted.data).toString('utf8'), /^ESDTTransfer@/);
+  assert.equal(identifyTransaction(submitted).txHash, networkHash);
+  const reservations = await store.listReservationsForOperation(req.makexOperation.id);
+  assert.equal(reservations.find((row) => row.purpose === 'fee')?.state, 'CONFIRMED');
+});
+
+test('REWARD and USDC fee payloads are UTF-8 bytes with one gateway hash', async () => {
+  for (const [token, prefs] of [
+    ['USDC', null],
+    ['REWARD', { fee_token: 'REWARD', fee_token_identifier: 'REWARD-cf6eac' }],
+  ]) {
+    const store = createMemoryStore();
+    const chain = createFakeChain(40);
+    let submitted = null;
+    chain.sendImpl = async (tx) => {
+      submitted = tx;
+      const networkHash = identifyTransaction(rebuildTransaction(tx.toPlainObject())).txHash;
+      chain.sent.push({ hash: networkHash, nonce: Number(tx.nonce) });
+      return networkHash;
+    };
+    chain.statusImpl = async (hash) => ({
+      status: hash === chain.sent.at(-1)?.hash ? 'success' : 'not_found',
+    });
+    const middleware = feeMiddleware(makeCoordinator(chain, store), {
+      supabase: {
+        from(table) {
+          const api = {
+            select() { return api; },
+            eq() { return api; },
+            insert() { return Promise.resolve({ error: null }); },
+            maybeSingle: async () => {
+              if (table.includes('prefs')) return { data: prefs, error: null };
+              return { data: null, error: null };
+            },
+          };
+          return api;
+        },
+      },
+    });
+    const response = await invoke(middleware, {
+      body: { idempotencyKey: `fee-${token}`, recipient: WALLET, amount: 1 },
+      onNext: async (_req, res) => {
+        await res.json({ status: 'success', result: { txHash: 'primary-mocked' } });
+      },
+    });
+    assert.equal(response.nextCalled, true, token);
+    assert.ok(submitted.data instanceof Uint8Array, token);
+    const text = Buffer.from(submitted.data).toString('utf8');
+    assert.match(text, new RegExp(`^ESDTTransfer@${Buffer.from(token === 'REWARD' ? 'REWARD-cf6eac' : 'USDC-c76f1f').toString('hex')}@`));
+    assert.equal(identifyTransaction(submitted).txHash, identifyTransaction(rebuildTransaction(submitted.toPlainObject())).txHash);
+  }
+});
+
+test('a renewed claim blocks a second worker after the original lease would have expired', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(11);
+  let clock = 1_000_000;
+  let renew = async () => {};
+  const middleware = feeMiddleware(makeCoordinator(chain, store), {
+    claimTtlMs: 1_000,
+    claimRenewMs: 1_000,
+    now: () => clock,
+    scheduleClaimRenewal: (callback) => {
+      renew = callback;
+      return () => {};
+    },
+  });
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let runs = 0;
+  const body = { idempotencyKey: 'long-post', text: 'hello' };
+  const first = invoke(middleware, {
+    body,
+    onNext: async (_req, res) => {
+      runs += 1;
+      clock += 5_000;
+      await renew();
+      await gate;
+      await res.json({ status: 'success', result: { id: 'post-1' } });
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = await invoke(middleware, {
+    body,
+    onNext: async () => {
+      runs += 1;
+    },
+  });
+  assert.equal(second.res.statusCode, 503);
+  assert.equal(second.res.body.code, 'OPERATION_IN_PROGRESS');
+  assert.equal(second.nextCalled, false);
+  release();
+  const completed = await first;
+  assert.equal(completed.res.statusCode, 200);
+  assert.equal(runs, 1);
+  assert.equal(chain.sent.length, 1);
+});
+
+test('express next returns before the handler and the claim keeps renewing', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(21);
+  let clock = 5_000_000;
+  let renew = async () => {};
+  let stopped = false;
+  const middleware = feeMiddleware(makeCoordinator(chain, store), {
+    claimTtlMs: 1_000,
+    claimRenewMs: 1_000,
+    now: () => clock,
+    scheduleClaimRenewal: (callback) => {
+      renew = callback;
+      return () => { stopped = true; };
+    },
+  });
+  const body = { idempotencyKey: 'express-live', text: 'still running' };
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let runs = 0;
+  let handler;
+  const req = { method: 'POST', path: '/post', body, headers: {}, usageFeeAlreadyProcessed: false };
+  const res = {
+    statusCode: 200,
+    body: undefined,
+    status(code) { this.statusCode = code; return this; },
+    json(payload) { this.body = payload; return this; },
+  };
+  const returned = middleware(req, res, () => {
+    runs += 1;
+    handler = (async () => {
+      clock += 5_000;
+      await renew();
+      await gate;
+      await res.json({ status: 'success', result: { id: 'posted' } });
+    })();
+    return undefined;
+  });
+  await returned;
+  assert.equal(stopped, false);
+  assert.equal(runs, 1);
+  const second = await invoke(middleware, {
+    body,
+    path: '/post',
+    onNext: async () => { runs += 1; },
+  });
+  assert.equal(second.nextCalled, false);
+  assert.equal(second.res.statusCode, 503);
+  assert.equal(second.res.body.code, 'OPERATION_IN_PROGRESS');
+  release();
+  await handler;
+  assert.equal(stopped, true);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.result.id, 'posted');
+  assert.equal(runs, 1);
+  assert.equal(chain.sent.length, 1);
+});
+
+test('a failed renewal does not release the current claim', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(22);
+  const original = store.claimBusiness.bind(store);
+  let owner = null;
+  store.claimBusiness = async (args) => {
+    if (owner && args.owner === owner) throw new Error('renewal database unavailable');
+    const result = await original(args);
+    if (result?.claimed && !owner) owner = args.owner;
+    return result;
+  };
+  let renew = async () => {};
+  const middleware = feeMiddleware(makeCoordinator(chain, store), {
+    claimTtlMs: 30_000,
+    scheduleClaimRenewal: (callback) => {
+      renew = callback;
+      return () => {};
+    },
+  });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const body = { idempotencyKey: 'renew-down', text: 'held' };
+  let runs = 0;
+  let renewalAttempted = false;
+  const first = invoke(middleware, {
+    body,
+    onNext: async (_req, res) => {
+      runs += 1;
+      await renew();
+      renewalAttempted = true;
+      await gate;
+      await res.json({ status: 'success', result: { id: 'kept' } });
+    },
+  });
+  while (!renewalAttempted) await new Promise((resolve) => setImmediate(resolve));
+  const second = await invoke(middleware, {
+    body,
+    onNext: async () => { runs += 1; },
+  });
+  assert.equal(second.nextCalled, false);
+  assert.equal(second.res.body.code, 'OPERATION_IN_PROGRESS');
+  const held = await store.getOperation(second.res.body.data.operationId);
+  assert.equal(held.state, 'OPERATION_IN_PROGRESS');
+  assert.equal(held.claim_owner, owner);
+  release();
+  const completed = await first;
+  assert.equal(completed.res.statusCode, 200);
+  assert.equal(runs, 1);
+});
+
+test('a closed response without a stored result is not executed again', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(23);
+  const middleware = feeMiddleware(makeCoordinator(chain, store));
+  const body = { idempotencyKey: 'response-closed', text: 'unknown' };
+  const req = { method: 'POST', path: '/post', body, headers: {}, usageFeeAlreadyProcessed: false };
+  const res = new EventEmitter();
+  res.statusCode = 200;
+  res.status = function status(code) { this.statusCode = code; return this; };
+  res.json = function json(payload) { this.body = payload; return this; };
+  let runs = 0;
+  await middleware(req, res, () => {
+    runs += 1;
+    return undefined;
+  });
+  res.emit('close');
+  let operation;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    operation = await store.getOperation(req.makexOperation.id);
+    if (operation?.error_class === 'business_abandoned') break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(operation.state, 'NEEDS_RECONCILIATION');
+  assert.equal(operation.error_class, 'business_abandoned');
+  const second = await invoke(middleware, {
+    body,
+    path: '/post',
+    onNext: async () => { runs += 1; },
+  });
+  assert.equal(second.nextCalled, false);
+  assert.equal(second.res.statusCode, 503);
+  assert.equal(second.res.body.code, 'BUSINESS_ABANDONED');
+  assert.equal(second.res.body.data.retryable, false);
+  assert.equal(runs, 1);
+  assert.equal(chain.sent.length, 1);
+});
+
+test('a crash after the external action leaves an expired claim that a retry cannot run', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(24);
+  let clock = 8_000_000;
+  const middleware = feeMiddleware(makeCoordinator(chain, store), {
+    claimTtlMs: 1_000,
+    now: () => clock,
+    scheduleClaimRenewal: () => () => {},
+  });
+  const body = { idempotencyKey: 'crashed-action', text: 'already sent' };
+  const req = { method: 'POST', path: '/post', body, headers: {}, usageFeeAlreadyProcessed: false };
+  const res = {
+    statusCode: 200,
+    body: undefined,
+    status(code) { this.statusCode = code; return this; },
+    json(payload) { this.body = payload; return this; },
+  };
+  let runs = 0;
+  await middleware(req, res, () => {
+    runs += 1;
+    return undefined;
+  });
+  clock += 10_000;
+  const second = await invoke(middleware, {
+    body,
+    path: '/post',
+    onNext: async () => { runs += 1; },
+  });
+  assert.equal(second.nextCalled, false);
+  assert.equal(second.res.statusCode, 503);
+  assert.equal(second.res.body.code, 'BUSINESS_CLAIM_EXPIRED');
+  assert.equal(second.res.body.data.retryable, false);
+  const operation = await store.getOperation(req.makexOperation.id);
+  assert.equal(operation.state, 'OPERATION_IN_PROGRESS');
+  assert.equal(operation.error_class, 'business_claim_expired');
+  assert.equal(operation.result_json ?? null, null);
+  assert.ok(operation.fee_tx_hash);
+  const third = await invoke(middleware, {
+    body,
+    path: '/post',
+    onNext: async () => { runs += 1; },
+  });
+  assert.equal(third.nextCalled, false);
+  assert.equal(third.res.body.code, 'BUSINESS_CLAIM_EXPIRED');
+  const fresh = await invoke(middleware, {
+    body: { idempotencyKey: 'intentional-new-action', text: 'already sent' },
+    path: '/post',
+    onNext: async (_req, response) => {
+      runs += 1;
+      await response.json({ status: 'success', result: { id: 'new' } });
+    },
+  });
+  assert.equal(fresh.nextCalled, true);
+  assert.equal(fresh.res.body.result.id, 'new');
+  assert.equal(runs, 2);
+  assert.equal(chain.sent.length, 2);
+});
+
+test('a stale claim owner cannot store a newer worker result', async () => {
+  const store = createMemoryStore();
+  const begun = await store.beginOperation({
+    idempotencyKey: 'fence',
+    fingerprint: 'same',
+    appId: 'makex-transfers',
+    chainId: '1',
+    sender: WALLET,
+  });
+  await store.claimBusiness({ id: begun.operation.id, owner: 'worker-a', ttlMs: 5000, now: 0 });
+  const intruder = await store.finishBusiness({
+    id: begun.operation.id,
+    owner: 'worker-b',
+    patch: { state: 'OPERATION_CONFIRMED' },
+    now: 1000,
+  });
+  assert.equal(intruder.ok, false);
+  assert.equal(intruder.reason, 'stale_claim');
+  const takeover = await store.claimBusiness({ id: begun.operation.id, owner: 'worker-b', ttlMs: 5000, now: 6000 });
+  assert.equal(takeover.claimed, false);
+  assert.equal(takeover.reason, 'needs_reconciliation');
+  const expiredOwner = await store.finishBusiness({
+    id: begun.operation.id,
+    owner: 'worker-a',
+    patch: { state: 'OPERATION_CONFIRMED' },
+    now: 6000,
+  });
+  assert.equal(expiredOwner.ok, false);
+  assert.equal(expiredOwner.reason, 'claim_expired');
+  assert.equal((await store.getOperation(begun.operation.id)).state, 'OPERATION_IN_PROGRESS');
+});
+
+test('uploaded media bytes change the idempotency fingerprint', () => {
+  const body = { text: 'same caption', idempotencyKey: 'media-key' };
+  const first = fingerprintRequest({ method: 'POST', path: '/post', body, file: { buffer: Buffer.from('image-a') } });
+  const replay = fingerprintRequest({ method: 'POST', path: '/post', body, file: { buffer: Buffer.from('image-a') } });
+  const different = fingerprintRequest({ method: 'POST', path: '/post', body, file: { buffer: Buffer.from('image-b') } });
+  const textOnly = fingerprintRequest({ method: 'POST', path: '/post', body });
+  assert.equal(first, replay);
+  assert.notEqual(first, different);
+  assert.notEqual(first, textOnly);
+});
+
+test('the same idempotency key with different media does not start a second action', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(12);
+  const middleware = feeMiddleware(makeCoordinator(chain, store));
+  const body = { idempotencyKey: 'media-key', text: 'caption' };
+  let runs = 0;
+  const first = await invoke(middleware, {
+    body,
+    file: { buffer: Buffer.from('image-a') },
+    onNext: async (_req, res) => {
+      runs += 1;
+      await res.json({ status: 'success', result: { id: 'post-a' } });
+    },
+  });
+  assert.equal(first.res.statusCode, 200);
+  const second = await invoke(middleware, {
+    body,
+    file: { buffer: Buffer.from('image-b') },
+    onNext: async () => {
+      runs += 1;
+    },
+  });
+  assert.equal(second.res.statusCode, 409);
+  assert.equal(second.res.body.code, 'IDEMPOTENCY_CONFLICT');
+  assert.equal(second.nextCalled, false);
+  assert.equal(runs, 1);
+  assert.equal(chain.sent.length, 1);
 });

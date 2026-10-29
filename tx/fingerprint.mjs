@@ -24,6 +24,19 @@ function canonicalize(value) {
   return value;
 }
 
+function mediaDigest(req) {
+  const buffers = [];
+  if (req?.file?.buffer) buffers.push(req.file.buffer);
+  const many = Array.isArray(req?.files) ? req.files : [];
+  for (const file of many) {
+    if (file?.buffer) buffers.push(file.buffer);
+  }
+  if (!buffers.length) return '';
+  const hash = createHash('sha256');
+  for (const buffer of buffers) hash.update(buffer);
+  return hash.digest('hex');
+}
+
 export function fingerprintRequest(req) {
   const body = req?.body && typeof req.body === 'object' ? req.body : {};
   const payload = {
@@ -31,6 +44,8 @@ export function fingerprintRequest(req) {
     path: req?.path || req?.originalUrl || '',
     body: canonicalize(body),
   };
+  const mediaSha256 = mediaDigest(req);
+  if (mediaSha256) payload.mediaSha256 = mediaSha256;
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 

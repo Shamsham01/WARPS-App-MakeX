@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import test from 'node:test';
+import { Address, Transaction } from '@multiversx/sdk-core';
 
 const require = createRequire(import.meta.url);
-import { identifyTransaction } from '../tx/chain.mjs';
+import { identifyTransaction, rebuildTransaction } from '../tx/chain.mjs';
 import { createTxCoordinator, submitSequentialBatch } from '../tx/coordinator.mjs';
 import { createMemoryStore } from '../tx/memoryStore.mjs';
 import {
@@ -500,6 +501,277 @@ test('logs redact PEM material', async () => {
   const rendered = logs.join('\n');
   assert.equal(rendered.includes('SECRET'), false);
   assert.equal(rendered.includes('BEGIN PRIVATE KEY'), false);
+});
+
+function esdtPayload(tokenIdentifier, amountWei) {
+  const tokenIdentifierHex = Buffer.from(tokenIdentifier, 'utf8').toString('hex');
+  let amountHex = BigInt(amountWei).toString(16);
+  if (amountHex.length % 2 !== 0) amountHex = `0${amountHex}`;
+  return `ESDTTransfer@${tokenIdentifierHex}@${amountHex}`;
+}
+
+function makeRealCoordinator(chain, store) {
+  return createTxCoordinator({
+    store,
+    chain,
+    appId: 'makex-transfers',
+    instanceId: 'hash-instance',
+    log: () => {},
+    sleepFn: async () => {},
+    config: {
+      network: '1',
+      leaseTtlMs: 30000,
+      queueTimeoutMs: 3000,
+      pollIntervalMs: 1,
+      pollMaxMs: 15,
+      pollMaxIntervalMs: 5,
+      backoff: 1,
+      maxRebroadcasts: 1,
+    },
+  });
+}
+
+function sdkFeeInput(data, operationId) {
+  return {
+    senderAddress: TEST_WALLET,
+    purpose: 'fee',
+    operationId,
+    appId: 'makex-transfers',
+    buildTx(nonce) {
+      const tx = new Transaction({
+        sender: new Address(TEST_WALLET),
+        receiver: new Address(TEST_WALLET),
+        value: 0n,
+        data,
+        gasLimit: 500000n,
+        chainID: '1',
+      });
+      tx.nonce = BigInt(nonce);
+      return tx;
+    },
+    signTx: async (tx) => {
+      tx.signature = Buffer.alloc(64, 4);
+    },
+  };
+}
+
+function createGatewayChain(start = 13) {
+  let accountNonce = start;
+  const statuses = new Map();
+  const chain = {
+    sent: [],
+    publishSuccess: true,
+    foreignHash: null,
+    recordFor() {
+      return null;
+    },
+    async getAccountNonce() {
+      return accountNonce;
+    },
+    async send(tx) {
+      const local = identifyTransaction(tx).txHash;
+      const gateway = identifyTransaction(rebuildTransaction(tx.toPlainObject())).txHash;
+      const returned = chain.foreignHash || gateway;
+      chain.sent.push({ local, gateway, returned, nonce: Number(tx.nonce) });
+      if (chain.publishSuccess && !chain.foreignHash) {
+        statuses.set(gateway, { status: 'success', transaction: chain.recordFor(tx) });
+      }
+      accountNonce = Math.max(accountNonce, Number(tx.nonce) + 1);
+      return returned;
+    },
+    async getStatus(hash) {
+      return statuses.get(hash) || { status: 'not_found' };
+    },
+    setStatus(hash, status) {
+      statuses.set(hash, status);
+    },
+  };
+  return chain;
+}
+
+test('a verified gateway hash is confirmed once and is not charged again', async () => {
+  const store = createMemoryStore();
+  const chain = createGatewayChain(13);
+  const coordinator = makeRealCoordinator(chain, store);
+  const payload = esdtPayload('REWARD-cf6eac', 40947869622n);
+  const first = await coordinator.submitAndConfirm(sdkFeeInput(payload, 'op-reward-hash'));
+  assert.equal(first.status, 'success');
+  assert.equal(first.txHash, chain.sent[0].gateway);
+  assert.notEqual(chain.sent[0].local, chain.sent[0].gateway);
+  assert.equal(first.reconciliation.localHash, chain.sent[0].local);
+  assert.equal(first.reconciliation.gatewayHash, chain.sent[0].gateway);
+  const again = await coordinator.submitAndConfirm(sdkFeeInput(payload, 'op-reward-hash'));
+  assert.equal(again.txHash, first.txHash);
+  assert.equal(chain.sent.length, 1);
+  const rows = await store.listReservationsForOperation('op-reward-hash');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].state, 'CONFIRMED');
+  assert.match(rows[0].error_detail, /local_hash=/);
+  assert.match(rows[0].error_detail, /gateway_hash=/);
+});
+
+test('an advanced nonce does not confirm a fee whose gateway transaction is not indexed', async () => {
+  const store = createMemoryStore();
+  const chain = createGatewayChain(13);
+  chain.publishSuccess = false;
+  const coordinator = makeRealCoordinator(chain, store);
+  const payload = esdtPayload('USDC-c76f1f', 30000n);
+  await assert.rejects(
+    coordinator.submitAndConfirm(sdkFeeInput(payload, 'op-unindexed')),
+    (error) => error.code === 'TX_NEEDS_RECONCILIATION' && error.errorClass === 'hash_mismatch',
+  );
+  assert.equal(chain.sent.length, 1);
+  await assert.rejects(
+    coordinator.submitAndConfirm(sdkFeeInput(payload, 'op-unindexed')),
+    (error) => error.code === 'TX_NEEDS_RECONCILIATION',
+  );
+  assert.equal(chain.sent.length, 1);
+  const rows = await store.listReservationsForOperation('op-unindexed');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].state, 'NEEDS_RECONCILIATION');
+  assert.equal(rows[0].error_class, 'hash_mismatch');
+  assert.notEqual(rows[0].state, 'CONFIRMED');
+
+  chain.setStatus(chain.sent[0].gateway, { status: 'success' });
+  const recovered = await coordinator.submitAndConfirm(sdkFeeInput(payload, 'op-unindexed'));
+  assert.equal(recovered.status, 'success');
+  assert.equal(recovered.txHash, chain.sent[0].gateway);
+  assert.equal(chain.sent.length, 1);
+});
+
+test('a foreign gateway hash is not treated as a paid fee when the nonce advances', async () => {
+  const store = createMemoryStore();
+  const chain = createGatewayChain(20);
+  chain.foreignHash = 'ab'.repeat(32);
+  chain.setStatus(chain.foreignHash, { status: 'success' });
+  const coordinator = makeRealCoordinator(chain, store);
+  await assert.rejects(
+    coordinator.submitAndConfirm(sdkFeeInput(esdtPayload('REWARD-cf6eac', 1n), 'op-foreign')),
+    (error) => error.code === 'TX_NEEDS_RECONCILIATION',
+  );
+  await assert.rejects(
+    coordinator.submitAndConfirm(sdkFeeInput(esdtPayload('REWARD-cf6eac', 1n), 'op-foreign')),
+    (error) => error.code === 'TX_NEEDS_RECONCILIATION' || error.code === 'TX_PENDING',
+  );
+  assert.equal(chain.sent.length, 1);
+  const rows = await store.listReservationsForOperation('op-foreign');
+  assert.equal(rows[0].state, 'NEEDS_RECONCILIATION');
+  assert.equal(rows[0].nonce, 20);
+});
+
+test('a successful status with a different transaction record does not confirm the fee', async () => {
+  const store = createMemoryStore();
+  const chain = createGatewayChain(8);
+  chain.recordFor = () => ({
+    sender: 'erd1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gq4hu',
+    receiver: TEST_WALLET,
+    nonce: 8,
+    chainID: '1',
+    data: 'bm90LXRoZS1mZWU=',
+    signature: '00',
+  });
+  const coordinator = makeRealCoordinator(chain, store);
+  await assert.rejects(
+    coordinator.submitAndConfirm(sdkFeeInput(esdtPayload('USDC-c76f1f', 1n), 'op-record')),
+    (error) => error.code === 'TX_NEEDS_RECONCILIATION',
+  );
+  const rows = await store.listReservationsForOperation('op-record');
+  assert.equal(rows[0].state, 'NEEDS_RECONCILIATION');
+  assert.notEqual(rows[0].state, 'CONFIRMED');
+});
+
+test('a failed broadcast does not allocate a second usage-fee nonce', async () => {
+  const store = createMemoryStore();
+  const chain = createGatewayChain(4);
+  let calls = 0;
+  chain.send = async (tx) => {
+    calls += 1;
+    const gateway = identifyTransaction(rebuildTransaction(tx.toPlainObject())).txHash;
+    chain.sent.push({ gateway, nonce: Number(tx.nonce) });
+    if (calls === 1) throw new Error('socket timeout before acceptance');
+    chain.setStatus(gateway, { status: 'success' });
+    return gateway;
+  };
+  const coordinator = makeRealCoordinator(chain, store);
+  const payload = Buffer.from(esdtPayload('USDC-c76f1f', 30000n), 'utf8');
+  await assert.rejects(
+    coordinator.submitAndConfirm(sdkFeeInput(payload, 'op-broadcast')),
+    (error) => error.code === 'TX_INCONCLUSIVE' || error.code === 'TX_NEEDS_RECONCILIATION',
+  );
+  const recovered = await coordinator.submitAndConfirm(sdkFeeInput(payload, 'op-broadcast'));
+  assert.equal(recovered.status, 'success');
+  assert.deepEqual(chain.sent.map((tx) => tx.nonce), [4, 4]);
+  const rows = await store.listReservationsForOperation('op-broadcast');
+  assert.equal(rows.length, 1);
+});
+
+test('a confirmed usage fee does not complete the primary operation', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(3);
+  const coordinator = makeCoordinator(chain, store);
+  const middleware = feeMiddleware(coordinator);
+  const body = { idempotencyKey: 'fee-only', recipient: 'erd1dest', amount: 1, tokenTicker: 'USDC-c76f1f' };
+  const first = await invokeFee(middleware, {
+    body,
+    onNext: async () => {
+      throw new Error('primary transfer was not executed');
+    },
+  });
+  assert.equal(first.nextCalled, true);
+  assert.equal(first.res.statusCode, 400);
+  const operation = await store.getOperation(first.req.makexOperation.id);
+  assert.equal(operation.state, 'OPERATION_FAILED');
+  assert.equal(operation.primary_tx_hash, null);
+  assert.notEqual(operation.state, 'OPERATION_CONFIRMED');
+  assert.ok(operation.fee_tx_hash);
+  const second = await invokeFee(middleware, {
+    body,
+    onNext: async (req) => {
+      await resJson(req, 'primary-later');
+    },
+  });
+  assert.equal(second.nextCalled, true);
+  assert.equal(chain.sent.length, 1);
+  assert.equal(second.req.usageFeeHash, first.req.usageFeeHash);
+});
+
+test('a usage-fee hash mismatch is recorded and does not start the primary transfer', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(9);
+  chain.sendImpl = async (tx) => {
+    chain.sent.push({ hash: 'foreign', nonce: Number(tx.nonce) });
+    chain.setAccountNonce(Number(tx.nonce) + 1);
+    return 'ab'.repeat(32);
+  };
+  const coordinator = makeCoordinator(chain, store);
+  const middleware = feeMiddleware(coordinator);
+  const body = { idempotencyKey: 'mismatch-fee', recipient: 'erd1dest', amount: 1, tokenTicker: 'USDC-c76f1f' };
+  const first = await invokeFee(middleware, {
+    body,
+    onNext: async () => {
+      throw new Error('primary must not run');
+    },
+  });
+  assert.equal(first.nextCalled, false);
+  assert.equal(first.res.statusCode, 503);
+  const operation = await store.getOperation(first.req.makexOperation.id);
+  assert.equal(operation.state, 'NEEDS_RECONCILIATION');
+  assert.equal(operation.error_class, 'hash_mismatch');
+  assert.match(operation.error_detail, /local_hash=/);
+  assert.match(operation.error_detail, /gateway_hash=abababab/);
+  assert.equal(operation.progress_json.fee_reconciliation.primaryExecuted, false);
+  assert.equal(operation.progress_json.fee_reconciliation.gatewayHash, 'ab'.repeat(32));
+  assert.equal(operation.primary_tx_hash, null);
+  assert.equal(operation.fee_tx_hash, operation.progress_json.fee_reconciliation.localHash);
+  assert.notEqual(operation.fee_tx_hash, 'ab'.repeat(32));
+  assert.notEqual(operation.state, 'FEE_CONFIRMED');
+  const second = await invokeFee(middleware, { body });
+  assert.equal(second.nextCalled, false);
+  assert.equal(chain.sent.length, 1);
+  const rows = await store.listReservationsForOperation(operation.id);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].state, 'NEEDS_RECONCILIATION');
+  assert.equal(rows[0].error_class, 'hash_mismatch');
 });
 
 test('ledger insert errors are visible and do not hide a confirmed fee', async () => {

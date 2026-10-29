@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,22 +8,59 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const migrationsDir = path.join(root, 'supabase', 'migrations');
 const container = `makex-tx-rpc-${process.pid}`;
+const localDb = `makex_tx_rpc_${process.pid}`;
 
-function docker(args, input) {
-  const result = spawnSync('docker', args, {
+function run(command, args, input) {
+  const result = spawnSync(command, args, {
     input,
     encoding: 'utf8',
     timeout: 120000,
   });
   if (result.error) throw result.error;
   if (result.status !== 0) {
-    throw new Error((result.stderr || result.stdout || `docker exited ${result.status}`).trim());
+    throw new Error((result.stderr || result.stdout || `${command} exited ${result.status}`).trim());
   }
   return (result.stdout || '').trim();
 }
 
-function psql(sql) {
-  return docker(['exec', '-i', container, 'psql', '-U', 'postgres', '-d', 'makex_tx', '-v', 'ON_ERROR_STOP=1', '-t', '-A'], sql);
+function resolveDocker() {
+  const candidates = [
+    process.env.DOCKER,
+    'docker',
+    'C:\\Users\\sheme\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe',
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (candidate !== 'docker' && !existsSync(candidate)) continue;
+    const probe = spawnSync(candidate, ['version'], { encoding: 'utf8' });
+    if (!probe.error && probe.status === 0) return candidate;
+  }
+  return null;
+}
+
+const dockerBin = resolveDocker();
+
+function dockerAvailable() {
+  return Boolean(dockerBin);
+}
+
+const useDocker = dockerAvailable();
+
+function docker(args, input) {
+  return run(dockerBin, args, input);
+}
+
+function psql(sql, database = useDocker ? 'makex_tx' : localDb) {
+  if (useDocker) {
+    return docker(['exec', '-i', container, 'psql', '-U', 'postgres', '-d', database, '-v', 'ON_ERROR_STOP=1', '-t', '-A'], sql);
+  }
+  return run('sudo', ['-u', 'postgres', 'psql', '-d', database, '-v', 'ON_ERROR_STOP=1', '-t', '-A'], sql);
+}
+
+function psqlStatus(sql, database = useDocker ? 'makex_tx' : localDb) {
+  if (useDocker) {
+    return spawnSync(dockerBin, ['exec', '-i', container, 'psql', '-U', 'postgres', '-d', database, '-v', 'ON_ERROR_STOP=1', '-c', sql], { encoding: 'utf8' });
+  }
+  return spawnSync('sudo', ['-u', 'postgres', 'psql', '-d', database, '-v', 'ON_ERROR_STOP=1', '-c', sql], { encoding: 'utf8' });
 }
 
 function query(sql) {
@@ -32,21 +69,29 @@ function query(sql) {
 }
 
 test('coordinator RPC functions enforce idempotency, one unresolved nonce, and service-role grants', async () => {
-  docker(['run', '-d', '--name', container, '-e', 'POSTGRES_PASSWORD=postgres', '-e', 'POSTGRES_DB=makex_tx', 'postgres:16']);
+  if (useDocker) {
+    docker(['run', '-d', '--name', container, '-e', 'POSTGRES_PASSWORD=postgres', '-e', 'POSTGRES_DB=makex_tx', 'postgres:16']);
+  } else {
+    psql(`create database ${localDb};`, 'postgres');
+  }
   try {
-    const readyDeadline = Date.now() + 40000;
-    let readyError = 'postgres did not accept connections';
-    let ready = false;
-    while (Date.now() < readyDeadline) {
-      const probe = spawnSync('docker', ['exec', container, 'psql', '-U', 'postgres', '-d', 'makex_tx', '-c', 'select 1'], { encoding: 'utf8' });
-      if (probe.status === 0) {
-        ready = true;
-        break;
+    if (useDocker) {
+      const readyDeadline = Date.now() + 40000;
+      let readyError = 'postgres did not accept connections';
+      let ready = false;
+      while (Date.now() < readyDeadline) {
+        const probe = spawnSync(dockerBin, ['exec', container, 'psql', '-U', 'postgres', '-d', 'makex_tx', '-c', 'select 1'], { encoding: 'utf8' });
+        if (probe.status === 0) {
+          ready = true;
+          break;
+        }
+        readyError = (probe.stderr || probe.stdout || probe.error?.message || 'postgres is starting').trim();
+        await new Promise((resolve) => setTimeout(resolve, 500));
       }
-      readyError = (probe.stderr || probe.stdout || probe.error?.message || 'postgres is starting').trim();
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      assert.equal(ready, true, readyError);
+    } else {
+      psql('select 1');
     }
-    assert.equal(ready, true, readyError);
 
     psql(`
       do $$ begin
@@ -154,9 +199,26 @@ test('coordinator RPC functions enforce idempotency, one unresolved nonce, and s
     const secondClaim = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-b', 60000);`);
     assert.equal(secondClaim.claimed, false);
     assert.equal(secondClaim.reason, 'in_progress');
+    const renewed = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-a', 60000);`);
+    assert.equal(renewed.claimed, true);
+    assert.equal(psql(`select claim_owner from public.makex_operations where id = '${claimId}';`), 'owner-a');
+    psql(`update public.makex_operations set claim_expires_at = now() - interval '1 minute', result_json = null where id = '${claimId}';`);
+    const expired = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-b', 60000);`);
+    assert.equal(expired.claimed, false);
+    assert.equal(expired.reason, 'needs_reconciliation');
+    assert.equal(expired.operation.state, 'OPERATION_IN_PROGRESS');
+    assert.equal(expired.operation.error_class, 'business_claim_expired');
+    assert.equal(expired.operation.fee_tx_hash, 'fee-hash');
+    assert.equal(expired.operation.result_json, null);
+    const expiredAgain = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-c', 60000);`);
+    assert.equal(expiredAgain.claimed, false);
+    assert.equal(expiredAgain.reason, 'needs_reconciliation');
+    const sameOwnerAfterExpiry = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-a', 60000);`);
+    assert.equal(sameOwnerAfterExpiry.claimed, true);
     psql(`update public.makex_operations set claim_expires_at = now() - interval '1 minute' where id = '${claimId}';`);
-    const reclaimed = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-b', 60000);`);
-    assert.equal(reclaimed.claimed, true);
+    const crashedRetry = query(`select public.makex_tx_claim_business('${claimId}'::uuid, 'owner-d', 60000);`);
+    assert.equal(crashedRetry.claimed, false);
+    assert.equal(crashedRetry.operation.fee_tx_hash, 'fee-hash');
     const pending = query(`
       select public.makex_tx_update_operation(
         '${claimId}'::uuid,
@@ -169,16 +231,40 @@ test('coordinator RPC functions enforce idempotency, one unresolved nonce, and s
     const confirmedClaim = query(`select public.makex_tx_claim_business('${operationId}'::uuid, 'owner-c', 60000);`);
     assert.equal(confirmedClaim.claimed, false);
     assert.equal(confirmedClaim.reason, 'confirmed');
+    const fresh = query(`
+      select public.makex_tx_begin_operation('after-crash-key', 'fingerprint-b', 'makex-transfers', '1', 'erd1wallet');
+    `);
+    assert.equal(fresh.created, true);
 
-    const anonDenied = spawnSync(
-      'docker',
-      ['exec', '-i', container, 'psql', '-U', 'postgres', '-d', 'makex_tx', '-v', 'ON_ERROR_STOP=1', '-c',
-        'set role anon; select count(*) from public.makex_operations;'],
-      { encoding: 'utf8' },
-    );
+    const fenced = query(`
+      select public.makex_tx_begin_operation('finish-key', 'fingerprint-a', 'makex-transfers', '1', 'erd1wallet');
+    `);
+    const finishId = fenced.operation.id;
+    query(`select public.makex_tx_claim_business('${finishId}'::uuid, 'owner-a', 60000);`);
+    const stale = query(`
+      select public.makex_tx_finish_business(
+        '${finishId}'::uuid, 'owner-b', '{"state":"OPERATION_CONFIRMED"}'::jsonb
+      );
+    `);
+    assert.equal(stale.ok, false);
+    assert.equal(stale.reason, 'stale_claim');
+    const finished = query(`
+      select public.makex_tx_finish_business(
+        '${finishId}'::uuid, 'owner-a', '{"state":"OPERATION_CONFIRMED","http_status":200}'::jsonb
+      );
+    `);
+    assert.equal(finished.ok, true);
+    assert.equal(finished.operation.state, 'OPERATION_CONFIRMED');
+
+    const anonDenied = psqlStatus('set role anon; select count(*) from public.makex_operations;');
     assert.notEqual(anonDenied.status, 0);
     assert.match(`${anonDenied.stderr}`, /permission denied/i);
   } finally {
-    spawnSync('docker', ['rm', '-f', container], { encoding: 'utf8' });
+    if (useDocker) {
+      spawnSync(dockerBin, ['rm', '-f', container], { encoding: 'utf8' });
+    } else {
+      spawnSync('sudo', ['-u', 'postgres', 'psql', '-d', 'postgres', '-c',
+        `select pg_terminate_backend(pid) from pg_stat_activity where datname = '${localDb}'; drop database if exists ${localDb};`], { encoding: 'utf8' });
+    }
   }
 });

@@ -1,7 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import { redactPemFromString, sanitizeObjectForLog } from '../makexStandard.mjs';
-import { createMultiversxChain, identifyTransaction, rebuildTransaction } from './chain.mjs';
+import {
+  createMultiversxChain,
+  hashDiagnostic,
+  identifyTransaction,
+  isTxHash,
+  readHashDiagnostic,
+  rebuildTransaction,
+  signedPlainMatchesRecord,
+} from './chain.mjs';
 import { classifySendError, safeErrorDetail, TxCoordinationError } from './errors.mjs';
 import { createSupabaseStore } from './supabaseStore.mjs';
 import { pollTransaction } from './polling.mjs';
@@ -181,6 +189,82 @@ export function createTxCoordinator({
     });
   }
 
+  function canonicalHashOf(tx) {
+    if (!tx || typeof tx.toPlainObject !== 'function') return null;
+    try {
+      const identified = identify(rebuild(tx.toPlainObject()));
+      return isTxHash(identified?.txHash) ? identified.txHash : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function canonicalHashOfPlain(plain) {
+    if (!plain || typeof plain !== 'object') return null;
+    try {
+      const identified = identify(rebuild(plain));
+      return isTxHash(identified?.txHash) ? identified.txHash : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function acceptanceProved(plain, status) {
+    if (!status || (status.status !== 'success' && status.status !== 'fail')) return false;
+    if (!status.transaction) return true;
+    return signedPlainMatchesRecord(plain, status.transaction);
+  }
+
+  async function recoverAcceptedHash(lease, sender, reservation) {
+    if (!reservation?.signed_tx) return null;
+    const canonicalHash = canonicalHashOfPlain(reservation.signed_tx);
+    if (!canonicalHash) return null;
+    const noted = readHashDiagnostic(reservation.error_detail);
+    const gatewayHash = isTxHash(noted.gateway_hash) ? noted.gateway_hash : null;
+    if (gatewayHash && gatewayHash !== canonicalHash) return null;
+    if (reservation.tx_hash === canonicalHash && !gatewayHash) return null;
+
+    const status = await chain.getStatus(canonicalHash);
+    if (status.transaction && !signedPlainMatchesRecord(reservation.signed_tx, status.transaction)) {
+      return null;
+    }
+    if (status.status === 'success') {
+      const detail = reservation.error_detail || hashDiagnostic({
+        localHash: reservation.tx_hash,
+        gatewayHash: canonicalHash,
+        canonicalHash,
+      });
+      const updated = await transition(lease, sender, reservation, {
+        nextState: 'CONFIRMED',
+        txHash: canonicalHash,
+        errorClass: 'hash_mismatch_reconciled',
+        errorDetail: detail,
+      });
+      const outcome = outcomeFrom(updated, 'success');
+      outcome.reconciliation = {
+        localHash: reservation.tx_hash,
+        gatewayHash: canonicalHash,
+        canonicalHash,
+        nonce: updated.nonce,
+      };
+      return { action: 'done', outcome };
+    }
+    if (status.status === 'fail') {
+      const updated = await transition(lease, sender, reservation, {
+        nextState: 'FAILED',
+        txHash: canonicalHash,
+        errorClass: 'execution_failed',
+        errorDetail: status.details || reservation.error_detail,
+      });
+      return { action: 'done', outcome: outcomeFrom(updated, 'fail', status.details) };
+    }
+    if (status.status === 'pending') {
+      const updated = await transition(lease, sender, reservation, { nextState: 'PENDING' });
+      return { action: 'block', reservation: updated, code: 'TX_PENDING' };
+    }
+    return null;
+  }
+
   async function reconcileReservation(lease, sender, reservation) {
     if (!reservation) return { action: 'clear' };
     if (reservation.state === 'CONFIRMED') {
@@ -205,6 +289,15 @@ export function createTxCoordinator({
       ? await chain.getStatus(reservation.tx_hash)
       : { status: 'not_found' };
 
+    if ((status.status === 'success' || status.status === 'fail')
+      && !acceptanceProved(reservation.signed_tx, status)) {
+      const updated = await transition(lease, sender, reservation, {
+        nextState: 'NEEDS_RECONCILIATION',
+        errorClass: 'record_mismatch',
+        errorDetail: status.details || 'chain record did not match the signed transaction',
+      });
+      return { action: 'block', reservation: updated, code: 'TX_NEEDS_RECONCILIATION' };
+    }
     if (status.status === 'success') {
       const updated = await transition(lease, sender, reservation, { nextState: 'CONFIRMED' });
       return { action: 'done', outcome: outcomeFrom(updated, 'success') };
@@ -230,12 +323,15 @@ export function createTxCoordinator({
       return { action: 'block', reservation: updated, code: 'TX_INCONCLUSIVE' };
     }
 
+    const recovered = await recoverAcceptedHash(lease, sender, reservation);
+    if (recovered) return recovered;
+
     const chainNonce = await chain.getAccountNonce(sender);
     if (chainNonce > reservation.nonce) {
       const updated = await transition(lease, sender, reservation, {
         nextState: 'NEEDS_RECONCILIATION',
         chainNonce,
-        errorClass: 'missing_tx_chain_moved',
+        errorClass: reservation.error_class === 'hash_mismatch' ? 'hash_mismatch' : 'missing_tx_chain_moved',
       });
       return { action: 'block', reservation: updated, code: 'TX_NEEDS_RECONCILIATION' };
     }
@@ -258,7 +354,50 @@ export function createTxCoordinator({
     }
 
     try {
-      await chain.send(rebuild(reservation.signed_tx));
+      const gatewayHash = await chain.send(rebuild(reservation.signed_tx));
+      if (gatewayHash && reservation.tx_hash && gatewayHash !== reservation.tx_hash) {
+        const canonicalHash = canonicalHashOfPlain(reservation.signed_tx);
+        const detail = hashDiagnostic({
+          localHash: reservation.tx_hash,
+          gatewayHash,
+          canonicalHash,
+        });
+        const noted = await transition(lease, sender, reservation, {
+          nextState: 'NEEDS_RECONCILIATION',
+          errorClass: 'hash_mismatch',
+          errorDetail: detail,
+          attempt: reservation.attempt + 1,
+        });
+        if (isTxHash(canonicalHash) && gatewayHash === canonicalHash) {
+          const polled = await poll(gatewayHash, sender, lease);
+          if (polled.status === 'success' && acceptanceProved(reservation.signed_tx, polled)) {
+            const confirmed = await transition(lease, sender, noted, {
+              nextState: 'CONFIRMED',
+              txHash: gatewayHash,
+              errorClass: 'hash_mismatch_reconciled',
+              errorDetail: detail,
+            });
+            const outcome = outcomeFrom(confirmed, 'success');
+            outcome.reconciliation = {
+              localHash: reservation.tx_hash,
+              gatewayHash,
+              canonicalHash,
+              nonce: confirmed.nonce,
+            };
+            return { action: 'done', outcome };
+          }
+          if (polled.status === 'fail' && acceptanceProved(reservation.signed_tx, polled)) {
+            const failed = await transition(lease, sender, noted, {
+              nextState: 'FAILED',
+              txHash: gatewayHash,
+              errorClass: 'execution_failed',
+              errorDetail: polled.details || detail,
+            });
+            return { action: 'done', outcome: outcomeFrom(failed, 'fail', polled.details) };
+          }
+        }
+        return { action: 'block', reservation: noted, code: 'TX_NEEDS_RECONCILIATION' };
+      }
       const updated = await transition(lease, sender, reservation, {
         nextState: 'SUBMITTED',
         attempt: reservation.attempt + 1,
@@ -310,6 +449,19 @@ export function createTxCoordinator({
   }
 
   async function finishPolled(lease, sender, reservation, polled) {
+    if ((polled.status === 'success' || polled.status === 'fail')
+      && !acceptanceProved(reservation.signed_tx, polled)) {
+      const updated = await transition(lease, sender, reservation, {
+        nextState: 'NEEDS_RECONCILIATION',
+        errorClass: 'record_mismatch',
+        errorDetail: polled.details || 'chain record did not match the signed transaction',
+      });
+      await blockFor(
+        updated,
+        'TX_NEEDS_RECONCILIATION',
+        'The chain record did not match the signed transaction. No replacement payment was created.',
+      );
+    }
     if (polled.status === 'success') {
       const updated = await transition(lease, sender, reservation, { nextState: 'CONFIRMED' });
       return outcomeFrom(updated, 'success');
@@ -418,12 +570,60 @@ export function createTxCoordinator({
         try {
           const gatewayHash = await chain.send(tx);
           if (gatewayHash && gatewayHash !== identity.txHash) {
-            await transition(activeLease, sender, saved.reservation, {
+            const canonicalHash = canonicalHashOf(tx);
+            const detail = hashDiagnostic({
+              localHash: identity.txHash,
+              gatewayHash,
+              canonicalHash,
+            });
+            const noted = await transition(activeLease, sender, saved.reservation, {
               nextState: 'NEEDS_RECONCILIATION',
               txHash: identity.txHash,
               errorClass: 'hash_mismatch',
-              errorDetail: `gateway_hash=${gatewayHash}`,
+              errorDetail: detail,
             });
+            logEvent('error', 'Local transaction hash differed from the gateway hash', {
+              appId,
+              senderAddress: sender,
+              purpose: input.purpose,
+              operationId: input.operationId || null,
+              nonce: saved.reservation.nonce,
+              txHash: identity.txHash,
+              gatewayHash,
+              canonicalHash,
+              errorClass: 'hash_mismatch',
+            });
+            const verified = isTxHash(canonicalHash) && gatewayHash === canonicalHash;
+            if (verified) {
+              const polled = await poll(gatewayHash, sender, activeLease);
+              const proved = acceptanceProved(identity.plain, polled);
+              if (polled.status === 'success' && proved) {
+                const confirmed = await transition(activeLease, sender, noted, {
+                  nextState: 'CONFIRMED',
+                  txHash: gatewayHash,
+                  errorClass: 'hash_mismatch_reconciled',
+                  errorDetail: detail,
+                });
+                if (input.onSubmitted) await input.onSubmitted(confirmed);
+                const outcome = outcomeFrom(confirmed, 'success');
+                outcome.reconciliation = {
+                  localHash: identity.txHash,
+                  gatewayHash,
+                  canonicalHash,
+                  nonce: confirmed.nonce,
+                };
+                return outcome;
+              }
+              if (polled.status === 'fail' && proved) {
+                const failed = await transition(activeLease, sender, noted, {
+                  nextState: 'FAILED',
+                  txHash: gatewayHash,
+                  errorClass: 'execution_failed',
+                  errorDetail: polled.details || detail,
+                });
+                return outcomeFrom(failed, 'fail', polled.details);
+              }
+            }
             throw new TxCoordinationError(
               'TX_NEEDS_RECONCILIATION',
               'The gateway hash did not match the signed transaction. No replacement payment was created.',
@@ -431,9 +631,12 @@ export function createTxCoordinator({
                 retryable: true,
                 httpStatus: 503,
                 txHash: identity.txHash,
+                gatewayHash,
+                canonicalHash,
                 nonce: saved.reservation.nonce,
                 operationId: input.operationId || null,
                 errorClass: 'hash_mismatch',
+                state: 'NEEDS_RECONCILIATION',
               },
             );
           }
@@ -460,6 +663,27 @@ export function createTxCoordinator({
           const kind = classifySendError(error);
           const observed = await chain.getStatus(identity.txHash);
           if (observed.status === 'success' || observed.status === 'fail' || observed.status === 'pending') {
+            if ((observed.status === 'success' || observed.status === 'fail')
+              && !acceptanceProved(identity.plain, observed)) {
+              await transition(activeLease, sender, saved.reservation, {
+                nextState: 'NEEDS_RECONCILIATION',
+                errorClass: 'record_mismatch',
+                errorDetail: observed.details || 'chain record did not match the signed transaction',
+              });
+              throw new TxCoordinationError(
+                'TX_NEEDS_RECONCILIATION',
+                'The chain record did not match the signed transaction. No replacement payment was created.',
+                {
+                  retryable: true,
+                  httpStatus: 503,
+                  txHash: identity.txHash,
+                  nonce: saved.reservation.nonce,
+                  operationId: input.operationId || null,
+                  errorClass: 'record_mismatch',
+                  state: 'NEEDS_RECONCILIATION',
+                },
+              );
+            }
             const submitted = await transition(activeLease, sender, saved.reservation, {
               nextState: observed.status === 'success' ? 'CONFIRMED' : observed.status === 'fail' ? 'FAILED' : 'SUBMITTED',
               errorClass: 'broadcast_response_lost',
