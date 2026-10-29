@@ -289,6 +289,15 @@ export function createTxCoordinator({
       ? await chain.getStatus(reservation.tx_hash)
       : { status: 'not_found' };
 
+    if ((status.status === 'success' || status.status === 'fail')
+      && !acceptanceProved(reservation.signed_tx, status)) {
+      const updated = await transition(lease, sender, reservation, {
+        nextState: 'NEEDS_RECONCILIATION',
+        errorClass: 'record_mismatch',
+        errorDetail: status.details || 'chain record did not match the signed transaction',
+      });
+      return { action: 'block', reservation: updated, code: 'TX_NEEDS_RECONCILIATION' };
+    }
     if (status.status === 'success') {
       const updated = await transition(lease, sender, reservation, { nextState: 'CONFIRMED' });
       return { action: 'done', outcome: outcomeFrom(updated, 'success') };
@@ -440,6 +449,19 @@ export function createTxCoordinator({
   }
 
   async function finishPolled(lease, sender, reservation, polled) {
+    if ((polled.status === 'success' || polled.status === 'fail')
+      && !acceptanceProved(reservation.signed_tx, polled)) {
+      const updated = await transition(lease, sender, reservation, {
+        nextState: 'NEEDS_RECONCILIATION',
+        errorClass: 'record_mismatch',
+        errorDetail: polled.details || 'chain record did not match the signed transaction',
+      });
+      await blockFor(
+        updated,
+        'TX_NEEDS_RECONCILIATION',
+        'The chain record did not match the signed transaction. No replacement payment was created.',
+      );
+    }
     if (polled.status === 'success') {
       const updated = await transition(lease, sender, reservation, { nextState: 'CONFIRMED' });
       return outcomeFrom(updated, 'success');
@@ -641,6 +663,27 @@ export function createTxCoordinator({
           const kind = classifySendError(error);
           const observed = await chain.getStatus(identity.txHash);
           if (observed.status === 'success' || observed.status === 'fail' || observed.status === 'pending') {
+            if ((observed.status === 'success' || observed.status === 'fail')
+              && !acceptanceProved(identity.plain, observed)) {
+              await transition(activeLease, sender, saved.reservation, {
+                nextState: 'NEEDS_RECONCILIATION',
+                errorClass: 'record_mismatch',
+                errorDetail: observed.details || 'chain record did not match the signed transaction',
+              });
+              throw new TxCoordinationError(
+                'TX_NEEDS_RECONCILIATION',
+                'The chain record did not match the signed transaction. No replacement payment was created.',
+                {
+                  retryable: true,
+                  httpStatus: 503,
+                  txHash: identity.txHash,
+                  nonce: saved.reservation.nonce,
+                  operationId: input.operationId || null,
+                  errorClass: 'record_mismatch',
+                  state: 'NEEDS_RECONCILIATION',
+                },
+              );
+            }
             const submitted = await transition(activeLease, sender, saved.reservation, {
               nextState: observed.status === 'success' ? 'CONFIRMED' : observed.status === 'fail' ? 'FAILED' : 'SUBMITTED',
               errorClass: 'broadcast_response_lost',

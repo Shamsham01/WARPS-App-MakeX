@@ -353,6 +353,20 @@ export function createMemoryStore() {
       });
     },
 
+    finishBusiness({ id, owner, patch, now = Date.now() }) {
+      return lock(() => {
+        const operation = [...operations.values()].find((row) => row.id === id);
+        if (!operation) return { ok: false, reason: 'not_found' };
+        const expires = Date.parse(operation.claim_expires_at || 0);
+        if (operation.state !== 'OPERATION_IN_PROGRESS' || operation.claim_owner !== owner || expires <= now) {
+          const reason = operation.claim_owner !== owner ? 'stale_claim' : 'claim_expired';
+          return { ok: false, reason, operation: clone(operation) };
+        }
+        Object.assign(operation, patch, { updated_at: new Date().toISOString() });
+        return { ok: true, operation: clone(operation) };
+      });
+    },
+
     getOperation(id) {
       return lock(() => {
         const operation = [...operations.values()].find((row) => row.id === id);

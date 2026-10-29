@@ -58,9 +58,9 @@ Add an optional module parameter named `idempotencyKey`. Leave it empty to dedup
 
 If no key is sent, the API uses `request:` plus the canonical request fingerprint. A retry of the same request does not charge again. Two different explicit keys still create two payments, even when the amount and recipient match. A random `ephemeral:` key is no longer used.
 
-An HTTP 200 body is stored as `OPERATION_CONFIRMED` only when it is a finished business success. `status` or `finalStatus` of `pending`, `processing`, or `in_progress` is stored as `OPERATION_PENDING`. A retry runs the handler again and does not replay that incomplete body. `error`, `fail`, `failed`, `partial`, and `inconclusive` are stored as `OPERATION_FAILED`. The confirmed fee is kept either way, and a retry does not charge it again. A failed ledger write on a successful result returns HTTP 503 instead of hanging the request.
+An HTTP 200 body is stored as `OPERATION_CONFIRMED` only when it is a finished business success. `status` or `finalStatus` of `pending`, `processing`, or `in_progress` is stored as `OPERATION_PENDING`. A retry runs the handler again and does not replay that incomplete body. `error`, `fail`, `failed`, `partial`, and `inconclusive` are stored as `OPERATION_FAILED`. The confirmed fee is kept either way, and a retry does not charge it again. If the external action succeeded but the confirmed result cannot be stored, the operation is marked `NEEDS_RECONCILIATION` with `error_class` `business_result_unstored`. A retry returns HTTP 503 `BUSINESS_RESULT_UNSTORED` and does not run the action again. Reconcile that row before using a new idempotency key.
 
-Before the handler runs, the operation row is claimed. A second request with the same idempotency key receives HTTP 503 `OPERATION_IN_PROGRESS` until the first request stores a result or the claim expires. This prevents two concurrent X posts or direct messages. It cannot promise exactly-once delivery if the process stops after X accepts the call and before the result is stored. Leave the idempotency key empty to dedupe an identical retry. Set a new key to repeat an identical post on purpose. Field filters cannot hide a failure: the unfiltered outcome is classified before the filtered body is returned.
+Before the handler runs, the operation row is claimed. The owner renews that claim while the handler is still running, so a long snapshot or post does not lose the lease at 120 seconds. A second request with the same idempotency key receives HTTP 503 `OPERATION_IN_PROGRESS` until the owner stores a result. A worker whose claim has been replaced cannot overwrite the newer result. This cannot promise exactly-once delivery if the process stops after the external service accepts the call and before the result is stored. Leave the idempotency key empty to dedupe an identical retry. Set a new key to repeat an identical post on purpose. Uploaded file bytes are part of the request fingerprint, so the same key with different media is rejected. Field filters cannot hide a failure: the unfiltered outcome is classified before the filtered body is returned.
 
 ### Make.com errors
 
@@ -68,25 +68,17 @@ Retryable failures use HTTP 503 or 504 and `data.retryable: true`. Examples: `NO
 
 ## Deployment
 
-The migration `20261028220000_makex_tx_coordinator.sql` is already applied on production project `yalewhpzptgtfzwpzhjm`. Do not run it again. Before deploying this revision, apply only `20261028233000_makex_operation_claim.sql` in the Supabase SQL editor.
+The migrations `20261028220000_makex_tx_coordinator.sql` and `20261028233000_makex_operation_claim.sql` are already applied on production project `yalewhpzptgtfzwpzhjm`. Do not run them again and do not modify existing operation rows. Before deploying this revision, apply only `20261029190000_makex_finish_business.sql`. It adds `makex_tx_finish_business` and does not change existing rows.
 
 1. Confirm Render `SUPABASE_URL` contains `yalewhpzptgtfzwpzhjm`.
 2. Confirm `select public.makex_tx_health();` returns `{"ok": true, "version": 1, "store": "supabase"}` when called with the service role.
-3. Apply `20261028233000_makex_operation_claim.sql` once. Do not rerun the earlier coordinator migration.
-4. Deploy one MakeX service after review. Do not deploy all six at once.
+3. Apply `20261029190000_makex_finish_business.sql` once. Do not rerun the earlier coordinator migrations.
+4. Deploy one MakeX service after review. Do not deploy every service at once.
 5. Watch for `[TX_COORDINATOR] schema ready` in the Render log. Payments fail closed with `COORDINATOR_SCHEMA_MISSING` if the migration is absent. They do not fall back to the in-memory nonce cache.
 
 `MAKEX_CHAIN_ID` must stay `1` in production. It is the authority partition and the fee transaction chain id. Do not point it at devnet while the wallet still signs mainnet transactions.
 
 Polling defaults: 2s interval, 1.5x backoff, 8s cap, 90s maximum. Override with `MAKEX_TX_POLL_*`. One identical rebroadcast is allowed after an ambiguous submission (`MAKEX_TX_MAX_RECOVERY_ATTEMPTS`).
-
-## Transaction hash mismatch
-
-SDK 13, 14, and 15 hash `Transaction.data` as protobuf bytes. `toPlainObject()` base64-encodes that field with `Buffer.from(data)`. A JavaScript string is hashed differently from the UTF-8 bytes the gateway receives, so the local hash and the gateway hash diverge even though the signature is over the same sendable JSON.
-
-The usage-fee payload is therefore `Buffer.from(esdtData, 'utf8')`. The bytes are ASCII, so the same `Buffer.from` call is valid on SDK 13 (hash is a Buffer), 14, and 15 (hash is a hex string). `identifyTransaction` already accepts both.
-
-If a gateway hash still differs from the local hash, the coordinator stores `local_hash`, `gateway_hash`, and `canonical_hash` on the reservation and `progress_json.fee_reconciliation` on the operation. It confirms the fee only when the gateway hash equals the hash of the signed sendable transaction and that transaction's status is success. A chain record, when the status lookup includes one, must match sender, receiver, nonce, data, chain id, and signature. An advanced account nonce does not confirm a fee. The primary transfer does not run, and the operation is not marked `OPERATION_CONFIRMED`, until the fee itself is confirmed. No second nonce is reserved while that reservation is unresolved. No database migration is required: `error_detail` and `progress_json` already hold the diagnostic.
 
 ## Recovery
 

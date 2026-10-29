@@ -8,7 +8,7 @@ function asDbError(error, label) {
   if (missing) {
     return new TxCoordinationError(
       'COORDINATOR_SCHEMA_MISSING',
-      'Transaction coordinator schema is not installed. Apply supabase/migrations in filename order. Do not rerun 20261028220000_makex_tx_coordinator.sql if it is already applied. Apply 20261028233000_makex_operation_claim.sql before serving.',
+      'Transaction coordinator schema is not installed. Apply supabase/migrations in filename order. Do not rerun 20261028220000_makex_tx_coordinator.sql or 20261028233000_makex_operation_claim.sql if they are already applied. Apply 20261029190000_makex_finish_business.sql before serving this revision.',
       { retryable: false, httpStatus: 503, errorClass: 'schema_missing' },
     );
   }
@@ -184,6 +184,15 @@ export function createSupabaseStore(supabase) {
         'makex_tx_claim_business',
         { p_id: id, p_owner: owner, p_ttl_ms: ttlMs },
         'claim business operation',
+      );
+    },
+
+    finishBusiness({ id, owner, patch }) {
+      return call(
+        supabase,
+        'makex_tx_finish_business',
+        { p_id: id, p_owner: owner, p_patch: patch },
+        'finish business operation',
       );
     },
 

@@ -578,6 +578,19 @@ function ledgerFailureBody(operation, req) {
   });
 }
 
+function unstoredBusinessBody(operation, req, body) {
+  return buildMakeComErrorResponse({
+    code: 'BUSINESS_RESULT_UNSTORED',
+    message: 'The external action may already have completed, but its result was not stored. Do not run it again until this operation is reconciled. The usage fee will not be charged again.',
+    data: {
+      retryable: false,
+      operationId: operation.id,
+      usageFeeHash: req.usageFeeHash || operation.fee_tx_hash || null,
+      result: body,
+    },
+  });
+}
+
 function operationPatchForOutcome(outcome, status, responseBody, ledgerBody, operation) {
   if (outcome === 'confirmed') {
     return {
@@ -616,26 +629,55 @@ function continueAfterFee(req, res, next, operation) {
       const ledgerBody = res.makexBusinessOutcome || body;
       const outcome = classifyBusinessOutcome(status, ledgerBody);
       const patch = operationPatchForOutcome(outcome, status, body, ledgerBody, operation);
-      const releaseUnstoredSuccess = () => req.makexCoordinator.store.updateOperation({
+      const finish = (nextPatch) => req.makexCoordinator.store.finishBusiness({
         id: operation.id,
-        expectedState: 'OPERATION_IN_PROGRESS',
-        patch: { state: operation.fee_tx_hash || operation.skipped_whitelist ? 'FEE_CONFIRMED' : 'RECEIVED' },
-      }).catch(() => {});
+        owner: req.makexClaimOwner,
+        patch: nextPatch,
+        now: req.makexClaimNow ? req.makexClaimNow() : Date.now(),
+      });
+      const releaseRetryable = () => releaseBusinessClaim(req.makexCoordinator.store, operation).catch(() => {});
       return Promise.resolve()
-        .then(() => req.makexCoordinator.store.updateOperation({ id: operation.id, patch }))
+        .then(() => finish(patch))
         .then(async (updated) => {
-          if (!updated?.ok && outcome === 'confirmed') {
-            await releaseUnstoredSuccess();
+          if (updated?.ok) return originalJson(body);
+          if (updated?.reason === 'stale_claim' || updated?.reason === 'claim_expired') {
             res.status(503);
-            return originalJson(ledgerFailureBody(operation, req));
+            return originalJson(buildMakeComErrorResponse({
+              code: 'STALE_CLAIM',
+              message: 'This worker lost the operation claim and did not store its result. Reconcile the operation before running it again.',
+              data: { retryable: false, operationId: operation.id },
+            }));
           }
+          if (outcome === 'confirmed') {
+            await finish({
+              state: 'NEEDS_RECONCILIATION',
+              error_class: 'business_result_unstored',
+              error_detail: 'External action completed but the operation result was not stored.',
+              result_json: body,
+              http_status: status,
+              primary_tx_hash: primaryHashFromBody(ledgerBody, operation),
+            }).catch(() => {});
+            res.status(503);
+            return originalJson(unstoredBusinessBody(operation, req, body));
+          }
+          await releaseRetryable();
           return originalJson(body);
         })
         .catch(async () => {
-          if (outcome !== 'confirmed') return originalJson(body);
-          await releaseUnstoredSuccess();
-          res.status(503);
-          return originalJson(ledgerFailureBody(operation, req));
+          if (outcome === 'confirmed') {
+            await finish({
+              state: 'NEEDS_RECONCILIATION',
+              error_class: 'business_result_unstored',
+              error_detail: 'External action completed but the operation result was not stored.',
+              result_json: body,
+              http_status: status,
+              primary_tx_hash: primaryHashFromBody(ledgerBody, operation),
+            }).catch(() => {});
+            res.status(503);
+            return originalJson(unstoredBusinessBody(operation, req, body));
+          }
+          await releaseRetryable();
+          return originalJson(body);
         });
     };
     res.makexJsonWrapped = true;
@@ -668,12 +710,21 @@ async function releaseBusinessClaim(store, operation) {
   });
 }
 
-async function runBusiness(req, res, next, operation) {
+async function runBusiness(req, res, next, operation, claimOptions = {}) {
+  const claimTtlMs = claimOptions.claimTtlMs || 120000;
+  const claimRenewMs = claimOptions.claimRenewMs || 30000;
+  const clock = claimOptions.now || (() => Date.now());
+  const scheduleClaimRenewal = claimOptions.scheduleClaimRenewal || ((callback, intervalMs) => {
+    const timer = setInterval(callback, intervalMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    return () => clearInterval(timer);
+  });
   const owner = `${req.makexCoordinator?.instanceId || 'local'}:${randomUUID()}`;
   const claim = await req.makexCoordinator.store.claimBusiness({
     id: operation.id,
     owner,
-    ttlMs: 120000,
+    ttlMs: claimTtlMs,
+    now: clock(),
   });
   if (!claim?.ok) {
     throw new TxCoordinationError('LEDGER_WRITE_FAILED', 'Could not claim the operation before running it.', {
@@ -695,11 +746,20 @@ async function runBusiness(req, res, next, operation) {
     }));
   }
   req.makexOperation = claim.operation;
+  req.makexClaimOwner = owner;
+  req.makexClaimNow = clock;
+  const stopRenewal = scheduleClaimRenewal(() => {
+    req.makexCoordinator.store.claimBusiness({
+      id: operation.id,
+      owner,
+      ttlMs: claimTtlMs,
+      now: clock(),
+    }).catch(() => {});
+  }, claimRenewMs);
   try {
     return await continueAfterFee(req, res, next, claim.operation);
-  } catch (error) {
-    await releaseBusinessClaim(req.makexCoordinator.store, claim.operation).catch(() => {});
-    throw error;
+  } finally {
+    stopRenewal();
   }
 }
 
@@ -754,6 +814,10 @@ export function createUsageFeeMiddleware({
   deriveAddress,
   signFeeTransaction,
   network = process.env.MAKEX_CHAIN_ID || '1',
+  claimTtlMs = 120000,
+  claimRenewMs = 30000,
+  now,
+  scheduleClaimRenewal,
 } = {}) {
   if (!appId) {
     throw new Error('MAKEX_APP_ID is required for usage fee middleware');
@@ -841,6 +905,19 @@ export function createUsageFeeMiddleware({
         return replayConfirmed(res, operation);
       }
 
+      if (operation.state === 'NEEDS_RECONCILIATION' && operation.error_class === 'business_result_unstored') {
+        return res.status(503).json(buildMakeComErrorResponse({
+          code: 'BUSINESS_RESULT_UNSTORED',
+          message: 'The external action may already have completed, but its result was not stored. Do not run it again until this operation is reconciled. The usage fee will not be charged again.',
+          data: {
+            retryable: false,
+            operationId: operation.id,
+            usageFeeHash: operation.fee_tx_hash || null,
+            result: operation.result_json || null,
+          },
+        }));
+      }
+
       if (operation.state === 'INCONCLUSIVE' || operation.state === 'NEEDS_RECONCILIATION' || operation.state === 'FEE_SUBMITTED' || operation.state === 'FEE_PREPARED') {
         const resumed = await sendUsageFee({
           pemContent,
@@ -882,7 +959,7 @@ export function createUsageFeeMiddleware({
         operation = settled.operation;
         req.makexOperation = operation;
         req.usageFeeHash = resumed.txHash;
-        return await runBusiness(req, res, next, operation);
+        return await runBusiness(req, res, next, operation, { claimTtlMs, claimRenewMs, now, scheduleClaimRenewal });
       }
 
       const profile = await loadAppProfile(appId, supabase);
@@ -913,7 +990,7 @@ export function createUsageFeeMiddleware({
             operationId: operation.id,
           });
           req.makexOperation = skipped.operation;
-          return await runBusiness(req, res, next, skipped.operation);
+          return await runBusiness(req, res, next, skipped.operation, { claimTtlMs, claimRenewMs, now, scheduleClaimRenewal });
         }
         if (whitelistEligibility.reason === 'expired') {
           log('info', 'Whitelist entry expired, charging usage fee', { walletAddress, appId, operationId: operation.id });
@@ -997,7 +1074,7 @@ export function createUsageFeeMiddleware({
         });
       }
 
-      return await runBusiness(req, res, next, operation);
+      return await runBusiness(req, res, next, operation, { claimTtlMs, claimRenewMs, now, scheduleClaimRenewal });
     } catch (error) {
       const failedOperation = req.makexOperation;
       if (

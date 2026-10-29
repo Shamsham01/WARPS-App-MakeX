@@ -2,6 +2,27 @@ import { interpretTransactionRecord } from '../makexStandard.mjs';
 
 const RETRYABLE_HTTP = new Set([429, 502, 503, 504]);
 
+/**
+ * The public `/transactions/{hash}` resource is the transaction itself.
+ * It includes sender, receiver, nonce, base64 `data`, and hex `signature`.
+ * `chainID` is often absent; keep it only when the API sends one.
+ */
+export function apiTransactionRecord(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const looksLikeTransaction = body.sender != null || body.txHash != null || body.nonce != null || body.status != null;
+  if (!looksLikeTransaction) return null;
+  const chainID = body.chainID ?? body.chainId;
+  const record = {
+    sender: body.sender == null ? '' : String(body.sender),
+    receiver: body.receiver == null ? '' : String(body.receiver),
+    nonce: body.nonce,
+    data: body.data == null ? '' : String(body.data),
+    signature: body.signature == null ? '' : String(body.signature),
+  };
+  if (chainID != null && String(chainID) !== '') record.chainID = String(chainID);
+  return record;
+}
+
 export async function fetchTransactionStatus(txHash, fetchImpl, apiBase = 'https://api.multiversx.com') {
   const hash = String(txHash);
   const url = `${apiBase}/transactions/${encodeURIComponent(hash)}?withResults=true`;
@@ -22,8 +43,10 @@ export async function fetchTransactionStatus(txHash, fetchImpl, apiBase = 'https
   }
 
   try {
-    const interpreted = interpretTransactionRecord(await response.json());
-    return interpreted;
+    const body = await response.json();
+    const interpreted = interpretTransactionRecord(body);
+    const transaction = apiTransactionRecord(body);
+    return transaction ? { ...interpreted, transaction } : interpreted;
   } catch (error) {
     return { status: 'unknown', details: `Failed to read transaction status: ${error.message}` };
   }

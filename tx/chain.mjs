@@ -92,14 +92,17 @@ function sameText(left, right) {
 
 /**
  * The plain object is the gateway-sendable transaction.
- * A chain record must carry the same sender, receiver, nonce, data, chain id, and signature.
+ * Sender, receiver, nonce, base64 data, and signature must match.
+ * The public API often omits chainID; compare it only when the record includes one.
  */
 export function signedPlainMatchesRecord(plain, record) {
   if (!plain || !record) return false;
+  const chainID = record.chainID ?? record.chainId;
+  const chainOk = chainID == null || String(chainID) === '' || sameText(plain.chainID, chainID);
   return sameText(plain.sender, record.sender)
     && sameText(plain.receiver, record.receiver)
     && Number(plain.nonce) === Number(record.nonce)
-    && sameText(plain.chainID, record.chainID)
+    && chainOk
     && sameText(plain.data || '', record.data || '')
     && sameText(plain.signature || '', record.signature || '');
 }

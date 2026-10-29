@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,15 +23,30 @@ function run(command, args, input) {
   return (result.stdout || '').trim();
 }
 
+function resolveDocker() {
+  const candidates = [
+    process.env.DOCKER,
+    'docker',
+    'C:\\Users\\sheme\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe',
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (candidate !== 'docker' && !existsSync(candidate)) continue;
+    const probe = spawnSync(candidate, ['version'], { encoding: 'utf8' });
+    if (!probe.error && probe.status === 0) return candidate;
+  }
+  return null;
+}
+
+const dockerBin = resolveDocker();
+
 function dockerAvailable() {
-  const probe = spawnSync('docker', ['version'], { encoding: 'utf8' });
-  return !probe.error && probe.status === 0;
+  return Boolean(dockerBin);
 }
 
 const useDocker = dockerAvailable();
 
 function docker(args, input) {
-  return run('docker', args, input);
+  return run(dockerBin, args, input);
 }
 
 function psql(sql, database = useDocker ? 'makex_tx' : localDb) {
@@ -43,7 +58,7 @@ function psql(sql, database = useDocker ? 'makex_tx' : localDb) {
 
 function psqlStatus(sql, database = useDocker ? 'makex_tx' : localDb) {
   if (useDocker) {
-    return spawnSync('docker', ['exec', '-i', container, 'psql', '-U', 'postgres', '-d', database, '-v', 'ON_ERROR_STOP=1', '-c', sql], { encoding: 'utf8' });
+    return spawnSync(dockerBin, ['exec', '-i', container, 'psql', '-U', 'postgres', '-d', database, '-v', 'ON_ERROR_STOP=1', '-c', sql], { encoding: 'utf8' });
   }
   return spawnSync('sudo', ['-u', 'postgres', 'psql', '-d', database, '-v', 'ON_ERROR_STOP=1', '-c', sql], { encoding: 'utf8' });
 }
@@ -65,7 +80,7 @@ test('coordinator RPC functions enforce idempotency, one unresolved nonce, and s
       let readyError = 'postgres did not accept connections';
       let ready = false;
       while (Date.now() < readyDeadline) {
-        const probe = spawnSync('docker', ['exec', container, 'psql', '-U', 'postgres', '-d', 'makex_tx', '-c', 'select 1'], { encoding: 'utf8' });
+        const probe = spawnSync(dockerBin, ['exec', container, 'psql', '-U', 'postgres', '-d', 'makex_tx', '-c', 'select 1'], { encoding: 'utf8' });
         if (probe.status === 0) {
           ready = true;
           break;
@@ -200,12 +215,34 @@ test('coordinator RPC functions enforce idempotency, one unresolved nonce, and s
     assert.equal(confirmedClaim.claimed, false);
     assert.equal(confirmedClaim.reason, 'confirmed');
 
+    const fenced = query(`
+      select public.makex_tx_begin_operation('finish-key', 'fingerprint-a', 'makex-transfers', '1', 'erd1wallet');
+    `);
+    const finishId = fenced.operation.id;
+    query(`select public.makex_tx_claim_business('${finishId}'::uuid, 'owner-a', 60000);`);
+    psql(`update public.makex_operations set claim_expires_at = now() - interval '1 minute' where id = '${finishId}';`);
+    query(`select public.makex_tx_claim_business('${finishId}'::uuid, 'owner-b', 60000);`);
+    const stale = query(`
+      select public.makex_tx_finish_business(
+        '${finishId}'::uuid, 'owner-a', '{"state":"OPERATION_CONFIRMED"}'::jsonb
+      );
+    `);
+    assert.equal(stale.ok, false);
+    assert.equal(stale.reason, 'stale_claim');
+    const finished = query(`
+      select public.makex_tx_finish_business(
+        '${finishId}'::uuid, 'owner-b', '{"state":"OPERATION_CONFIRMED","http_status":200}'::jsonb
+      );
+    `);
+    assert.equal(finished.ok, true);
+    assert.equal(finished.operation.state, 'OPERATION_CONFIRMED');
+
     const anonDenied = psqlStatus('set role anon; select count(*) from public.makex_operations;');
     assert.notEqual(anonDenied.status, 0);
     assert.match(`${anonDenied.stderr}`, /permission denied/i);
   } finally {
     if (useDocker) {
-      spawnSync('docker', ['rm', '-f', container], { encoding: 'utf8' });
+      spawnSync(dockerBin, ['rm', '-f', container], { encoding: 'utf8' });
     } else {
       spawnSync('sudo', ['-u', 'postgres', 'psql', '-d', 'postgres', '-c',
         `select pg_terminate_backend(pid) from pg_stat_activity where datname = '${localDb}'; drop database if exists ${localDb};`], { encoding: 'utf8' });
