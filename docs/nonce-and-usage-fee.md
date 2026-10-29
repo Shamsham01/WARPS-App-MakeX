@@ -80,6 +80,14 @@ The migration `20261028220000_makex_tx_coordinator.sql` is already applied on pr
 
 Polling defaults: 2s interval, 1.5x backoff, 8s cap, 90s maximum. Override with `MAKEX_TX_POLL_*`. One identical rebroadcast is allowed after an ambiguous submission (`MAKEX_TX_MAX_RECOVERY_ATTEMPTS`).
 
+## Transaction hash mismatch
+
+SDK 13, 14, and 15 hash `Transaction.data` as protobuf bytes. `toPlainObject()` base64-encodes that field with `Buffer.from(data)`. A JavaScript string is hashed differently from the UTF-8 bytes the gateway receives, so the local hash and the gateway hash diverge even though the signature is over the same sendable JSON.
+
+The usage-fee payload is therefore `Buffer.from(esdtData, 'utf8')`. The bytes are ASCII, so the same `Buffer.from` call is valid on SDK 13 (hash is a Buffer), 14, and 15 (hash is a hex string). `identifyTransaction` already accepts both.
+
+If a gateway hash still differs from the local hash, the coordinator stores `local_hash`, `gateway_hash`, and `canonical_hash` on the reservation and `progress_json.fee_reconciliation` on the operation. It confirms the fee only when the gateway hash equals the hash of the signed sendable transaction and that transaction's status is success. A chain record, when the status lookup includes one, must match sender, receiver, nonce, data, chain id, and signature. An advanced account nonce does not confirm a fee. The primary transfer does not run, and the operation is not marked `OPERATION_CONFIRMED`, until the fee itself is confirmed. No second nonce is reserved while that reservation is unresolved. No database migration is required: `error_detail` and `progress_json` already hold the diagnostic.
+
 ## Recovery
 
 `POST /admin/tx/reconcile` with the existing bearer token and `{ "walletAddress": "erd1..." }` re-reads the unresolved reservation. It can mark a transaction confirmed, failed, or rejected, and it may rebroadcast the stored signed transaction. It does not create a new payment.
