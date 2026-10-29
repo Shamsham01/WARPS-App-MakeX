@@ -9,6 +9,8 @@ export class TxCoordinationError extends Error {
     this.httpStatus = extra.httpStatus || (this.retryable ? 503 : 400);
     this.operationId = extra.operationId || null;
     this.txHash = extra.txHash || null;
+    this.gatewayHash = extra.gatewayHash || null;
+    this.canonicalHash = extra.canonicalHash || null;
     this.nonce = extra.nonce ?? null;
     this.state = extra.state || null;
     this.errorClass = extra.errorClass || null;

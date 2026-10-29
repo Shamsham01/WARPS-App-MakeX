@@ -61,3 +61,45 @@ export function rebuildTransaction(plain) {
   }
   return Transaction.fromPlainObject(plain);
 }
+
+const TX_HASH = /^[0-9a-f]{64}$/i;
+
+export function isTxHash(value) {
+  return TX_HASH.test(String(value || ''));
+}
+
+export function hashDiagnostic({ localHash, gatewayHash, canonicalHash }) {
+  return [
+    `local_hash=${localHash || ''}`,
+    `gateway_hash=${gatewayHash || ''}`,
+    `canonical_hash=${canonicalHash || ''}`,
+  ].join(';');
+}
+
+export function readHashDiagnostic(detail) {
+  const fields = {};
+  for (const part of String(detail || '').split(';')) {
+    const index = part.indexOf('=');
+    if (index <= 0) continue;
+    fields[part.slice(0, index)] = part.slice(index + 1);
+  }
+  return fields;
+}
+
+function sameText(left, right) {
+  return String(left ?? '').toLowerCase() === String(right ?? '').toLowerCase();
+}
+
+/**
+ * The plain object is the gateway-sendable transaction.
+ * A chain record must carry the same sender, receiver, nonce, data, chain id, and signature.
+ */
+export function signedPlainMatchesRecord(plain, record) {
+  if (!plain || !record) return false;
+  return sameText(plain.sender, record.sender)
+    && sameText(plain.receiver, record.receiver)
+    && Number(plain.nonce) === Number(record.nonce)
+    && sameText(plain.chainID, record.chainID)
+    && sameText(plain.data || '', record.data || '')
+    && sameText(plain.signature || '', record.signature || '');
+}
