@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Address, Mnemonic, Transaction, UserSecretKey, UserSigner } from '@multiversx/sdk-core';
-import { identifyTransaction } from '../tx/chain.mjs';
+import { identifyTransaction, rebuildTransaction } from '../tx/chain.mjs';
 import { createTxCoordinator } from '../tx/coordinator.mjs';
 import { createMemoryStore } from '../tx/memoryStore.mjs';
 import { sendPreparedTransaction, nextStablePurpose } from '../tx/preparedSend.mjs';
@@ -549,4 +549,87 @@ test('an expired business claim can be taken by the retry', async () => {
   const later = Date.now() + 120000;
   const reclaimed = await store.claimBusiness({ id: begun.operation.id, owner: 'owner-b', ttlMs: 60000, now: later });
   assert.equal(reclaimed.claimed, true);
+});
+
+test('usage fee hash matches the canonical sendable transaction representation', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(30);
+  let submitted = null;
+  let networkHash = null;
+
+  // Model the gateway's canonical transaction representation, without broadcasting.
+  // Prior code passed a string as SDK Transaction.data, causing its protobuf hash
+  // to differ from the hash of the bytes serialized into the sendable payload.
+  chain.sendImpl = async (tx) => {
+    submitted = tx;
+    networkHash = identifyTransaction(rebuildTransaction(tx.toPlainObject())).txHash;
+    return networkHash;
+  };
+  chain.statusImpl = async (hash) => ({
+    status: hash === networkHash ? 'success' : 'not_found',
+  });
+
+  const middleware = feeMiddleware(makeCoordinator(chain, store));
+  const { req, res, nextCalled } = await invoke(middleware, {
+    body: { idempotencyKey: 'canonical-fee-hash', recipient: WALLET, amount: 1 },
+    onNext: async (_req, response) => {
+      await response.json({ status: 'success', result: { txHash: 'primary-mocked' } });
+    },
+  });
+
+  assert.equal(nextCalled, true, 'hash mismatch must not block the payment');
+  assert.equal(res.statusCode, 200);
+  assert.ok(submitted);
+  assert.ok(submitted.data instanceof Uint8Array, 'fee data must be raw UTF-8 bytes');
+  assert.match(Buffer.from(submitted.data).toString('utf8'), /^ESDTTransfer@/);
+  assert.equal(identifyTransaction(submitted).txHash, networkHash);
+  const reservations = await store.listReservationsForOperation(req.makexOperation.id);
+  assert.equal(reservations.find((row) => row.purpose === 'fee')?.state, 'CONFIRMED');
+});
+
+test('REWARD and USDC fee payloads are UTF-8 bytes with one gateway hash', async () => {
+  for (const [token, prefs] of [
+    ['USDC', null],
+    ['REWARD', { fee_token: 'REWARD', fee_token_identifier: 'REWARD-cf6eac' }],
+  ]) {
+    const store = createMemoryStore();
+    const chain = createFakeChain(40);
+    let submitted = null;
+    chain.sendImpl = async (tx) => {
+      submitted = tx;
+      const networkHash = identifyTransaction(rebuildTransaction(tx.toPlainObject())).txHash;
+      chain.sent.push({ hash: networkHash, nonce: Number(tx.nonce) });
+      return networkHash;
+    };
+    chain.statusImpl = async (hash) => ({
+      status: hash === chain.sent.at(-1)?.hash ? 'success' : 'not_found',
+    });
+    const middleware = feeMiddleware(makeCoordinator(chain, store), {
+      supabase: {
+        from(table) {
+          const api = {
+            select() { return api; },
+            eq() { return api; },
+            insert() { return Promise.resolve({ error: null }); },
+            maybeSingle: async () => {
+              if (table.includes('prefs')) return { data: prefs, error: null };
+              return { data: null, error: null };
+            },
+          };
+          return api;
+        },
+      },
+    });
+    const response = await invoke(middleware, {
+      body: { idempotencyKey: `fee-${token}`, recipient: WALLET, amount: 1 },
+      onNext: async (_req, res) => {
+        await res.json({ status: 'success', result: { txHash: 'primary-mocked' } });
+      },
+    });
+    assert.equal(response.nextCalled, true, token);
+    assert.ok(submitted.data instanceof Uint8Array, token);
+    const text = Buffer.from(submitted.data).toString('utf8');
+    assert.match(text, new RegExp(`^ESDTTransfer@${Buffer.from(token === 'REWARD' ? 'REWARD-cf6eac' : 'USDC-c76f1f').toString('hex')}@`));
+    assert.equal(identifyTransaction(submitted).txHash, identifyTransaction(rebuildTransaction(submitted.toPlainObject())).txHash);
+  }
 });
