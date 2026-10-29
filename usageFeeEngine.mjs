@@ -13,6 +13,7 @@ import {
 } from '@multiversx/sdk-core';
 import BigNumber from 'bignumber.js';
 import { createClient } from '@supabase/supabase-js';
+import { hashDiagnostic } from './tx/chain.mjs';
 import { createProductionCoordinator } from './tx/coordinator.mjs';
 import { TxCoordinationError } from './tx/errors.mjs';
 import { fingerprintRequest, readIdempotencyKey } from './tx/fingerprint.mjs';
@@ -416,7 +417,7 @@ async function sendUsageFee({
         sender: senderAddress,
         receiver: receiverAddress,
         value: BigInt(0),
-        data: buildEsdtTransferData(tokenIdentifier, dynamicFeeAmount),
+        data: Buffer.from(buildEsdtTransferData(tokenIdentifier, dynamicFeeAmount), 'utf8'),
         gasLimit: BigInt(500000),
         chainID: network,
       });
@@ -493,7 +494,26 @@ async function sendUsageFee({
     );
   }
 
-  return { txHash: outcome.txHash, amountWei: dynamicFeeAmount, reservationId: outcome.reservationId, replayed: false };
+  return {
+    txHash: outcome.txHash,
+    amountWei: dynamicFeeAmount,
+    reservationId: outcome.reservationId,
+    replayed: false,
+    reconciliation: outcome.reconciliation || null,
+  };
+}
+
+function feeReconciliationPatch(operation, reconciliation) {
+  if (!reconciliation) return {};
+  return {
+    progress_json: {
+      ...(operation?.progress_json || {}),
+      fee_reconciliation: {
+        ...reconciliation,
+        recordedAt: new Date().toISOString(),
+      },
+    },
+  };
 }
 
 function businessMarkers(body) {
@@ -848,6 +868,7 @@ export function createUsageFeeMiddleware({
             state: 'FEE_CONFIRMED',
             fee_tx_hash: resumed.txHash,
             fee_reservation_id: resumed.reservationId,
+            ...feeReconciliationPatch(operation, resumed.reconciliation),
           },
         });
         if (!settled.ok) {
@@ -861,7 +882,7 @@ export function createUsageFeeMiddleware({
         operation = settled.operation;
         req.makexOperation = operation;
         req.usageFeeHash = resumed.txHash;
-        return runBusiness(req, res, next, operation);
+        return await runBusiness(req, res, next, operation);
       }
 
       const profile = await loadAppProfile(appId, supabase);
@@ -892,7 +913,7 @@ export function createUsageFeeMiddleware({
             operationId: operation.id,
           });
           req.makexOperation = skipped.operation;
-          return runBusiness(req, res, next, skipped.operation);
+          return await runBusiness(req, res, next, skipped.operation);
         }
         if (whitelistEligibility.reason === 'expired') {
           log('info', 'Whitelist entry expired, charging usage fee', { walletAddress, appId, operationId: operation.id });
@@ -902,7 +923,7 @@ export function createUsageFeeMiddleware({
       if (!feeIsSettled(operation)) {
         const prefs = await getWalletBillingPrefs(walletAddress, supabase);
         const payment = resolvePaymentToken(profile, prefs);
-        const { txHash, amountWei, reservationId } = await sendUsageFee({
+        const { txHash, amountWei, reservationId, reconciliation } = await sendUsageFee({
           pemContent,
           walletAddress,
           tokenIdentifier: payment.tokenIdentifier,
@@ -928,6 +949,7 @@ export function createUsageFeeMiddleware({
             usd_amount: payment.usdFee,
             skipped_whitelist: false,
             whitelist_reason: whitelistReason,
+            ...feeReconciliationPatch(operation, reconciliation),
           },
         });
         if (!recorded.ok) {
@@ -975,8 +997,39 @@ export function createUsageFeeMiddleware({
         });
       }
 
-      return runBusiness(req, res, next, operation);
+      return await runBusiness(req, res, next, operation);
     } catch (error) {
+      const failedOperation = req.makexOperation;
+      if (
+        failedOperation?.id
+        && req.makexCoordinator?.store
+        && error?.code === 'TX_NEEDS_RECONCILIATION'
+        && error?.errorClass === 'hash_mismatch'
+      ) {
+        await req.makexCoordinator.store.updateOperation({
+          id: failedOperation.id,
+          patch: {
+            state: 'NEEDS_RECONCILIATION',
+            error_class: 'hash_mismatch',
+            error_detail: hashDiagnostic({
+              localHash: error.txHash,
+              gatewayHash: error.gatewayHash,
+              canonicalHash: error.canonicalHash,
+            }).slice(0, 500),
+            progress_json: {
+              ...(failedOperation.progress_json || {}),
+              fee_reconciliation: {
+                localHash: error.txHash || null,
+                gatewayHash: error.gatewayHash || null,
+                canonicalHash: error.canonicalHash || null,
+                nonce: error.nonce ?? null,
+                recordedAt: new Date().toISOString(),
+                primaryExecuted: false,
+              },
+            },
+          },
+        }).catch(() => {});
+      }
       log('error', 'Error processing usage fee', {
         error: redactPemFromString(error.message),
         appId,
@@ -1003,6 +1056,8 @@ export function createUsageFeeMiddleware({
             retryable,
             ...(error.chainDetail ? { chainDetail: error.chainDetail } : {}),
             ...(error.txHashUsageFee || error.txHash ? { txHash: error.txHashUsageFee || error.txHash } : {}),
+            ...(error.gatewayHash ? { gatewayHash: error.gatewayHash } : {}),
+            ...(error.canonicalHash ? { canonicalHash: error.canonicalHash } : {}),
             ...(error.operationId ? { operationId: error.operationId } : {}),
             ...(error.state ? { state: error.state } : {}),
           },
