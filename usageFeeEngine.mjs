@@ -591,6 +591,54 @@ function unstoredBusinessBody(operation, req, body) {
   });
 }
 
+function abandonedBusinessBody(operation, req) {
+  return buildMakeComErrorResponse({
+    code: 'BUSINESS_ABANDONED',
+    message: 'The operation ended before its result was stored. Do not run it again until it is reconciled. The usage fee will not be charged again.',
+    data: {
+      retryable: false,
+      operationId: operation.id,
+      usageFeeHash: req.usageFeeHash || operation.fee_tx_hash || null,
+      result: operation.result_json || null,
+    },
+  });
+}
+
+function staleClaimBody(operation) {
+  return buildMakeComErrorResponse({
+    code: 'STALE_CLAIM',
+    message: 'This worker lost the operation claim and did not store its result. Reconcile the operation before running it again.',
+    data: { retryable: false, operationId: operation.id },
+  });
+}
+
+function irreversibleResultMissing(operation) {
+  return operation?.state === 'NEEDS_RECONCILIATION'
+    && (operation.error_class === 'business_result_unstored' || operation.error_class === 'business_abandoned');
+}
+
+async function parkOwnedClaim(req, operation, patch) {
+  const store = req.makexCoordinator?.store;
+  const owner = req.makexClaimOwner;
+  if (!store || !owner || !operation?.id || req.makexClaimLost) return null;
+  const now = req.makexClaimNow ? req.makexClaimNow() : Date.now();
+  const held = await store.finishBusiness({ id: operation.id, owner, patch, now }).catch(() => null);
+  if (held?.ok || held?.reason === 'stale_claim') return held;
+  const reclaimed = await store.claimBusiness({
+    id: operation.id,
+    owner,
+    ttlMs: req.makexClaimTtlMs || 120000,
+    now,
+  }).catch(() => null);
+  if (!reclaimed?.claimed) return reclaimed;
+  return store.finishBusiness({
+    id: operation.id,
+    owner,
+    patch,
+    now: req.makexClaimNow ? req.makexClaimNow() : Date.now(),
+  }).catch(() => null);
+}
+
 function operationPatchForOutcome(outcome, status, responseBody, ledgerBody, operation) {
   if (outcome === 'confirmed') {
     return {
@@ -628,6 +676,11 @@ function continueAfterFee(req, res, next, operation) {
       if (!operation?.id) return originalJson(body);
       const ledgerBody = res.makexBusinessOutcome || body;
       const outcome = classifyBusinessOutcome(status, ledgerBody);
+      if (req.makexResultSettled) {
+        res.status(503);
+        return originalJson(req.makexClaimLost ? staleClaimBody(operation) : abandonedBusinessBody(operation, req));
+      }
+      req.makexResultSettled = true;
       const patch = operationPatchForOutcome(outcome, status, body, ledgerBody, operation);
       const finish = (nextPatch) => req.makexCoordinator.store.finishBusiness({
         id: operation.id,
@@ -635,18 +688,31 @@ function continueAfterFee(req, res, next, operation) {
         patch: nextPatch,
         now: req.makexClaimNow ? req.makexClaimNow() : Date.now(),
       });
-      const releaseRetryable = () => releaseBusinessClaim(req.makexCoordinator.store, operation).catch(() => {});
+      const releaseRetryable = () => finish({
+        state: operation.fee_tx_hash || operation.skipped_whitelist ? 'FEE_CONFIRMED' : 'RECEIVED',
+      }).catch(() => {});
+      const stopRenewal = () => req.makexStopClaimRenewal?.();
       return Promise.resolve()
-        .then(() => finish(patch))
+        .then(() => {
+          if (req.makexClaimLost) return { ok: false, reason: 'stale_claim' };
+          return finish(patch);
+        })
         .then(async (updated) => {
           if (updated?.ok) return originalJson(body);
-          if (updated?.reason === 'stale_claim' || updated?.reason === 'claim_expired') {
+          if (updated?.reason === 'stale_claim') {
             res.status(503);
-            return originalJson(buildMakeComErrorResponse({
-              code: 'STALE_CLAIM',
-              message: 'This worker lost the operation claim and did not store its result. Reconcile the operation before running it again.',
-              data: { retryable: false, operationId: operation.id },
-            }));
+            return originalJson(staleClaimBody(operation));
+          }
+          if (updated?.reason === 'claim_expired') {
+            await parkOwnedClaim(req, operation, {
+              state: 'NEEDS_RECONCILIATION',
+              error_class: 'business_abandoned',
+              error_detail: 'The business claim lapsed before the result was stored.',
+              result_json: body,
+              http_status: status,
+            });
+            res.status(503);
+            return originalJson(abandonedBusinessBody(operation, req));
           }
           if (outcome === 'confirmed') {
             await finish({
@@ -678,7 +744,8 @@ function continueAfterFee(req, res, next, operation) {
           }
           await releaseRetryable();
           return originalJson(body);
-        });
+        })
+        .finally(stopRenewal);
     };
     res.makexJsonWrapped = true;
   }
@@ -748,19 +815,57 @@ async function runBusiness(req, res, next, operation, claimOptions = {}) {
   req.makexOperation = claim.operation;
   req.makexClaimOwner = owner;
   req.makexClaimNow = clock;
-  const stopRenewal = scheduleClaimRenewal(() => {
-    req.makexCoordinator.store.claimBusiness({
-      id: operation.id,
-      owner,
-      ttlMs: claimTtlMs,
-      now: clock(),
-    }).catch(() => {});
-  }, claimRenewMs);
-  try {
-    return await continueAfterFee(req, res, next, claim.operation);
-  } finally {
-    stopRenewal();
+  req.makexClaimTtlMs = claimTtlMs;
+  req.makexClaimLost = false;
+  req.makexResultSettled = false;
+  let renewalStopped = false;
+  let stopTimer = () => {};
+  const stopRenewal = () => {
+    if (renewalStopped) return;
+    renewalStopped = true;
+    stopTimer();
+  };
+  req.makexStopClaimRenewal = stopRenewal;
+  const renewClaim = async () => {
+    if (renewalStopped || req.makexClaimLost) return;
+    try {
+      const renewed = await req.makexCoordinator.store.claimBusiness({
+        id: operation.id,
+        owner,
+        ttlMs: claimTtlMs,
+        now: clock(),
+      });
+      if (renewalStopped || req.makexClaimLost) return;
+      if (!renewed?.claimed) {
+        req.makexClaimLost = true;
+        stopRenewal();
+      }
+    } catch {
+      // A failed renewal leaves the current lease unchanged. Do not release it
+      // and do not write over a claim that may now belong to another worker.
+    }
+  };
+  stopTimer = scheduleClaimRenewal(() => renewClaim().catch(() => {}), claimRenewMs);
+  if (typeof res.on === 'function') {
+    const noteResponseEnded = () => {
+      if (req.makexResultSettled) {
+        stopRenewal();
+        return;
+      }
+      req.makexResultSettled = true;
+      stopRenewal();
+      parkOwnedClaim(req, operation, {
+        state: 'NEEDS_RECONCILIATION',
+        error_class: 'business_abandoned',
+        error_detail: 'The response ended before the business result was stored.',
+      }).catch(() => {});
+    };
+    res.on('finish', noteResponseEnded);
+    res.on('close', noteResponseEnded);
   }
+  // Express next() returns undefined before an async route handler finishes.
+  // Renewal stays armed until that handler stores its result or the response ends.
+  return continueAfterFee(req, res, next, claim.operation);
 }
 
 function buildInsufficientFeeResponse(error) {
@@ -905,17 +1010,11 @@ export function createUsageFeeMiddleware({
         return replayConfirmed(res, operation);
       }
 
-      if (operation.state === 'NEEDS_RECONCILIATION' && operation.error_class === 'business_result_unstored') {
-        return res.status(503).json(buildMakeComErrorResponse({
-          code: 'BUSINESS_RESULT_UNSTORED',
-          message: 'The external action may already have completed, but its result was not stored. Do not run it again until this operation is reconciled. The usage fee will not be charged again.',
-          data: {
-            retryable: false,
-            operationId: operation.id,
-            usageFeeHash: operation.fee_tx_hash || null,
-            result: operation.result_json || null,
-          },
-        }));
+      if (irreversibleResultMissing(operation)) {
+        const abandoned = operation.error_class === 'business_abandoned';
+        return res.status(503).json(abandoned
+          ? abandonedBusinessBody(operation, req)
+          : unstoredBusinessBody(operation, req, operation.result_json || null));
       }
 
       if (operation.state === 'INCONCLUSIVE' || operation.state === 'NEEDS_RECONCILIATION' || operation.state === 'FEE_SUBMITTED' || operation.state === 'FEE_PREPARED') {

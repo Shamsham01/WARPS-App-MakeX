@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import test from 'node:test';
 import { Address, Mnemonic, Transaction, UserSecretKey, UserSigner } from '@multiversx/sdk-core';
 import { identifyTransaction, rebuildTransaction } from '../tx/chain.mjs';
@@ -103,8 +104,8 @@ function feeMiddleware(coordinator, extra = {}) {
   });
 }
 
-async function invoke(middleware, { body = {}, headers = {}, file, onNext } = {}) {
-  const req = { method: 'POST', path: '/execute/egldTransfer', body, headers, file, usageFeeAlreadyProcessed: false };
+async function invoke(middleware, { body = {}, headers = {}, file, path = '/execute/egldTransfer', onNext } = {}) {
+  const req = { method: 'POST', path, body, headers, file, usageFeeAlreadyProcessed: false };
   const res = {
     statusCode: 200,
     body: undefined,
@@ -691,6 +692,150 @@ test('a renewed claim blocks a second worker after the original lease would have
   release();
   const completed = await first;
   assert.equal(completed.res.statusCode, 200);
+  assert.equal(runs, 1);
+  assert.equal(chain.sent.length, 1);
+});
+
+test('express next returns before the handler and the claim keeps renewing', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(21);
+  let clock = 5_000_000;
+  let renew = async () => {};
+  let stopped = false;
+  const middleware = feeMiddleware(makeCoordinator(chain, store), {
+    claimTtlMs: 1_000,
+    claimRenewMs: 1_000,
+    now: () => clock,
+    scheduleClaimRenewal: (callback) => {
+      renew = callback;
+      return () => { stopped = true; };
+    },
+  });
+  const body = { idempotencyKey: 'express-live', text: 'still running' };
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let runs = 0;
+  let handler;
+  const req = { method: 'POST', path: '/post', body, headers: {}, usageFeeAlreadyProcessed: false };
+  const res = {
+    statusCode: 200,
+    body: undefined,
+    status(code) { this.statusCode = code; return this; },
+    json(payload) { this.body = payload; return this; },
+  };
+  const returned = middleware(req, res, () => {
+    runs += 1;
+    handler = (async () => {
+      clock += 5_000;
+      await renew();
+      await gate;
+      await res.json({ status: 'success', result: { id: 'posted' } });
+    })();
+    return undefined;
+  });
+  await returned;
+  assert.equal(stopped, false);
+  assert.equal(runs, 1);
+  const second = await invoke(middleware, {
+    body,
+    path: '/post',
+    onNext: async () => { runs += 1; },
+  });
+  assert.equal(second.nextCalled, false);
+  assert.equal(second.res.statusCode, 503);
+  assert.equal(second.res.body.code, 'OPERATION_IN_PROGRESS');
+  release();
+  await handler;
+  assert.equal(stopped, true);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.result.id, 'posted');
+  assert.equal(runs, 1);
+  assert.equal(chain.sent.length, 1);
+});
+
+test('a failed renewal does not release the current claim', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(22);
+  const original = store.claimBusiness.bind(store);
+  let owner = null;
+  store.claimBusiness = async (args) => {
+    if (owner && args.owner === owner) throw new Error('renewal database unavailable');
+    const result = await original(args);
+    if (result?.claimed && !owner) owner = args.owner;
+    return result;
+  };
+  let renew = async () => {};
+  const middleware = feeMiddleware(makeCoordinator(chain, store), {
+    claimTtlMs: 30_000,
+    scheduleClaimRenewal: (callback) => {
+      renew = callback;
+      return () => {};
+    },
+  });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const body = { idempotencyKey: 'renew-down', text: 'held' };
+  let runs = 0;
+  let renewalAttempted = false;
+  const first = invoke(middleware, {
+    body,
+    onNext: async (_req, res) => {
+      runs += 1;
+      await renew();
+      renewalAttempted = true;
+      await gate;
+      await res.json({ status: 'success', result: { id: 'kept' } });
+    },
+  });
+  while (!renewalAttempted) await new Promise((resolve) => setImmediate(resolve));
+  const second = await invoke(middleware, {
+    body,
+    onNext: async () => { runs += 1; },
+  });
+  assert.equal(second.nextCalled, false);
+  assert.equal(second.res.body.code, 'OPERATION_IN_PROGRESS');
+  const held = await store.getOperation(second.res.body.data.operationId);
+  assert.equal(held.state, 'OPERATION_IN_PROGRESS');
+  assert.equal(held.claim_owner, owner);
+  release();
+  const completed = await first;
+  assert.equal(completed.res.statusCode, 200);
+  assert.equal(runs, 1);
+});
+
+test('a closed response without a stored result is not executed again', async () => {
+  const store = createMemoryStore();
+  const chain = createFakeChain(23);
+  const middleware = feeMiddleware(makeCoordinator(chain, store));
+  const body = { idempotencyKey: 'response-closed', text: 'unknown' };
+  const req = { method: 'POST', path: '/post', body, headers: {}, usageFeeAlreadyProcessed: false };
+  const res = new EventEmitter();
+  res.statusCode = 200;
+  res.status = function status(code) { this.statusCode = code; return this; };
+  res.json = function json(payload) { this.body = payload; return this; };
+  let runs = 0;
+  await middleware(req, res, () => {
+    runs += 1;
+    return undefined;
+  });
+  res.emit('close');
+  let operation;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    operation = await store.getOperation(req.makexOperation.id);
+    if (operation?.error_class === 'business_abandoned') break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(operation.state, 'NEEDS_RECONCILIATION');
+  assert.equal(operation.error_class, 'business_abandoned');
+  const second = await invoke(middleware, {
+    body,
+    path: '/post',
+    onNext: async () => { runs += 1; },
+  });
+  assert.equal(second.nextCalled, false);
+  assert.equal(second.res.statusCode, 503);
+  assert.equal(second.res.body.code, 'BUSINESS_ABANDONED');
+  assert.equal(second.res.body.data.retryable, false);
   assert.equal(runs, 1);
   assert.equal(chain.sent.length, 1);
 });
